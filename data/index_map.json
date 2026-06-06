@@ -1,0 +1,238 @@
+{
+  "aliases": {
+    "nvda": [
+      "NVDA"
+    ],
+    "nvidia": [
+      "NVDA"
+    ],
+    "s&p500": [
+      "SPY"
+    ],
+    "sp500": [
+      "SPY"
+    ],
+    "微软": [
+      "MSFT"
+    ],
+    "标普500": [
+      "SPY"
+    ],
+    "沪深300": [
+      "000300",
+      "510300"
+    ],
+    "特斯拉": [
+      "TSLA"
+    ],
+    "纳指100": [
+      "QQQ",
+      "513100",
+      "270042"
+    ],
+    "纳斯达克100": [
+      "QQQ",
+      "513100",
+      "270042"
+    ],
+    "英伟达": [
+      "NVDA"
+    ],
+    "苹果": [
+      "AAPL"
+    ]
+  },
+  "comment": "指数/基金估值映射表。基金/ETF 自身通常没有 PE 百分位，需映射到跟踪指数。可直接编辑本文件，保存后在设置页点击『重载映射表』或重启应用。",
+  "fund_index_map": {
+    "050025": "SP500",
+    "110020": "SH000300",
+    "110026": "SZ399006",
+    "159845": "SH000852",
+    "159915": "SZ399006",
+    "159919": "SH000300",
+    "159922": "SH000905",
+    "159941": "NDX",
+    "160119": "SH000905",
+    "161125": "SP500",
+    "270042": "NDX",
+    "510050": "SH000016",
+    "510300": "SH000300",
+    "510500": "SH000905",
+    "512100": "SH000852",
+    "513100": "NDX",
+    "513500": "SP500",
+    "588000": "SH000688",
+    "588080": "SH000688"
+  },
+  "index_codes": {
+    "000016": "SH000016",
+    "000300": "SH000300",
+    "000688": "SH000688",
+    "000852": "SH000852",
+    "000905": "SH000905",
+    "000922": "SH000922",
+    "399001": "SZ399001",
+    "399005": "SZ399005",
+    "399006": "SZ399006",
+    "NDX": "NDX",
+    "SP500": "SP500"
+  },
+  "index_names": {
+    "NDX": "纳斯达克100",
+    "SH000016": "上证50",
+    "SH000300": "沪深300",
+    "SH000688": "科创50",
+    "SH000852": "中证1000",
+    "SH000905": "中证500",
+    "SH000922": "中证红利",
+    "SP500": "标普500",
+    "SZ399001": "深证成指",
+    "SZ399005": "中小100",
+    "SZ399006": "创业板指"
+  },
+  "keyword_rules": [
+    {
+      "keywords": [
+        "纳指",
+        "纳斯达克",
+        "NASDAQ",
+        "NDX"
+      ],
+      "index_code": "NDX"
+    },
+    {
+      "keywords": [
+        "标普",
+        "S&P",
+        "SP500",
+        "S&P500"
+      ],
+      "index_code": "SP500"
+    },
+    {
+      "keywords": [
+        "沪深300",
+        "CSI300"
+      ],
+      "index_code": "SH000300"
+    },
+    {
+      "keywords": [
+        "上证50"
+      ],
+      "index_code": "SH000016"
+    },
+    {
+      "keywords": [
+        "中证500"
+      ],
+      "index_code": "SH000905"
+    },
+    {
+      "keywords": [
+        "中证1000"
+      ],
+      "index_code": "SH000852"
+    },
+    {
+      "keywords": [
+        "科创50",
+        "科创板50"
+      ],
+      "index_code": "SH000688"
+    },
+    {
+      "keywords": [
+        "创业板",
+        "创业板指"
+      ],
+      "index_code": "SZ399006"
+    },
+    {
+      "keywords": [
+        "中证红利"
+      ],
+      "index_code": "SH000922"
+    }
+  ],
+  "local_symbols": [
+    {
+      "symbol": "NVDA",
+      "name": "NVIDIA Corporation / 英伟达",
+      "market": "US",
+      "asset_kind": "stock",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "AAPL",
+      "name": "Apple Inc. / 苹果",
+      "market": "US",
+      "asset_kind": "stock",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "MSFT",
+      "name": "Microsoft Corporation / 微软",
+      "market": "US",
+      "asset_kind": "stock",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "TSLA",
+      "name": "Tesla, Inc. / 特斯拉",
+      "market": "US",
+      "asset_kind": "stock",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "AMD",
+      "name": "Advanced Micro Devices / AMD",
+      "market": "US",
+      "asset_kind": "stock",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "QQQ",
+      "name": "Invesco QQQ Trust / 纳斯达克100ETF",
+      "market": "US",
+      "asset_kind": "etf",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "SPY",
+      "name": "SPDR S&P 500 ETF / 标普500ETF",
+      "market": "US",
+      "asset_kind": "etf",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "000300",
+      "name": "沪深300指数",
+      "market": "CN",
+      "asset_kind": "index",
+      "source": "akshare"
+    },
+    {
+      "symbol": "510300",
+      "name": "沪深300ETF",
+      "market": "CN",
+      "asset_kind": "etf",
+      "source": "akshare"
+    },
+    {
+      "symbol": "513100",
+      "name": "纳指ETF / 纳斯达克100ETF",
+      "market": "CN",
+      "asset_kind": "etf",
+      "source": "akshare"
+    },
+    {
+      "symbol": "270042",
+      "name": "广发纳斯达克100ETF联接(QDII)A",
+      "market": "CN",
+      "asset_kind": "fund",
+      "source": "akshare"
+    }
+  ],
+  "version": 1
+}

@@ -1,0 +1,1291 @@
+
+:root {
+  --bg: #f6f3ee;
+  --card: #fffaf2;
+  --ink: #232323;
+  --muted: #6c6257;
+  --line: #e1d8cb;
+  --accent: #8f5f36;
+  --accent-dark: #674222;
+  --green: #168765;
+  --green-soft: #e6f3ed;
+  --red: #b84444;
+  --red-soft: #f7e4e1;
+  --amber: #b4842f;
+  --amber-soft: #f6ead2;
+  --blue: #466b8f;
+  --blue-soft: #e4ecf4;
+  --shadow: 0 8px 22px rgba(82, 62, 38, .08);
+  --radius: 18px;
+  --topbar-h: 70px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  margin: 0;
+  background: linear-gradient(180deg, #f9f5ed, #f1ebe1);
+  color: var(--ink);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+}
+
+button, input, select { font: inherit; }
+
+.app-shell {
+  height: 100dvh;
+  width: 100%;
+  display: grid;
+  grid-template-columns: minmax(235px, .72fr) minmax(510px, 1.62fr) minmax(310px, .95fr);
+  grid-template-rows: var(--topbar-h) minmax(0, 1fr);
+  grid-template-areas:
+    "top top top"
+    "config signal result";
+  gap: clamp(8px, .9vw, 14px);
+  padding: clamp(8px, .9vw, 14px);
+}
+
+.topbar {
+  grid-area: top;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 18px;
+  border-radius: 20px;
+  background: #2f241d;
+  color: #fff6e8;
+  box-shadow: 0 14px 35px rgba(48, 34, 22, .18);
+  min-width: 0;
+}
+
+.brand { min-width: 0; }
+.brand h1 {
+  margin: 0 0 3px;
+  font-size: clamp(18px, 1.7vw, 25px);
+  letter-spacing: .02em;
+}
+.brand p {
+  margin: 0;
+  color: #e8d8c2;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.top-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+.ghost-btn {
+  border: 1px solid rgba(255,255,255,.28);
+  border-radius: 999px;
+  background: rgba(255,255,255,.08);
+  color: #fff6e8;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+.ghost-btn:hover { background: rgba(255,255,255,.14); }
+
+.config-pane { grid-area: config; min-height: 0; overflow: auto; }
+.signal-pane { grid-area: signal; min-height: 0; padding-right: 2px; }
+.result-pane { grid-area: result; min-height: 0; overflow: auto; }
+
+.local-scroll {
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.local-scroll::-webkit-scrollbar,
+.config-pane::-webkit-scrollbar,
+.result-pane::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+.local-scroll::-webkit-scrollbar-thumb,
+.config-pane::-webkit-scrollbar-thumb,
+.result-pane::-webkit-scrollbar-thumb {
+  background: #c9b9a5;
+  border-radius: 999px;
+  border: 2px solid #f6f0e8;
+}
+
+.card, .result-card {
+  padding: clamp(12px, 1vw, 17px);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--card) 94%, white);
+  box-shadow: var(--shadow);
+}
+.card + .card, .result-card + .card { margin-top: 10px; }
+
+.card-title {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+.card h2, .result-card h2 {
+  margin: 0;
+  font-size: clamp(16px, 1.35vw, 19px);
+}
+
+.pill {
+  white-space: nowrap;
+  padding: 5px 9px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 800;
+}
+.pill.neutral { background: #efe2d0; color: var(--accent-dark); }
+.pill.buy { background: var(--green-soft); color: var(--green); }
+.pill.danger { background: var(--red-soft); color: var(--red); }
+.pill.wait { background: var(--amber-soft); color: #8c631f; }
+
+.config-form {
+  display: grid;
+  gap: 9px;
+}
+
+.field, .strategy-option, .check-grid label, .segmented label, .choice-grid label {
+  position: relative;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: rgba(255,255,255,.62);
+  cursor: pointer;
+  transition: transform .12s ease, border-color .12s ease, background .12s ease, opacity .12s ease;
+}
+.field:hover, .strategy-option:hover, .check-grid label:hover, .segmented label:hover, .choice-grid label:hover {
+  transform: translateY(-1px);
+  background: #fffdf9;
+}
+
+.field {
+  display: block;
+  padding: 10px 11px;
+}
+.field span {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+input[type="number"], select {
+  width: 100%;
+  border: 1px solid #cfc1b2;
+  border-radius: 10px;
+  padding: 8px 9px;
+  background: #fffdfa;
+  color: var(--ink);
+  font-size: 14px;
+}
+input[type="checkbox"], input[type="radio"] {
+  transform: translateY(1px);
+  margin-right: 7px;
+  accent-color: var(--accent);
+}
+
+.position-tile {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 11px;
+  border: 1px dashed #bda891;
+  border-radius: 14px;
+  color: var(--muted);
+  background: #fff8ed;
+}
+.position-tile strong {
+  color: var(--accent-dark);
+  font-size: 24px;
+}
+
+.strategy-box {
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 10px;
+  margin: 0;
+  display: grid;
+  gap: 8px;
+  background: rgba(255,255,255,.4);
+}
+.strategy-box legend {
+  padding: 0 6px;
+  color: #46372b;
+  font-weight: 800;
+}
+
+.strategy-option {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 6px;
+  padding: 9px 10px;
+}
+.strategy-option input { grid-row: span 2; }
+.strategy-option span { font-weight: 900; }
+.strategy-option em {
+  font-style: normal;
+  color: var(--muted);
+  font-size: 12px;
+}
+.strategy-option.defensive:has(input:checked) { border-color: var(--red); background: var(--red-soft); }
+.strategy-option.balanced:has(input:checked) { border-color: var(--amber); background: var(--amber-soft); }
+.strategy-option.aggressive:has(input:checked) { border-color: var(--green); background: var(--green-soft); }
+
+.strategy-summary {
+  padding: 10px 11px;
+  border-radius: 14px;
+  background: #f1e5d5;
+  color: #4d3b2c;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.inline-toast {
+  margin-top: 8px;
+  padding: 9px 11px;
+  border-radius: 12px;
+  background: #efe4d3;
+  border-left: 4px solid var(--green);
+  font-size: 13px;
+}
+
+.signal-card { border-left-width: 5px; }
+.signal-card.neutral { border-left-color: var(--amber); }
+.signal-card.event-zone { border-left-color: var(--amber); }
+.signal-card.position-zone { border-left-color: var(--blue); }
+.signal-card.pattern-zone { border-left-color: var(--green); }
+.signal-card.context-zone { border-left-color: var(--red); }
+
+.segmented, .choice-grid, .check-grid {
+  display: grid;
+  gap: 8px;
+}
+
+.segmented.trend-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.choice-grid {
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+.market-grid {
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+.choice-grid.compact-choice {
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+}
+.check-grid {
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+
+.segmented label, .choice-grid label, .check-grid label {
+  display: flex;
+  align-items: center;
+  min-height: 40px;
+  padding: 8px 11px;
+  font-size: 14px;
+  font-weight: 800;
+  line-height: 1.35;
+}
+
+.segmented label:has(input:checked),
+.choice-grid label:has(input:checked) {
+  border-color: var(--accent);
+  background: #f3e4d0;
+}
+
+.choice-block {
+  margin-top: 10px;
+}
+.choice-block + .check-grid,
+.check-grid + .choice-block {
+  margin-top: 10px;
+}
+.block-title {
+  margin-bottom: 7px;
+  color: #4a3a2d;
+  font-size: 13px;
+  font-weight: 900;
+}
+
+label:has(input:checked)[data-impact^="buy"] {
+  border-color: rgba(22, 135, 101, .75);
+  background: var(--green-soft);
+}
+label:has(input:checked)[data-impact="buy-strong"] {
+  border-color: rgba(22, 135, 101, .95);
+  background: #d8efe5;
+  box-shadow: inset 0 0 0 1px rgba(22, 135, 101, .12);
+}
+label:has(input:checked)[data-impact^="sell"] {
+  border-color: rgba(184, 68, 68, .78);
+  background: var(--red-soft);
+}
+label:has(input:checked)[data-impact="sell-strong"] {
+  border-color: rgba(184, 68, 68, 1);
+  background: #f3d7d2;
+  box-shadow: inset 0 0 0 1px rgba(184, 68, 68, .12);
+}
+label:has(input:checked)[data-impact="wait"] {
+  border-color: rgba(180, 132, 47, .75);
+  background: var(--amber-soft);
+}
+
+.is-muted {
+  opacity: .36;
+  filter: grayscale(.4);
+}
+.is-muted input { pointer-events: none; }
+
+.btn {
+  border: 0;
+  border-radius: 13px;
+  padding: 12px 14px;
+  cursor: pointer;
+  font-size: 15px;
+  font-weight: 900;
+}
+.btn.secondary {
+  width: 100%;
+  background: #33261e;
+  color: #fff6e8;
+}
+.btn:disabled {
+  opacity: .65;
+  cursor: wait;
+}
+
+.result-card { border-width: 2px; }
+.result-card.清仓, .result-card.减仓, .result-card.止盈 { border-color: rgba(184, 68, 68, .55); }
+.result-card.加仓, .result-card.重仓 { border-color: rgba(22, 135, 101, .55); }
+.result-card.idle { border-color: rgba(143, 95, 54, .22); }
+
+.result-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+}
+.small {
+  color: var(--muted);
+  font-size: 13px;
+}
+.confidence {
+  width: 82px;
+  height: 82px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: #f1e5d5;
+  border: 1px solid var(--line);
+}
+.confidence span {
+  display: block;
+  font-size: 22px;
+  font-weight: 900;
+  color: var(--accent-dark);
+}
+.confidence em {
+  display: block;
+  margin-top: -20px;
+  font-style: normal;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.big-action {
+  margin: 12px 0;
+  padding: 14px;
+  border-radius: 15px;
+  background: #33261e;
+  color: #fff7e9;
+}
+.big-action strong {
+  display: block;
+  font-size: clamp(27px, 3vw, 36px);
+  margin-bottom: 4px;
+}
+.big-action span {
+  color: #ead9c2;
+  font-size: 13px;
+}
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.metric {
+  padding: 10px;
+  border-radius: 13px;
+  background: rgba(255,255,255,.62);
+  border: 1px solid var(--line);
+}
+.metric span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 5px;
+}
+.metric strong {
+  font-size: 14px;
+  word-break: break-word;
+}
+.metric.wide { grid-column: 1 / -1; }
+
+.details-block {
+  margin-top: 10px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(255,255,255,.46);
+  overflow: hidden;
+}
+.details-block summary {
+  cursor: pointer;
+  padding: 10px 12px;
+  font-weight: 900;
+  color: #44362b;
+}
+.details-block ul {
+  margin: 0;
+  padding: 0 16px 12px 30px;
+  color: #3c332c;
+  font-size: 13px;
+}
+.details-block li + li { margin-top: 5px; }
+
+.rules-mini ol {
+  margin: 0;
+  padding-left: 22px;
+  color: #3d332b;
+  font-size: 13px;
+  line-height: 1.65;
+}
+.rules-mini li + li { margin-top: 4px; }
+
+.hover-popover {
+  position: fixed;
+  z-index: 1000;
+  max-width: min(360px, calc(100vw - 24px));
+  padding: 10px 12px;
+  border: 1px solid #cdb99f;
+  border-radius: 12px;
+  background: #2f241d;
+  color: #fff5e8;
+  box-shadow: 0 12px 30px rgba(0,0,0,.22);
+  font-size: 13px;
+  line-height: 1.55;
+  pointer-events: none;
+}
+[data-tip]::after {
+  content: "ⓘ";
+  position: absolute;
+  right: 8px;
+  top: 7px;
+  color: #b2916d;
+  font-size: 11px;
+  font-weight: 900;
+}
+
+@media (max-width: 1180px) {
+  .app-shell {
+    grid-template-columns: minmax(220px, .7fr) minmax(420px, 1.25fr) minmax(280px, .9fr);
+  }
+  .metrics { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 900px) {
+  html, body { height: auto; overflow: auto; }
+  .app-shell {
+    height: auto;
+    min-height: 100dvh;
+    grid-template-columns: 1fr;
+    grid-template-rows: auto auto auto auto;
+    grid-template-areas:
+      "top"
+      "config"
+      "result"
+      "signal";
+  }
+  .config-pane, .signal-pane, .result-pane { overflow: visible; }
+  .brand p { white-space: normal; }
+  .topbar { align-items: flex-start; flex-direction: column; }
+  .config-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .strategy-box, .strategy-summary, .btn.secondary { grid-column: 1 / -1; }
+}
+
+@media (max-width: 560px) {
+  .app-shell { padding: 7px; gap: 8px; }
+  .config-form, .segmented.trend-grid, .choice-grid, .choice-grid.compact-choice, .check-grid {
+    grid-template-columns: 1fr;
+  }
+  .result-head { align-items: flex-start; flex-direction: column; }
+}
+/* 单选组视觉聚焦：
+   当同组已有选中项时，未选中的同组选项降低透明度和对比度。
+   适用于：趋势、观察时间、支撑状态、压力/突破位状态、转强形态、策略配置。 */
+.choice-grid:not(.mixed-choice):has(input:checked) > label:not(:has(input:checked)),
+.choice-grid.mixed-choice:has(label[data-choice-group] input:checked) > label[data-choice-group]:not(:has(input:checked)),
+.segmented:has(input:checked) > label:not(:has(input:checked)),
+.strategy-box:has(input:checked) > .strategy-option:not(:has(input:checked)) {
+  opacity: 0.42;
+  filter: grayscale(0.38) saturate(0.65) contrast(0.82);
+  background: rgba(255, 255, 255, 0.38);
+  border-color: color-mix(in srgb, var(--line) 70%, #ffffff);
+}
+
+.choice-grid:not(.mixed-choice):has(input:checked) > label:not(:has(input:checked)):hover,
+.choice-grid.mixed-choice:has(label[data-choice-group] input:checked) > label[data-choice-group]:not(:has(input:checked)):hover,
+.segmented:has(input:checked) > label:not(:has(input:checked)):hover,
+.strategy-box:has(input:checked) > .strategy-option:not(:has(input:checked)):hover {
+  opacity: 0.72;
+  filter: grayscale(0.18) saturate(0.82) contrast(0.92);
+  background: rgba(255, 255, 255, 0.68);
+}
+
+.choice-grid > label:has(input:checked),
+.segmented > label:has(input:checked),
+.strategy-box > .strategy-option:has(input:checked) {
+  opacity: 1;
+  filter: none;
+}
+
+/* 复选信号组不做同组降权，避免多信号并存时误导。 */
+.check-grid:has(input:checked) > label:not(:has(input:checked)) {
+  opacity: 1;
+  filter: none;
+}
+
+
+.is-hidden {
+  opacity: 0.34 !important;
+  filter: grayscale(0.55) saturate(0.45) contrast(0.72) !important;
+}
+/* 趋势条件淡化项：
+   非下跌趋势时，“下跌后首次高量三天内”仍显示，但降低透明度/对比度并禁用。 */
+.is-inactive-by-trend {
+  opacity: 0.34 !important;
+  filter: grayscale(0.55) saturate(0.45) contrast(0.72) !important;
+  background: rgba(255, 255, 255, 0.28) !important;
+  border-color: color-mix(in srgb, var(--line) 72%, #ffffff) !important;
+  cursor: not-allowed !important;
+}
+
+.is-inactive-by-trend input {
+  cursor: not-allowed !important;
+}
+
+.is-inactive-by-trend::after {
+  opacity: 0.55;
+}
+
+/* 趋势风控版补充样式：沿用原有米色卡片风格，仅补充新动作/新选项。 */
+.strategy-option:has(input:checked) {
+  border-color: var(--accent);
+  background: #f3e4d0;
+}
+.strategy-option.broad_index:has(input:checked) { border-color: var(--green); background: var(--green-soft); }
+.strategy-option.sector_etf:has(input:checked) { border-color: var(--blue); background: var(--blue-soft); }
+.strategy-option.large_stock:has(input:checked) { border-color: var(--amber); background: var(--amber-soft); }
+.strategy-option.high_vol:has(input:checked) { border-color: var(--red); background: var(--red-soft); }
+
+.result-card.清仓,
+.result-card.大减仓,
+.result-card.减仓,
+.result-card.止盈 { border-color: rgba(184, 68, 68, .55); }
+.result-card.试仓,
+.result-card.买入,
+.result-card.加仓,
+.result-card.重仓 { border-color: rgba(22, 135, 101, .55); }
+.result-card.观望,
+.result-card.持有,
+.result-card.idle { border-color: rgba(143, 95, 54, .22); }
+
+.signal-card .field { margin-bottom: 10px; }
+.config-form .strategy-box { grid-column: 1 / -1; }
+.config-form .position-tile { min-height: 64px; }
+
+@media (max-width: 900px) {
+  .config-form .field,
+  .config-form .position-tile { grid-column: auto; }
+}
+
+/* 自动数据版补充样式：保留原有米色卡片风格。 */
+.asset-search-box {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.asset-search-box .field { margin: 0; }
+.btn.mini {
+  align-self: stretch;
+  background: #33261e;
+  color: #fff6e8;
+  padding: 9px 12px;
+  min-width: 72px;
+}
+.candidate-list {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 7px;
+}
+.candidate-item {
+  width: 100%;
+  text-align: left;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: rgba(255,255,255,.56);
+  padding: 9px 10px;
+  cursor: pointer;
+  display: grid;
+  gap: 3px;
+  color: var(--ink);
+}
+.candidate-item:hover {
+  background: #fffdf9;
+  transform: translateY(-1px);
+}
+.candidate-item strong { font-size: 14px; color: var(--accent-dark); }
+.candidate-item span { font-size: 13px; font-weight: 800; }
+.candidate-item em, .candidate-empty {
+  font-style: normal;
+  color: var(--muted);
+  font-size: 12px;
+}
+.selected-asset {
+  grid-column: 1 / -1;
+  padding: 10px 11px;
+  border: 1px dashed #bda891;
+  border-radius: 14px;
+  background: #fff8ed;
+  display: grid;
+  gap: 4px;
+}
+.selected-asset span, .selected-asset em {
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+}
+.selected-asset strong { color: var(--accent-dark); font-size: 15px; }
+.auto-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.auto-data-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.auto-data-item {
+  padding: 9px;
+  border-radius: 12px;
+  background: rgba(255,255,255,.58);
+  border: 1px solid var(--line);
+}
+.auto-data-item span {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+.auto-data-item strong {
+  font-size: 13px;
+  word-break: break-word;
+}
+.data-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 8px;
+}
+.data-grid .field { margin: 0; }
+.soft-top { margin-top: 10px; }
+.config-form .field,
+.config-form .position-tile { grid-column: auto; }
+.config-form .strategy-box,
+.config-form .strategy-summary,
+.config-form .btn.secondary { grid-column: 1 / -1; }
+
+@media (max-width: 560px) {
+  .asset-search-box { grid-template-columns: 1fr; }
+  .btn.mini { width: 100%; }
+}
+
+.data-source-box {
+  grid-column: 1 / -1;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: rgba(255,255,255,.42);
+  overflow: hidden;
+}
+.data-source-box summary {
+  cursor: pointer;
+  padding: 10px 12px;
+  color: #46372b;
+  font-weight: 900;
+}
+.data-source-box[open] {
+  padding-bottom: 10px;
+}
+.data-source-box[open] summary {
+  margin-bottom: 6px;
+  background: #f1e5d5;
+}
+.data-source-box .field {
+  margin: 8px 10px 0;
+}
+.data-source-box input[type="text"] {
+  width: 100%;
+  border: 1px solid #cfc1b2;
+  border-radius: 10px;
+  padding: 8px 9px;
+  background: #fffdfa;
+  color: var(--ink);
+  font-size: 14px;
+}
+.fetch-trace {
+  grid-column: 1 / -1;
+  padding: 8px 10px;
+  border: 1px dashed #c9b9a5;
+  border-radius: 13px;
+  background: #fff8ed;
+  color: #4d3b2c;
+  font-size: 12px;
+}
+.fetch-trace summary {
+  cursor: pointer;
+  font-weight: 900;
+}
+.fetch-trace ul {
+  margin: 8px 0 0;
+  padding-left: 18px;
+}
+.fetch-trace li + li { margin-top: 4px; }
+
+/* v10：顶部设置弹窗 + 接口连通性测试 + 搜索栏折叠动画 */
+input[type="text"], textarea {
+  width: 100%;
+  border: 1px solid #cfc1b2;
+  border-radius: 10px;
+  padding: 8px 9px;
+  background: #fffdfa;
+  color: var(--ink);
+  font-size: 14px;
+}
+textarea { resize: vertical; min-height: 74px; }
+
+.ghost-btn.dark {
+  border-color: rgba(47, 36, 29, .24);
+  background: #efe2d0;
+  color: #3a2b22;
+}
+.ghost-btn.dark:hover { background: #e6d4bd; }
+
+.asset-search-box {
+  overflow: hidden;
+  max-height: 0;
+  opacity: 0;
+  transform: translateY(-6px);
+  margin-bottom: 0;
+  pointer-events: none;
+  transition: max-height .22s ease, opacity .18s ease, transform .18s ease, margin-bottom .18s ease;
+}
+.asset-search-box.is-open {
+  max-height: 380px;
+  opacity: 1;
+  transform: translateY(0);
+  margin-bottom: 10px;
+  pointer-events: auto;
+}
+.selected-asset {
+  cursor: pointer;
+  transition: background .16s ease, border-color .16s ease, transform .12s ease;
+}
+.selected-asset:hover {
+  background: #fff3df;
+  border-color: var(--accent);
+  transform: translateY(-1px);
+}
+.selected-asset::after {
+  content: "点击搜索 / 切换标的";
+  color: #9b7851;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.settings-modal[hidden] { display: none; }
+.settings-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 1400;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+}
+.settings-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(28, 20, 14, .34);
+  opacity: 0;
+  transition: opacity .18s ease;
+}
+.settings-panel {
+  position: relative;
+  width: min(880px, calc(100vw - 28px));
+  max-height: min(82vh, 760px);
+  overflow: auto;
+  border: 1px solid #cdb99f;
+  border-radius: 22px;
+  background: #fffaf2;
+  box-shadow: 0 24px 70px rgba(48, 34, 22, .28);
+  padding: 16px;
+  transform: translateY(12px) scale(.985);
+  opacity: 0;
+  transition: transform .18s ease, opacity .18s ease;
+}
+.settings-modal.is-open .settings-backdrop { opacity: 1; }
+.settings-modal.is-open .settings-panel {
+  transform: translateY(0) scale(1);
+  opacity: 1;
+}
+.settings-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+}
+.settings-head h2 {
+  margin: 0 0 4px;
+  color: #30241d;
+  font-size: 20px;
+}
+.settings-head p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.settings-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+}
+.settings-grid .field { margin: 0; }
+.settings-grid .wide { grid-column: 1 / -1; }
+.settings-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+  margin: 12px 0 10px;
+}
+.btn.mini.light {
+  background: #efe2d0;
+  color: #3a2b22;
+  border: 1px solid #d6c4ad;
+}
+.connection-test-results {
+  display: grid;
+  gap: 8px;
+}
+.test-empty {
+  padding: 10px 12px;
+  border: 1px dashed #c9b9a5;
+  border-radius: 13px;
+  background: #fff8ed;
+  color: var(--muted);
+  font-size: 13px;
+}
+.test-empty.error { color: var(--red); border-color: rgba(184,68,68,.35); background: var(--red-soft); }
+.connection-test-item {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(255,255,255,.6);
+  overflow: hidden;
+}
+.connection-test-item.ok { border-color: rgba(22,135,101,.35); }
+.connection-test-item.fail { border-color: rgba(184,68,68,.42); }
+.connection-test-item summary {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  cursor: pointer;
+  padding: 10px 12px;
+  font-weight: 900;
+}
+.connection-test-item.ok summary { background: var(--green-soft); color: var(--green); }
+.connection-test-item.fail summary { background: var(--red-soft); color: var(--red); }
+.connection-test-item summary span { font-size: 12px; color: inherit; opacity: .86; }
+.test-line, .test-grid, .test-block {
+  margin: 9px 12px;
+  color: #3d332b;
+  font-size: 12px;
+}
+.test-line {
+  display: grid;
+  gap: 4px;
+}
+.test-line code {
+  display: block;
+  padding: 7px 8px;
+  border-radius: 9px;
+  background: #f3eadf;
+  word-break: break-all;
+}
+.test-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.test-block pre {
+  margin: 5px 0 0;
+  max-height: 160px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  padding: 8px;
+  border-radius: 10px;
+  background: #f3eadf;
+  color: #31261f;
+}
+
+@media (max-width: 720px) {
+  .settings-grid, .test-grid { grid-template-columns: 1fr; }
+  .settings-head { flex-direction: column; }
+  .settings-panel { max-height: 88vh; }
+}
+
+/* v13：外置指数/基金映射表编辑器 */
+.mapping-editor {
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: rgba(255,255,255,.46);
+  overflow: hidden;
+}
+.mapping-editor summary {
+  cursor: pointer;
+  padding: 11px 12px;
+  font-weight: 900;
+  color: #44362b;
+  background: #f1e5d5;
+}
+.mapping-editor p {
+  margin: 10px 12px 8px;
+}
+#index-map-editor {
+  display: block;
+  margin: 0 12px 10px;
+  width: calc(100% - 24px);
+  min-height: 260px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre;
+}
+.settings-actions.slim {
+  margin: 0 12px 12px;
+}
+
+/* v19：脚本自动填写的选项只用更粗的蓝色边框强调，不再显示“自动”标签。 */
+.choice-grid > label.is-auto-filled,
+.check-grid > label.is-auto-filled,
+.segmented > label.is-auto-filled {
+  border-color: var(--blue) !important;
+  border-width: 2px !important;
+  box-shadow:
+    0 0 0 3px rgba(70, 107, 143, .18),
+    inset 0 0 0 1px rgba(70, 107, 143, .18) !important;
+}
+
+
+/* v20：量价辅助里选择“暂无明显量价信号”时，其他量价项也降权显示；
+   选择具体量价项时，“暂无明显量价信号”降权。 */
+.volume-confirm-grid:has(input[name="volume_state"][value="none"]:checked) > label:not(:has(input[name="volume_state"][value="none"])),
+.volume-confirm-grid:has(input[name="volume_confirm"]:checked, input[name="pullback_volume_dry"]:checked, input[name="upper_shadow"]:checked, input[name="failed_close"]:checked, input[name="far_from_ma"]:checked) > label:has(input[name="volume_state"][value="none"]) {
+  opacity: 0.42;
+  filter: grayscale(0.38) saturate(0.65) contrast(0.82);
+  background: rgba(255, 255, 255, 0.38);
+  border-color: color-mix(in srgb, var(--line) 70%, #ffffff);
+}
+
+.volume-confirm-grid:has(input[name="volume_state"][value="none"]:checked) > label:not(:has(input[name="volume_state"][value="none"])):hover,
+.volume-confirm-grid:has(input[name="volume_confirm"]:checked, input[name="pullback_volume_dry"]:checked, input[name="upper_shadow"]:checked, input[name="failed_close"]:checked, input[name="far_from_ma"]:checked) > label:has(input[name="volume_state"][value="none"]):hover {
+  opacity: 0.72;
+  filter: grayscale(0.18) saturate(0.82) contrast(0.92);
+  background: rgba(255, 255, 255, 0.68);
+}
+
+/* v23：实时结果标题用动作 + 本次变化量展示，颜色表达方向。 */
+.result-action-text {
+  font-weight: 950;
+}
+.result-action-text.buy { color: var(--green); }
+.result-action-text.sell { color: var(--red); }
+.result-action-text.hold { color: var(--ink); }
+.big-action strong.result-headline-text.buy { color: #bdf3d7; }
+.big-action strong.result-headline-text.sell { color: #ffd0ca; }
+.big-action strong.result-headline-text.hold { color: #fff7e9; }
+.big-action span {
+  display: block;
+  line-height: 1.55;
+}
+
+/* v25：结果卡片布局。移除“实时计算结果”标题，把操作建议和一致性指标放在同一行，解释置于下方。 */
+.result-summary {
+  margin: 2px 0 14px;
+  padding: 18px 20px;
+  border-radius: 18px;
+  background: #33261e;
+  color: #fff7e9;
+}
+.result-summary-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+.result-summary #result-headline,
+.result-summary .result-headline-text {
+  display: block;
+  margin: 0;
+  line-height: 1.05;
+  font-size: clamp(34px, 4.4vw, 54px);
+  font-weight: 950;
+  letter-spacing: -0.04em;
+}
+.result-summary .result-headline-text.buy { color: #bdf3d7; }
+.result-summary .result-headline-text.sell { color: #ffd0ca; }
+.result-summary .result-headline-text.hold { color: #fff7e9; }
+.result-summary .confidence {
+  width: 92px;
+  height: 92px;
+  flex: 0 0 auto;
+  background: #f1e5d5;
+  border-color: rgba(255, 247, 233, .28);
+}
+.result-explain {
+  margin: 14px 0 0;
+  color: #ead9c2;
+  font-size: 15px;
+  line-height: 1.55;
+  font-weight: 650;
+}
+@media (max-width: 560px) {
+  .result-summary { padding: 15px; }
+  .result-summary .confidence {
+    width: 76px;
+    height: 76px;
+  }
+  .result-summary .confidence span { font-size: 20px; }
+  .result-summary-row { align-items: flex-start; }
+}
+
+/* v37：历史回测模拟改为三栏内切换：中间=回测配置，右侧=回测结果 */
+.backtest-config-pane {
+  grid-area: signal;
+  min-height: 0;
+  padding-right: 2px;
+}
+.backtest-result-pane {
+  grid-area: result;
+  min-height: 0;
+  overflow: auto;
+}
+.backtest-config-pane[hidden],
+.backtest-result-pane[hidden] {
+  display: none !important;
+}
+.backtest-form-card, .backtest-result-card { min-width: 0; }
+.backtest-title-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.backtest-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+}
+.backtest-form .field,
+.backtest-form .backtest-fieldset,
+.backtest-form .backtest-run-btn {
+  min-width: 0;
+}
+.backtest-fieldset {
+  grid-column: 1 / -1;
+}
+.backtest-run-btn {
+  grid-column: 1 / -1;
+}
+.export-field .inline-check {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0;
+  color: var(--ink);
+  font-weight: 800;
+}
+.backtest-table-wrap {
+  max-height: min(52vh, 520px);
+  overflow: auto;
+  border-top: 1px solid var(--line);
+}
+.backtest-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  background: rgba(255,255,255,.46);
+}
+.backtest-table th,
+.backtest-table td {
+  padding: 8px 9px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+  white-space: nowrap;
+}
+.backtest-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: #efe2d0;
+  color: var(--accent-dark);
+  font-weight: 950;
+}
+.backtest-table td:last-child {
+  white-space: normal;
+  min-width: 180px;
+}
+.backtest-export-info {
+  padding: 10px 12px 14px;
+  font-size: 13px;
+  color: #3d332b;
+  line-height: 1.6;
+}
+.backtest-export-info code {
+  padding: 2px 5px;
+  border-radius: 6px;
+  background: #f3eadf;
+  word-break: break-all;
+}
+@media (max-width: 900px) {
+  .backtest-config-pane, .backtest-result-pane { overflow: visible; }
+}
+@media (max-width: 560px) {
+  .backtest-form { grid-template-columns: 1fr; }
+  .backtest-title-actions { justify-content: flex-start; }
+}
+
+/* v40: 回测模式隐藏当前持仓/盈亏/当前仓位等实时持仓字段。
+   需要 !important，避免 .field / .position-tile 的 display 样式覆盖 hidden 属性。 */
+[hidden],
+.app-shell[data-view="backtest"] [data-hide-in-backtest] {
+  display: none !important;
+}
+
+/* v41: 回测表格预览按钮与弹窗 */
+.backtest-section-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.backtest-section-summary::-webkit-details-marker { display: none; }
+.mini-action-btn {
+  border: 1px solid rgba(70, 107, 143, .35);
+  border-radius: 999px;
+  background: var(--blue-soft);
+  color: var(--blue);
+  padding: 5px 10px;
+  font-size: 12px;
+  font-weight: 900;
+  cursor: pointer;
+  line-height: 1.2;
+}
+.mini-action-btn:hover {
+  background: #d8e5f1;
+  border-color: rgba(70, 107, 143, .6);
+}
+.preview-modal-open { overflow: hidden; }
+.table-preview-modal[hidden] { display: none; }
+.table-preview-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  display: grid;
+  place-items: center;
+  padding: clamp(12px, 2vw, 26px);
+}
+.table-preview-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(30, 22, 15, .45);
+  backdrop-filter: blur(3px);
+}
+.table-preview-dialog {
+  position: relative;
+  width: min(1120px, 96vw);
+  max-height: min(84vh, 900px);
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  background: var(--card);
+  box-shadow: 0 24px 70px rgba(0,0,0,.28);
+  overflow: hidden;
+}
+.table-preview-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 14px 16px;
+  background: #2f241d;
+  color: #fff6e8;
+}
+.table-preview-head h2 {
+  margin: 2px 0 0;
+  font-size: 19px;
+}
+.preview-close-btn { flex: 0 0 auto; }
+.table-preview-body {
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+}
+.table-preview-body .backtest-table-wrap {
+  max-height: none;
+}
+.table-preview-body .backtest-table {
+  font-size: 13px;
+}
+.table-preview-body .backtest-table th {
+  top: 0;
+}
+
+/* v42：回测估值模式为“非固定估值”时，固定估值输入自动禁用淡化。 */
+.backtest-fixed-valuation.is-disabled {
+  opacity: .38;
+  filter: grayscale(.25);
+  pointer-events: none;
+}
+.backtest-fixed-valuation.is-disabled input {
+  background: rgba(255,255,255,.38);
+}

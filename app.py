@@ -1,0 +1,4609 @@
+from __future__ import annotations
+
+import csv
+import json
+import math
+import os
+import re
+import time
+import contextlib
+from io import StringIO
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from flask import Flask, jsonify, render_template, request
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(APP_DIR, "data")
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+INDEX_MAP_PATH = os.path.join(DATA_DIR, "index_map.json")
+
+app = Flask(__name__)
+app.secret_key = "local-trend-risk-position-tool"
+
+
+STRATEGY_PRESETS: Dict[str, Dict[str, Any]] = {
+    "defensive": {
+        "name": "防守",
+        "buy_step": 0.18,
+        "sell_step": 0.55,
+        "risk_multiplier": 0.75,
+        "desc": "买入更慢，卖出更快；适合不想承受大回撤。",
+    },
+    "balanced": {
+        "name": "均衡",
+        "buy_step": 0.28,
+        "sell_step": 0.45,
+        "risk_multiplier": 1.00,
+        "desc": "默认档；趋势、止损、仓位三者平衡。",
+    },
+    "aggressive": {
+        "name": "进攻",
+        "buy_step": 0.38,
+        "sell_step": 0.35,
+        "risk_multiplier": 1.25,
+        "desc": "盈利后加仓更快，但破位清仓不打折。",
+    },
+}
+
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "plan_amount": 10000.0,
+    "current_position_amount": 0.0,
+    "current_profit_pct": 0.0,
+    "strategy": "balanced",
+    "position_mode": "core_satellite",  # core_satellite / strict_trade
+    "risk_per_trade_pct": 1.0,
+    "symbol": "",
+    "symbol_name": "",
+    "market": "auto",
+    "asset_kind": "auto",
+    "data_source": "auto",
+    "proxy_mode": "system",  # system / custom / none
+    "proxy_url": "",
+    "request_timeout_sec": 12.0,
+    "retry_count": 2,
+    "danjuan_cookie": "",
+    "valuation_method": "system_calc",  # system_calc / danjuan
+}
+
+DEFAULT_INDEX_MAPPING: Dict[str, Any] = {
+    "version": 1,
+    "comment": "指数/基金估值映射表。基金/ETF 自身通常没有 PE 百分位，需映射到跟踪指数。可直接编辑本文件，保存后在设置页点击『重载映射表』或重启应用。",
+    "local_symbols": [
+        {"symbol": "NVDA", "name": "NVIDIA Corporation / 英伟达", "market": "US", "asset_kind": "stock", "source": "yfinance"},
+        {"symbol": "AAPL", "name": "Apple Inc. / 苹果", "market": "US", "asset_kind": "stock", "source": "yfinance"},
+        {"symbol": "MSFT", "name": "Microsoft Corporation / 微软", "market": "US", "asset_kind": "stock", "source": "yfinance"},
+        {"symbol": "TSLA", "name": "Tesla, Inc. / 特斯拉", "market": "US", "asset_kind": "stock", "source": "yfinance"},
+        {"symbol": "AMD", "name": "Advanced Micro Devices / AMD", "market": "US", "asset_kind": "stock", "source": "yfinance"},
+        {"symbol": "QQQ", "name": "Invesco QQQ Trust / 纳斯达克100ETF", "market": "US", "asset_kind": "etf", "source": "yfinance"},
+        {"symbol": "SPY", "name": "SPDR S&P 500 ETF / 标普500ETF", "market": "US", "asset_kind": "etf", "source": "yfinance"},
+        {"symbol": "000300", "name": "沪深300指数", "market": "CN", "asset_kind": "index", "source": "akshare"},
+        {"symbol": "510300", "name": "沪深300ETF", "market": "CN", "asset_kind": "etf", "source": "akshare"},
+        {"symbol": "513100", "name": "纳指ETF / 纳斯达克100ETF", "market": "CN", "asset_kind": "etf", "source": "akshare"},
+        {"symbol": "270042", "name": "广发纳斯达克100ETF联接(QDII)A", "market": "CN", "asset_kind": "fund", "source": "akshare"}
+    ],
+    "aliases": {
+        "英伟达": ["NVDA"],
+        "nvidia": ["NVDA"],
+        "nvda": ["NVDA"],
+        "苹果": ["AAPL"],
+        "微软": ["MSFT"],
+        "特斯拉": ["TSLA"],
+        "纳斯达克100": ["QQQ", "513100", "270042"],
+        "纳指100": ["QQQ", "513100", "270042"],
+        "标普500": ["SPY"],
+        "s&p500": ["SPY"],
+        "sp500": ["SPY"],
+        "沪深300": ["000300", "510300"]
+    },
+    "index_codes": {
+        "000300": "SH000300",
+        "000016": "SH000016",
+        "000905": "SH000905",
+        "000852": "SH000852",
+        "000688": "SH000688",
+        "399006": "SZ399006",
+        "399001": "SZ399001",
+        "399005": "SZ399005",
+        "000922": "SH000922",
+        "NDX": "NDX",
+        "SP500": "SP500"
+    },
+    "fund_index_map": {
+        "510300": "SH000300",
+        "159919": "SH000300",
+        "110020": "SH000300",
+        "510500": "SH000905",
+        "159922": "SH000905",
+        "160119": "SH000905",
+        "512100": "SH000852",
+        "159845": "SH000852",
+        "588000": "SH000688",
+        "588080": "SH000688",
+        "159915": "SZ399006",
+        "110026": "SZ399006",
+        "510050": "SH000016",
+        "513100": "NDX",
+        "159941": "NDX",
+        "270042": "NDX",
+        "513500": "SP500",
+        "161125": "SP500",
+        "050025": "SP500"
+    },
+    "index_names": {
+        "SH000300": "沪深300",
+        "SH000016": "上证50",
+        "SH000905": "中证500",
+        "SH000852": "中证1000",
+        "SH000688": "科创50",
+        "SZ399006": "创业板指",
+        "SZ399001": "深证成指",
+        "SZ399005": "中小100",
+        "SH000922": "中证红利",
+        "NDX": "纳斯达克100",
+        "SP500": "标普500"
+    },
+    "keyword_rules": [
+        {"keywords": ["纳指", "纳斯达克", "NASDAQ", "NDX"], "index_code": "NDX"},
+        {"keywords": ["标普", "S&P", "SP500", "S&P500"], "index_code": "SP500"},
+        {"keywords": ["沪深300", "CSI300"], "index_code": "SH000300"},
+        {"keywords": ["上证50"], "index_code": "SH000016"},
+        {"keywords": ["中证500"], "index_code": "SH000905"},
+        {"keywords": ["中证1000"], "index_code": "SH000852"},
+        {"keywords": ["科创50", "科创板50"], "index_code": "SH000688"},
+        {"keywords": ["创业板", "创业板指"], "index_code": "SZ399006"},
+        {"keywords": ["中证红利"], "index_code": "SH000922"}
+    ]
+}
+
+
+def _safe_json_copy(value: Any) -> Any:
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def _normalize_index_mapping(mapping: Dict[str, Any]) -> Dict[str, Any]:
+    """校验外置映射表。顶层字段缺失时补默认；字段存在时以用户文件为准。"""
+    if not isinstance(mapping, dict):
+        mapping = {}
+    normalized = _safe_json_copy(mapping)
+    for key, default_value in DEFAULT_INDEX_MAPPING.items():
+        if key not in normalized:
+            normalized[key] = _safe_json_copy(default_value)
+
+    def norm_map(src: Any, upper_value: bool = True, digits_key: bool = False) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        if not isinstance(src, dict):
+            return out
+        for k, v in src.items():
+            key = re.sub(r"\D", "", str(k)) if digits_key else str(k).strip().upper()
+            val = str(v).strip().upper() if upper_value else str(v).strip()
+            if key and val:
+                out[key] = val
+        return out
+
+    normalized["index_codes"] = norm_map(normalized.get("index_codes"), upper_value=True, digits_key=False)
+    normalized["fund_index_map"] = norm_map(normalized.get("fund_index_map"), upper_value=True, digits_key=True)
+    normalized["index_names"] = norm_map(normalized.get("index_names"), upper_value=False, digits_key=False)
+
+    local_symbols: List[Dict[str, str]] = []
+    for item in normalized.get("local_symbols") or []:
+        if not isinstance(item, dict):
+            continue
+        symbol = str(item.get("symbol") or "").strip()
+        if not symbol:
+            continue
+        local_symbols.append({
+            "symbol": symbol.upper() if re.search(r"[A-Za-z]", symbol) else symbol,
+            "name": str(item.get("name") or symbol).strip(),
+            "market": str(item.get("market") or "auto").strip(),
+            "asset_kind": str(item.get("asset_kind") or "auto").strip(),
+            "source": str(item.get("source") or "auto").strip(),
+        })
+    normalized["local_symbols"] = local_symbols
+
+    aliases: Dict[str, List[str]] = {}
+    for k, values in (normalized.get("aliases") or {}).items():
+        if not isinstance(values, list):
+            values = [values]
+        aliases[re.sub(r"\s+", "", str(k or "").strip().lower())] = [str(v).strip().upper() for v in values if str(v).strip()]
+    normalized["aliases"] = aliases
+
+    rules: List[Dict[str, Any]] = []
+    for rule in normalized.get("keyword_rules") or []:
+        if not isinstance(rule, dict):
+            continue
+        keywords = rule.get("keywords") or []
+        if isinstance(keywords, str):
+            keywords = [keywords]
+        index_code = str(rule.get("index_code") or "").strip().upper()
+        if keywords and index_code:
+            rules.append({"keywords": [str(k) for k in keywords if str(k)], "index_code": index_code})
+    normalized["keyword_rules"] = rules
+    return normalized
+
+
+def load_index_mapping() -> Dict[str, Any]:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    if not os.path.exists(INDEX_MAP_PATH):
+        mapping = _normalize_index_mapping(DEFAULT_INDEX_MAPPING)
+        save_index_mapping(mapping, apply=False)
+        return mapping
+    try:
+        with open(INDEX_MAP_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = DEFAULT_INDEX_MAPPING
+    mapping = _normalize_index_mapping(data)
+    # 回写一次：让旧文件自动补齐新增字段，但不覆盖用户已存在的映射内容。
+    save_index_mapping(mapping, apply=False)
+    return mapping
+
+
+def save_index_mapping(mapping: Dict[str, Any], apply: bool = True) -> Dict[str, Any]:
+    normalized = _normalize_index_mapping(mapping)
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(INDEX_MAP_PATH, "w", encoding="utf-8") as f:
+        json.dump(normalized, f, ensure_ascii=False, indent=2)
+    if apply:
+        apply_index_mapping(normalized)
+    return normalized
+
+
+def apply_index_mapping(mapping: Optional[Dict[str, Any]] = None) -> None:
+    global INDEX_MAPPING, INDEX_CODE_MAP, FUND_INDEX_MAP, AK_INDEX_NAME_MAP, INDEX_KEYWORD_RULES, LOCAL_SYMBOLS, ALIASES
+    INDEX_MAPPING = _normalize_index_mapping(mapping or load_index_mapping())
+    INDEX_CODE_MAP = INDEX_MAPPING.get("index_codes", {})
+    FUND_INDEX_MAP = INDEX_MAPPING.get("fund_index_map", {})
+    AK_INDEX_NAME_MAP = INDEX_MAPPING.get("index_names", {})
+    INDEX_KEYWORD_RULES = INDEX_MAPPING.get("keyword_rules", [])
+    LOCAL_SYMBOLS = INDEX_MAPPING.get("local_symbols", [])
+    ALIASES = INDEX_MAPPING.get("aliases", {})
+
+
+INDEX_MAPPING: Dict[str, Any] = {}
+INDEX_CODE_MAP: Dict[str, str] = {}
+FUND_INDEX_MAP: Dict[str, str] = {}
+AK_INDEX_NAME_MAP: Dict[str, str] = {}
+INDEX_KEYWORD_RULES: List[Dict[str, Any]] = []
+LOCAL_SYMBOLS: List[Dict[str, str]] = []
+ALIASES: Dict[str, List[str]] = {}
+apply_index_mapping()
+
+
+
+@dataclass
+class Decision:
+    action: str = "观望"
+    target_position: float = 0.0
+    confidence: int = 50
+    reason: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    matched_rule: str = "未触发明确信号"
+    risk_score: int = 0
+    trend_score: int = 0
+    risk_cap: float = 0.0
+    buy_step_limit: float = 0.0
+    sell_step_limit: float = 0.0
+    stop_distance: float = 0.0
+    valuation_adjustment: float = 0.0
+    quality_adjustment: float = 0.0
+    core_floor: float = 0.0
+    signal_quality: int = 50
+    expected_reward_r: float = 0.0
+    trade_frequency: str = "不操作"
+    opportunity_grade: str = "中性"
+
+
+def clamp(x: float, low: float, high: float) -> float:
+    return max(low, min(high, x))
+
+
+def pct(x: float) -> str:
+    return f"{round(x * 100):.0f}%"
+
+
+def pct2(x: float) -> str:
+    return f"{x * 100:.2f}%"
+
+
+
+
+def valuation_method_text(value: Any) -> str:
+    value = str(value or "system_calc")
+    if value == "danjuan":
+        return "蛋卷（雪球）"
+    return "乐咕乐股"
+
+def money(x: float) -> str:
+    return f"{x:,.2f}"
+
+
+def as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        v = float(value)
+        if math.isnan(v) or math.isinf(v):
+            return default
+        return v
+    except (TypeError, ValueError):
+        return default
+
+
+def get_bool(form: Dict[str, Any], key: str) -> bool:
+    return form.get(key) == "on" or form.get(key) is True
+
+
+def ensure_config() -> Dict[str, Any]:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    if not os.path.exists(CONFIG_PATH):
+        cfg = DEFAULT_CONFIG.copy()
+        save_config(cfg)
+        return cfg
+
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+
+    merged = DEFAULT_CONFIG.copy()
+    merged.update(data)
+
+    if merged.get("strategy") not in STRATEGY_PRESETS:
+        old = str(merged.get("risk_sensitivity", "balanced"))
+        merged["strategy"] = old if old in STRATEGY_PRESETS else "balanced"
+    if merged.get("position_mode") not in {"core_satellite", "strict_trade"}:
+        merged["position_mode"] = "core_satellite"
+
+    merged["plan_amount"] = max(as_float(merged.get("plan_amount"), DEFAULT_CONFIG["plan_amount"]), 0.0)
+    merged["current_position_amount"] = max(as_float(merged.get("current_position_amount"), 0.0), 0.0)
+    # 兼容旧版：不再用“持仓成本/买入价”，改为直接填写当前涨跌幅/持仓盈亏率。
+    merged.pop("cost_basis_price", None)
+    merged.pop("core_floor_pct", None)
+    merged.pop("asset_type", None)
+    merged["current_profit_pct"] = clamp(as_float(merged.get("current_profit_pct"), 0.0), -99.99, 9999.0)
+    merged["risk_per_trade_pct"] = clamp(as_float(merged.get("risk_per_trade_pct"), 1.0), 0.1, 100.0)
+
+    for key in ["symbol", "symbol_name", "market", "asset_kind", "data_source", "proxy_mode", "proxy_url", "danjuan_cookie", "valuation_method"]:
+        merged[key] = str(merged.get(key, DEFAULT_CONFIG.get(key, "")) or DEFAULT_CONFIG.get(key, ""))
+    if merged.get("proxy_mode") not in {"system", "custom", "none"}:
+        merged["proxy_mode"] = "system"
+    if merged.get("valuation_method") not in {"system_calc", "danjuan"}:
+        # 兼容旧配置：旧版的 auto 统一迁移到“乐咕乐股/系统自算”。
+        merged["valuation_method"] = "system_calc"
+    merged["request_timeout_sec"] = clamp(as_float(merged.get("request_timeout_sec"), 12.0), 3.0, 60.0)
+    merged["retry_count"] = int(clamp(as_float(merged.get("retry_count"), 2.0), 0.0, 5.0))
+
+    save_config(merged)
+    return merged
+
+
+def save_config(cfg: Dict[str, Any]) -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+def get_strategy(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    return STRATEGY_PRESETS.get(str(cfg.get("strategy", "balanced")), STRATEGY_PRESETS["balanced"])
+
+
+def current_position(cfg: Dict[str, Any]) -> float:
+    plan = max(as_float(cfg.get("plan_amount"), 0.0), 0.0)
+    current_amount = max(as_float(cfg.get("current_position_amount"), 0.0), 0.0)
+    return clamp(current_amount / plan, 0.0, 2.0) if plan > 0 else 0.0
+
+
+def lower_floor(cfg: Dict[str, Any], signals: Any) -> float:
+    """系统自动计算动态防守仓位。
+
+    - 纯交易仓：0%。
+    - 长期底仓+交易仓：不是固定死守底仓，而是随趋势、估值、质量和风险状态动态下降。
+    - 趋势好时保留长期暴露；行情变差、跌破关键线或触发止损时，防守仓位可降到 0%~10%。
+    - 计划资金仍然是 100% 上限；这里不是仓位上限，只是风险状态下最多保留的防守目标。
+    """
+    if cfg.get("position_mode") == "strict_trade":
+        return 0.0
+
+    if isinstance(signals, dict):
+        market_state = str(signals.get("market_state", "sideways"))
+        exit_state = str(signals.get("exit_state", "none"))
+        pe = signals.get("pe_percentile")
+        pb = signals.get("pb_percentile")
+        roe = signals.get("roe_pct")
+        market_risk = bool(signals.get("market_risk"))
+    else:
+        market_state = str(signals or "sideways")
+        exit_state = "none"
+        pe = pb = roe = None
+        market_risk = False
+
+    # 基础防守仓位：比旧版更克制。强多头才允许较高防守仓位，弱势/熊市不硬守。
+    base_map = {
+        "bear": 0.00,
+        "below_200": 0.03,
+        "sideways": 0.12,
+        "above_200": 0.22,
+        "strong_bull": 0.32,
+    }
+    floor = base_map.get(market_state, 0.12)
+
+    pe_v: Optional[float] = None
+    pb_v: Optional[float] = None
+
+    # 估值是防守仓位刹车：低估可以多留一点，高估会明显压低，但仍连续变化。
+    if pe is not None:
+        pe_v = clamp(as_float(pe), 0.0, 100.0)
+        floor += (50.0 - pe_v) / 100.0 * 0.12
+        if pe_v >= 80:
+            floor -= (pe_v - 80.0) / 20.0 * 0.08
+    elif pb is not None:
+        pb_v = clamp(as_float(pb), 0.0, 100.0)
+        floor += (50.0 - pb_v) / 100.0 * 0.08
+        if pb_v >= 80:
+            floor -= (pb_v - 80.0) / 20.0 * 0.05
+
+    # ROE只做质量微调，不允许它覆盖趋势纪律。
+    if roe is not None:
+        roe_v = as_float(roe)
+        floor += clamp((roe_v - 12.0) / 20.0, -0.04, 0.05)
+
+    # 系统性风险出现时，底仓进一步变成防守仓。
+    if market_risk:
+        floor *= 0.55
+
+    # 风险事件对防守仓位设置硬上限：长期底仓不是信仰仓，行情坏时可以接近 0。
+    if market_state == "bear":
+        floor = min(floor, 0.05)
+    elif market_state == "below_200":
+        floor = min(floor, 0.10)
+
+    if exit_state == "hit_stop":
+        floor = min(floor, 0.05)
+        if market_state in {"bear", "below_200"} or market_risk or (pe_v is not None and pe_v >= 80):
+            floor = 0.0
+    elif exit_state == "below_200":
+        floor = min(floor, 0.08)
+        if market_risk or (pe_v is not None and pe_v >= 80):
+            floor = min(floor, 0.03)
+    elif exit_state == "below_50":
+        floor = min(floor, 0.15)
+    elif exit_state == "failed_breakout":
+        floor = min(floor, 0.20)
+    elif exit_state == "below_20":
+        floor = min(floor, 0.25)
+
+    return clamp(floor, 0.0, 0.45)
+
+def parse_optional_pct(form: Dict[str, Any], key: str) -> Optional[float]:
+    raw = form.get(key)
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_signals(form: Dict[str, Any]) -> Dict[str, Any]:
+    pe_percentile = parse_optional_pct(form, "pe_percentile")
+    roe_pct = parse_optional_pct(form, "roe_pct")
+    pb_percentile = parse_optional_pct(form, "pb_percentile")
+    return {
+        "market_state": str(form.get("market_state", "sideways")),
+        "entry_state": str(form.get("entry_state", "none")),
+        "exit_state": str(form.get("exit_state", "none")),
+        "profit_state": str(form.get("profit_state", "none")),
+        "volume_confirm": get_bool(form, "volume_confirm"),
+        "pullback_volume_dry": get_bool(form, "pullback_volume_dry"),
+        "upper_shadow": get_bool(form, "upper_shadow"),
+        "failed_close": get_bool(form, "failed_close"),
+        "far_from_ma": get_bool(form, "far_from_ma"),
+        "market_risk": get_bool(form, "market_risk"),
+        "stop_loss_pct": clamp(as_float(form.get("stop_loss_pct"), 0.0), 0.0, 80.0) / 100,
+        "pe_percentile": clamp(pe_percentile, 0.0, 100.0) if pe_percentile is not None else None,
+        "pb_percentile": clamp(pb_percentile, 0.0, 100.0) if pb_percentile is not None else None,
+        "roe_pct": roe_pct,
+    }
+
+
+def trend_score(signals: Dict[str, Any]) -> int:
+    market = signals["market_state"]
+    table = {
+        "bear": -60,
+        "below_200": -35,
+        "sideways": 0,
+        "above_200": 45,
+        "strong_bull": 75,
+    }
+    score = table.get(market, 0)
+    if signals["market_risk"]:
+        score -= 20
+    return int(clamp(score, -100, 100))
+
+
+def valuation_penalty_bonus(signals: Dict[str, Any], action: str) -> Tuple[float, List[str]]:
+    """PE/PB 百分位用连续曲线，不做硬分段。返回对目标仓位的加减值。"""
+    notes: List[str] = []
+    adj = 0.0
+    pe = signals.get("pe_percentile")
+    pb = signals.get("pb_percentile")
+
+    # PE 是主估值刹车：低估最多 +8%，高估最多 -18%。
+    if pe is not None:
+        if pe < 50:
+            adj += (50 - pe) / 50 * 0.08
+        else:
+            adj -= (pe - 50) / 50 * 0.18
+        if pe >= 90:
+            notes.append(f"历史PE百分位 {pe:.1f}%：极高估，新增仓位明显降权。")
+        elif pe >= 80:
+            notes.append(f"历史PE百分位 {pe:.1f}%：高估，买入仓位降权。")
+        elif pe <= 30:
+            notes.append(f"历史PE百分位 {pe:.1f}%：估值偏低，允许小幅放宽仓位。")
+        else:
+            notes.append(f"历史PE百分位 {pe:.1f}%：估值处于可接受区间。")
+
+    # PB 作为可选辅助，权重比 PE 低。
+    if pb is not None:
+        if pb < 50:
+            adj += (50 - pb) / 50 * 0.03
+        else:
+            adj -= (pb - 50) / 50 * 0.06
+        notes.append(f"历史PB百分位 {pb:.1f}%：作为辅助估值修正。")
+
+    if action not in {"试仓", "买入", "加仓", "重仓"}:
+        # 卖出/观望时只提示，不主动抬高目标；高估仍可略微强化减仓。
+        adj = min(adj, 0.0)
+    return clamp(adj, -0.24, 0.10), notes
+
+
+def quality_bonus(signals: Dict[str, Any], action: str) -> Tuple[float, List[str]]:
+    """ROE 用连续曲线：质量修正，不是买卖信号。"""
+    notes: List[str] = []
+    roe = signals.get("roe_pct")
+    if roe is None:
+        return 0.0, notes
+
+    # 12% 为中轴，25% 附近加分接近上限；8%以下扣分。
+    if roe >= 12:
+        adj = min((roe - 12) / 13 * 0.07, 0.07)
+    else:
+        adj = -min((12 - roe) / 12 * 0.07, 0.07)
+
+    # 极高估时，ROE不允许无限抵消估值风险。
+    pe = signals.get("pe_percentile")
+    if pe is not None and pe >= 90 and adj > 0:
+        adj *= 0.35
+        notes.append("PE极高估时，ROE优秀只保留少量质量加分，不抵消高估风险。")
+
+    if roe >= 18:
+        notes.append(f"ROE {roe:.1f}%：盈利质量较强，目标仓位小幅上调。")
+    elif roe < 8:
+        notes.append(f"ROE {roe:.1f}%：盈利质量偏弱，目标仓位下调。")
+    else:
+        notes.append(f"ROE {roe:.1f}%：质量修正接近中性。")
+
+    if action not in {"试仓", "买入", "加仓", "重仓"}:
+        adj = min(adj, 0.0)
+    return clamp(adj, -0.08, 0.07), notes
+
+
+def risk_score(signals: Dict[str, Any], cfg: Dict[str, Any]) -> Tuple[int, List[str]]:
+    score = 0
+    notes: List[str] = []
+    market = signals["market_state"]
+    exit_state = signals["exit_state"]
+
+    if market == "bear":
+        score += 38
+        notes.append("价格位于200日线下方且200日线向下，大趋势不利。")
+    elif market == "below_200":
+        score += 28
+        notes.append("价格仍在200日线下方，反转确认不足。")
+    elif market == "sideways":
+        score += 12
+        notes.append("震荡环境容易假突破，仓位需要打折。")
+
+    if exit_state == "below_20":
+        score += 18
+        notes.append("跌破20日线，短线趋势开始弱化。")
+    elif exit_state == "failed_breakout":
+        score += 30
+        notes.append("突破后收盘跌回突破位，属于假突破/失败突破风险。")
+    elif exit_state == "below_50":
+        score += 48
+        notes.append("跌破50日线，中期趋势明显受损。")
+    elif exit_state in {"below_200", "hit_stop"}:
+        score += 90
+        notes.append("跌破200日线或初始止损，交易理由已经失效。")
+
+    if signals["upper_shadow"]:
+        score += 14
+        notes.append("放量长上影/冲高回落，说明上方抛压明显。")
+    if signals["failed_close"]:
+        score += 14
+        notes.append("收盘没有站稳关键位，突破确认不足。")
+    if signals["far_from_ma"]:
+        score += 12
+        notes.append("价格远离均线，追高的风险收益比下降。")
+    if signals["market_risk"]:
+        score += 18
+        notes.append("大盘/同类资产同步走弱，单个标的信号需要降权。")
+
+    pe = signals.get("pe_percentile")
+    if pe is not None:
+        if pe >= 95:
+            score += 24
+            notes.append("历史PE百分位≥95%，估值风险非常高。")
+        elif pe >= 90:
+            score += 18
+            notes.append("历史PE百分位≥90%，估值风险高。")
+        elif pe >= 80:
+            score += 10
+            notes.append("历史PE百分位≥80%，买入需要更克制。")
+
+    roe = signals.get("roe_pct")
+    if roe is not None and roe < 8:
+        score += 10
+        notes.append("ROE低于8%，质量偏弱。")
+
+    if cfg.get("strategy") == "defensive":
+        score = int(score * 1.12)
+    elif cfg.get("strategy") == "aggressive" and score < 90:
+        score = int(score * 0.90)
+
+    return int(clamp(score, 0, 100)), notes
+
+
+def risk_position_cap(cfg: Dict[str, Any], signals: Dict[str, Any], strategy: Dict[str, Any]) -> Tuple[float, List[str]]:
+    warnings: List[str] = []
+    stop = float(signals["stop_loss_pct"])
+    risk_budget = clamp(as_float(cfg.get("risk_per_trade_pct"), 1.0), 0.1, 100.0) / 100
+
+    if stop <= 0:
+        warnings.append("未填写止损距离：禁止新增交易仓；已有仓位只根据破位/止盈信号处理。")
+        return 0.0, warnings
+
+    cap = risk_budget / stop
+    cap *= float(strategy["risk_multiplier"])
+    cap = clamp(cap, 0.0, 0.9999)
+
+    if cap < 0.08:
+        warnings.append("止损距离过宽或单笔风险预算过低，系统自动压低买入仓位。")
+    elif cap >= 0.9999:
+        warnings.append("按你的风险预算/止损距离计算，风险仓位上限已接近计划资金100%。")
+    return cap, warnings
+
+
+def buy_step_sensitivity(signals: Dict[str, Any]) -> Tuple[float, List[str]]:
+    """对“本次新增仓位上限”做连续修正。
+
+    v29 测试发现：当风险仓位上限成为主限制时，PE/ROE 如果只修正 raw target，
+    最终加仓幅度可能完全相同。这里把估值/质量也作用到本次买入上限，
+    让“高估限制加仓”真正体现在最终建议里。
+    """
+    notes: List[str] = []
+    mult = 1.0
+
+    pe = signals.get("pe_percentile")
+    if pe is not None:
+        pe_v = clamp(as_float(pe), 0.0, 100.0)
+        if pe_v <= 60:
+            pe_mult = 1.0
+        elif pe_v <= 80:
+            pe_mult = 1.0 - (pe_v - 60.0) / 20.0 * 0.28
+        elif pe_v <= 95:
+            pe_mult = 0.72 - (pe_v - 80.0) / 15.0 * 0.40
+        else:
+            pe_mult = 0.32 - (pe_v - 95.0) / 5.0 * 0.14
+        pe_mult = clamp(pe_mult, 0.18, 1.0)
+        mult *= pe_mult
+        if pe_mult < 0.98:
+            notes.append(f"PE百分位 {pe_v:.1f}% 偏高，本次新增仓位上限乘以 {pe_mult:.2f}。")
+
+    roe = signals.get("roe_pct")
+    if roe is not None:
+        roe_v = as_float(roe)
+        if roe_v < 8:
+            roe_mult = 0.82
+        elif roe_v < 12:
+            roe_mult = 0.92
+        elif roe_v <= 18:
+            roe_mult = 1.0
+        else:
+            roe_mult = min(1.10, 1.0 + (roe_v - 18.0) / 35.0)
+        mult *= roe_mult
+        if roe_mult < 0.99:
+            notes.append(f"ROE {roe_v:.1f}% 偏弱，本次新增仓位上限乘以 {roe_mult:.2f}。")
+
+    # 不让质量优秀把买入上限放大到超过原始风险预算/策略上限；这里只负责降低风险。
+    return clamp(mult, 0.12, 1.0), notes
+
+
+
+
+def signal_quality_score(signals: Dict[str, Any], action: str) -> Tuple[int, List[str]]:
+    """信号质量分：近似“胜率/确定性”，不是历史胜率。
+
+    核心思想：趋势与主信号权重大，量价/估值/ROE只做修正。
+    这样避免把一堆同源指标重复加分，导致系统过度乐观。
+    """
+    notes: List[str] = []
+    market = signals.get("market_state", "sideways")
+    entry = signals.get("entry_state", "none")
+    exit_state = signals.get("exit_state", "none")
+    profit = signals.get("profit_state", "none")
+
+    market_score = {
+        "bear": 8,
+        "below_200": 28,
+        "sideways": 45,
+        "above_200": 68,
+        "strong_bull": 82,
+    }.get(market, 45)
+
+    entry_score = {
+        "none": 0,
+        "reversal_50": 38,
+        "breakout": 68,
+        "pullback_hold": 78,
+        "continuation_high": 72,
+    }.get(entry, 0)
+
+    exit_score = {
+        "none": 35,
+        "below_20": 62,
+        "failed_breakout": 74,
+        "below_50": 84,
+        "below_200": 94,
+        "hit_stop": 96,
+    }.get(exit_state, 35)
+
+    volume_adj = 0
+    if signals.get("volume_confirm"):
+        volume_adj += 5
+    if signals.get("pullback_volume_dry"):
+        volume_adj += 5
+    if signals.get("upper_shadow"):
+        volume_adj -= 8
+    if signals.get("failed_close"):
+        volume_adj -= 8
+    if signals.get("far_from_ma"):
+        volume_adj -= 7
+    if signals.get("market_risk"):
+        volume_adj -= 10
+
+    valuation_adj = 0
+    pe = signals.get("pe_percentile")
+    if pe is not None:
+        pe_v = clamp(as_float(pe), 0.0, 100.0)
+        if pe_v >= 95:
+            valuation_adj -= 14
+        elif pe_v >= 90:
+            valuation_adj -= 10
+        elif pe_v >= 80:
+            valuation_adj -= 6
+        elif pe_v <= 30:
+            valuation_adj += 4
+
+    roe = signals.get("roe_pct")
+    if roe is not None:
+        roe_v = as_float(roe)
+        if roe_v < 8:
+            valuation_adj -= 6
+        elif roe_v >= 18:
+            valuation_adj += 4
+
+    buy_actions = {"试仓", "买入", "加仓", "重仓"}
+    sell_actions = {"减仓", "大减仓", "止盈", "清仓"}
+    if action in buy_actions:
+        score = market_score * 0.50 + entry_score * 0.38 + 50 * 0.12 + volume_adj + valuation_adj
+        if entry == "none":
+            score -= 25
+            notes.append("没有明确买点，信号质量不支持主动加仓。")
+        if market in {"bear", "below_200"} and entry != "reversal_50":
+            score -= 12
+        if score >= 75:
+            notes.append("信号质量较高：趋势、买点和确认项相对一致。")
+        elif score < 55:
+            notes.append("信号质量一般：即使触发买点，也应降低新增仓位。")
+    elif action in sell_actions:
+        score = exit_score * 0.70 + max(0, -volume_adj) * 1.2 + (100 if profit in {"profit_2r", "profit_3r"} else 50) * 0.12
+        if pe is not None and as_float(pe) >= 85:
+            score += 4
+        if signals.get("market_risk"):
+            score += 6
+        if score >= 78:
+            notes.append("风险信号质量较高：退出/减仓理由比较明确。")
+    else:
+        score = 52 + (market_score - 50) * 0.18 + volume_adj * 0.4 + valuation_adj * 0.2
+        if entry == "none" and exit_state == "none":
+            notes.append("当前缺少明确操作触发点，适合降低交易频率。")
+
+    return int(clamp(round(score), 1, 99)), notes
+
+
+def expected_reward_r(signals: Dict[str, Any], action: str) -> Tuple[float, str, List[str]]:
+    """预期赔率R：没有输入目标价时，只能做规则估算。
+
+    它不是预测涨幅，而是根据入场类型、趋势、估值、量价风险估算
+    “这笔新增交易是否值得做”。低于1R时不应主动开新仓。
+    """
+    notes: List[str] = []
+    buy_actions = {"试仓", "买入", "加仓", "重仓"}
+    if action not in buy_actions:
+        return 0.0, "--", notes
+
+    entry = signals.get("entry_state", "none")
+    market = signals.get("market_state", "sideways")
+    base = {
+        "none": 0.0,
+        "reversal_50": 1.05,
+        "breakout": 1.65,
+        "pullback_hold": 2.00,
+        "continuation_high": 1.45,
+    }.get(entry, 0.0)
+
+    if market == "strong_bull":
+        base += 0.20
+    elif market == "above_200":
+        base += 0.10
+    elif market == "sideways":
+        base -= 0.25
+    elif market == "below_200":
+        base -= 0.35
+    elif market == "bear":
+        base -= 0.60
+
+    if signals.get("volume_confirm"):
+        base += 0.15
+    if signals.get("pullback_volume_dry"):
+        base += 0.20
+    if signals.get("upper_shadow"):
+        base -= 0.30
+    if signals.get("failed_close"):
+        base -= 0.35
+    if signals.get("far_from_ma"):
+        base -= 0.35
+    if signals.get("market_risk"):
+        base -= 0.25
+
+    pe = signals.get("pe_percentile")
+    if pe is not None:
+        pe_v = clamp(as_float(pe), 0.0, 100.0)
+        if pe_v >= 95:
+            base -= 0.45
+        elif pe_v >= 90:
+            base -= 0.35
+        elif pe_v >= 80:
+            base -= 0.22
+        elif pe_v <= 30:
+            base += 0.12
+
+    roe = signals.get("roe_pct")
+    if roe is not None:
+        roe_v = as_float(roe)
+        if roe_v < 8:
+            base -= 0.18
+        elif roe_v >= 18:
+            base += 0.08
+
+    r = clamp(base, 0.0, 3.0)
+    if r >= 1.8:
+        grade = "赔率较好"
+    elif r >= 1.3:
+        grade = "赔率一般"
+    elif r >= 1.0:
+        grade = "赔率偏低"
+    else:
+        grade = "赔率不足"
+        notes.append("预期赔率低于1R，不适合主动新增交易仓。")
+    return r, grade, notes
+
+
+def trade_frequency_profile(signals: Dict[str, Any], action: str) -> Tuple[str, float, List[str]]:
+    """操作频率控制：避免系统把普通波动当成频繁交易机会。"""
+    notes: List[str] = []
+    entry = signals.get("entry_state", "none")
+    market = signals.get("market_state", "sideways")
+    exit_state = signals.get("exit_state", "none")
+    buy_actions = {"试仓", "买入", "加仓", "重仓"}
+    sell_actions = {"减仓", "大减仓", "止盈", "清仓"}
+
+    if action in sell_actions:
+        if exit_state in {"hit_stop", "below_200", "below_50"}:
+            return "风险退出，不看频率", 1.0, notes
+        return "防守性调整", 0.95, notes
+
+    if action not in buy_actions:
+        return "不操作 / 等待信号", 1.0, notes
+
+    if entry == "pullback_hold":
+        return "低频优先买点", 1.0, notes
+    if entry == "breakout":
+        if signals.get("volume_confirm"):
+            return "中低频确认买点", 0.95, notes
+        notes.append("突破未获得放量确认，按更高噪音的买点处理。")
+        return "中频突破试错", 0.85, notes
+    if entry == "continuation_high":
+        if signals.get("far_from_ma") or signals.get("pe_percentile", 0) and as_float(signals.get("pe_percentile")) >= 85:
+            notes.append("趋势延续买点容易变成追高，降低交易频率权重。")
+            return "偏高频追涨，需克制", 0.72, notes
+        return "趋势延续买点", 0.88, notes
+    if entry == "reversal_50":
+        if market == "below_200":
+            return "反转试仓，高噪音", 0.70, ["仍在200日线下方，反转试仓属于高噪音机会。"]
+        return "反转试仓", 0.80, notes
+
+    return "不操作 / 等待信号", 1.0, notes
+
+
+def dynamic_sell_step_limit(strategy: Dict[str, Any], signals: Dict[str, Any], action: str) -> Tuple[float, List[str]]:
+    """卖出上限动态化：轻微风险少卖，严重风险允许快速退出。"""
+    base = float(strategy["sell_step"])
+    exit_state = signals.get("exit_state", "none")
+    profit = signals.get("profit_state", "none")
+    notes: List[str] = []
+
+    if action == "清仓" or exit_state in {"hit_stop", "below_200"}:
+        mult = 2.6
+    elif exit_state == "below_50":
+        mult = 1.45
+    elif exit_state == "failed_breakout":
+        mult = 1.05
+    elif exit_state == "below_20":
+        mult = 0.72
+    elif action == "止盈" and profit == "profit_3r":
+        mult = 1.05
+    elif action == "止盈":
+        mult = 0.82
+    else:
+        mult = 1.0
+
+    pe = signals.get("pe_percentile")
+    if pe is not None and as_float(pe) >= 90 and action in {"减仓", "大减仓", "止盈", "清仓"}:
+        mult += 0.18
+    roe = signals.get("roe_pct")
+    if roe is not None and as_float(roe) < 8 and action in {"减仓", "大减仓", "止盈", "清仓"}:
+        mult += 0.12
+    if signals.get("upper_shadow") or signals.get("failed_close"):
+        mult += 0.08
+    if signals.get("market_risk"):
+        mult += 0.15
+
+    limit = clamp(base * mult, 0.06, 0.9999)
+    if abs(limit - base) > 0.01:
+        notes.append(f"卖出上限按风险级别动态调整为 {pct2(limit)}。")
+    return limit, notes
+
+
+def buy_opportunity_multiplier(signal_quality: int, expected_r: float, frequency_mult: float) -> Tuple[float, List[str], bool]:
+    """把信号质量、预期赔率和交易频率合并成新增仓位修正。"""
+    notes: List[str] = []
+    reject = False
+
+    if signal_quality < 45:
+        quality_mult = 0.45
+        notes.append(f"信号质量仅 {signal_quality}/100，新增仓位大幅降权。")
+    elif signal_quality < 60:
+        quality_mult = 0.72
+        notes.append(f"信号质量 {signal_quality}/100，只适合小幅试仓。")
+    elif signal_quality < 75:
+        quality_mult = 0.90
+    else:
+        quality_mult = 1.0
+
+    if expected_r <= 0:
+        odds_mult = 1.0
+    elif expected_r < 1.0:
+        odds_mult = 0.0
+        reject = True
+        notes.append(f"预期赔率约 {expected_r:.2f}R，低于1R，不新增交易仓。")
+    elif expected_r < 1.3:
+        odds_mult = 0.55
+        notes.append(f"预期赔率约 {expected_r:.2f}R，赔率偏低，新增仓位降权。")
+    elif expected_r < 1.8:
+        odds_mult = 0.82
+    else:
+        odds_mult = 1.0
+
+    mult = clamp(quality_mult * odds_mult * frequency_mult, 0.0, 1.0)
+    return mult, notes, reject
+
+def raw_target_by_signal(cfg: Dict[str, Any], signals: Dict[str, Any], cur: float) -> Tuple[str, float, str, List[str], int]:
+    market = signals["market_state"]
+    entry = signals["entry_state"]
+    exit_state = signals["exit_state"]
+    profit = signals["profit_state"]
+    floor = lower_floor(cfg, signals)
+    reason: List[str] = []
+    confidence = 50
+    action = "观望"
+    matched = "未触发明确信号"
+    target = cur
+
+    # 1. 硬退出优先
+    if exit_state == "hit_stop":
+        action = "清仓"
+        target = floor
+        matched = "跌破初始止损"
+        confidence = 92
+        reason.append("初始止损被触发，交易失败，先退出交易仓。")
+        return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
+
+    if exit_state == "below_200":
+        action = "清仓"
+        target = floor
+        matched = "跌破200日线"
+        confidence = 88
+        reason.append("200日线是大趋势过滤线，跌破后只保留动态防守仓位，严重时可以接近空仓。")
+        return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
+
+    if exit_state == "below_50":
+        action = "大减仓"
+        target = max(floor, min(cur * 0.45, 0.30))
+        matched = "跌破50日线"
+        confidence = 82
+        reason.append("50日线失守，中期趋势破坏，先把仓位降到防守状态。")
+        return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
+
+    if exit_state == "failed_breakout":
+        action = "减仓"
+        target = max(floor, cur * 0.65)
+        matched = "突破失败"
+        confidence = 76
+        reason.append("突破后跌回突破位，说明这次入场信号失效，需要降低风险。")
+        return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
+
+    # 2. 止盈：只在已有盈利和仓位时触发，不猜顶部。
+    if profit == "profit_3r" and cur > 0:
+        action = "止盈"
+        target = max(floor, cur * 0.50)
+        matched = "盈利达到3R"
+        confidence = 74
+        reason.append("盈利达到3R，先兑现一半，剩余仓位用移动止损跟随趋势。")
+        return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
+
+    if profit == "profit_2r" and cur > 0 and (signals["upper_shadow"] or signals["far_from_ma"] or signals["failed_close"]):
+        action = "止盈"
+        target = max(floor, cur * 0.67)
+        matched = "盈利达到2R + 风险形态"
+        confidence = 72
+        reason.append("盈利达到2R且出现冲高/远离均线/未站稳，先兑现约三分之一。")
+        return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
+
+    if exit_state == "below_20":
+        matched = "跌破20日线"
+        confidence = 66
+        if cur > floor:
+            action = "减仓"
+            target = max(floor, cur * 0.75)
+            reason.append("20日线失守属于短线弱化，先减一部分，等待50日线确认。")
+        else:
+            action = "持有" if cur > 0 else "观望"
+            target = cur
+            matched = "跌破20日线（当前仓位已低于防守目标）"
+            reason.append("20日线失守，但当前仓位已经低于系统防守仓位，本次不追加卖出，也不因防守仓位差额买入。")
+        return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
+
+    # 3. 大趋势不利时，不主动新增买入。
+    if market == "bear":
+        action = "观望" if cur <= floor else "减仓"
+        target = min(cur, floor)
+        matched = "大趋势空头"
+        confidence = 78
+        reason.append("价格在200日线下方且200日线向下，不做新增买入。")
+        return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
+
+    # 4. 入场 / 加仓。不按标的类型设上限，统一以计划资金100%为上限。
+    if market == "below_200":
+        if entry == "reversal_50":
+            action = "试仓"
+            target = 0.20
+            matched = "站回50日线但未站上200日线"
+            confidence = 58
+            reason.append("反转初期只能小仓验证，不能重仓抄底。")
+        else:
+            action = "观望"
+            target = min(cur, max(floor, 0.20))
+            matched = "反转确认不足"
+            confidence = 62
+            reason.append("仍在200日线下方，除小仓反转验证外不主动买入。")
+        return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
+
+    if market == "sideways":
+        if entry in {"breakout", "pullback_hold"}:
+            action = "试仓"
+            target = 0.25
+            matched = "震荡环境中的突破/回踩"
+            confidence = 55
+            reason.append("震荡市假突破多，只能小仓试错，等待站上趋势后再加。")
+        else:
+            action = "观望"
+            target = cur
+            matched = "震荡无优势入场"
+            confidence = 56
+            reason.append("震荡环境没有清晰优势点，不追涨也不猜底。")
+        return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
+
+    if market == "above_200":
+        if entry == "breakout":
+            action = "买入"
+            target = 0.45
+            matched = "200日线上方平台突破"
+            confidence = 68
+            reason.append("大趋势转多，平台突破可以正常买入，但仍受止损距离限制。")
+        elif entry == "pullback_hold":
+            action = "加仓"
+            target = 0.65
+            matched = "200日线上方回踩不破"
+            confidence = 70
+            reason.append("回踩20/50日线不破，说明趋势仍有效，可把仓位提高一档。")
+        elif entry == "reversal_50":
+            action = "试仓"
+            target = 0.25
+            matched = "刚转强但买点不足"
+            confidence = 58
+            reason.append("虽然站上200日线，但信号还不是强入场，只适合试仓。")
+        else:
+            action = "观望"
+            target = cur
+            matched = "趋势可交易但暂无买点"
+            confidence = 58
+            reason.append("趋势环境可以交易，但没有突破或回踩确认，等待更好的风险收益比。")
+        return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
+
+    if market == "strong_bull":
+        if entry == "continuation_high":
+            action = "重仓"
+            target = 0.90
+            matched = "强多头持续创新高"
+            confidence = 78
+            reason.append("价格在50日线和200日线上方，且趋势持续创新高，可以重仓但不追到失控。")
+        elif entry == "pullback_hold":
+            action = "加仓"
+            target = 0.75
+            matched = "强多头回踩不破"
+            confidence = 76
+            reason.append("强趋势中回踩不破，比直接追高更稳，允许加仓。")
+        elif entry == "breakout":
+            action = "买入"
+            target = 0.65
+            matched = "强多头突破"
+            confidence = 72
+            reason.append("强趋势中的突破有效性更高，但仍要看止损距离决定买多少。")
+        else:
+            action = "观望"
+            target = cur
+            matched = "强趋势但无新买点"
+            confidence = 60
+            reason.append("趋势很强不等于任何位置都能买，等待回踩或突破后的合理点。")
+        return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
+
+    return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
+
+
+def compute_decision(cfg: Dict[str, Any], form: Dict[str, Any]) -> Decision:
+    cur = current_position(cfg)
+    strategy = get_strategy(cfg)
+    signals = parse_signals(form)
+
+    # 手动修改“当前涨跌幅 / 持仓盈亏 %”后，即使没有重新拉取数据，
+    # 后端也要按同一规则自动触发初始止损，避免 UI 状态和计算结果脱节。
+    profit_pct = as_float(cfg.get("current_profit_pct"), 0.0)
+    stop_pct = signals.get("stop_loss_pct", 0.0) * 100
+    if cur > 0 and stop_pct > 0 and profit_pct <= -stop_pct:
+        signals["exit_state"] = "hit_stop"
+
+    risk, risk_notes = risk_score(signals, cfg)
+    t_score = trend_score(signals)
+    r_cap, cap_warnings = risk_position_cap(cfg, signals, strategy)
+
+    action, raw_target, matched, reasons, confidence = raw_target_by_signal(cfg, signals, cur)
+    signal_quality, quality_notes2 = signal_quality_score(signals, action)
+    expected_r, opportunity_grade, odds_notes = expected_reward_r(signals, action)
+    trade_frequency, frequency_mult, frequency_notes = trade_frequency_profile(signals, action)
+    warnings: List[str] = risk_notes + cap_warnings
+
+    # 信号质量/赔率/频率是交易系统层面的三道过滤：不直接替代主信号，但会限制新增仓位。
+    warnings.extend(quality_notes2)
+    warnings.extend(odds_notes)
+    warnings.extend(frequency_notes)
+
+    # 量价只做确认，不主导。
+    if signals["volume_confirm"] and action in {"买入", "加仓", "重仓"}:
+        raw_target += 0.03
+        reasons.append("突破时放量，作为确认项小幅加分。")
+    if signals["pullback_volume_dry"] and action in {"试仓", "买入", "加仓"}:
+        raw_target += 0.02
+        reasons.append("回踩缩量，说明抛压较小，作为辅助确认。")
+    if signals["upper_shadow"] and action in {"买入", "加仓", "重仓"}:
+        raw_target -= 0.06
+        warnings.append("出现长上影/冲高回落，新买入仓位被压低。")
+    if signals["failed_close"] and action in {"买入", "加仓", "重仓"}:
+        raw_target -= 0.06
+        warnings.append("未站稳关键价位，新增仓位被压低。")
+    if signals["far_from_ma"] and action in {"买入", "加仓", "重仓"}:
+        raw_target -= 0.05
+        warnings.append("价格远离均线，避免追高，新增仓位被压低。")
+
+    val_adj_raw, val_notes = valuation_penalty_bonus(signals, action)
+    q_adj_raw, q_notes = quality_bonus(signals, action)
+    floor = lower_floor(cfg, signals)
+
+    # v20：估值/ROE只作为“仓位刹车”和“信号确认”，不能在无破位、无止盈、无买点时单独把仓位打到0。
+    # - 买入/加仓/重仓：估值与质量修正会真实影响目标仓位。
+    # - 减仓/止盈：只允许高估负向强化卖出，且不跌破系统防守仓位。
+    # - 观望/持有：只保留文字提示，不改变当前仓位。
+    buy_actions = {"试仓", "买入", "加仓", "重仓"}
+    sell_actions = {"减仓", "大减仓", "止盈"}
+    applied_val_adj = 0.0
+    applied_q_adj = 0.0
+
+    if action in buy_actions:
+        applied_val_adj = val_adj_raw
+        applied_q_adj = q_adj_raw
+        raw_target += applied_val_adj + applied_q_adj
+    elif action in sell_actions:
+        applied_val_adj = min(val_adj_raw, 0.0)
+        raw_target = max(floor, raw_target + applied_val_adj)
+    else:
+        if val_notes:
+            warnings.append("估值仅作为新增仓位刹车；未出现破位/止盈信号时，不单独触发减仓。")
+
+    warnings.extend(val_notes)
+    if action in buy_actions:
+        warnings.extend(q_notes)
+    elif q_notes and signals.get("roe_pct") is not None:
+        warnings.append("ROE仅作为买入质量修正；当前不是新增仓位信号，因此不改变目标仓位。")
+
+    base_buy_step_limit = min(float(strategy["buy_step"]), r_cap)
+    buy_step_limit = base_buy_step_limit
+    if action in buy_actions:
+        buy_mult, buy_mult_notes = buy_step_sensitivity(signals)
+        opp_mult, opp_notes, reject_for_odds = buy_opportunity_multiplier(signal_quality, expected_r, frequency_mult)
+        buy_step_limit = base_buy_step_limit * buy_mult * opp_mult
+        if buy_mult < 0.999 and base_buy_step_limit > 0:
+            warnings.extend(buy_mult_notes)
+        if opp_mult < 0.999 and base_buy_step_limit > 0:
+            warnings.extend(opp_notes)
+        if reject_for_odds:
+            raw_target = cur
+            reasons.append("信号质量/赔率过滤未通过，本次不新增交易仓。")
+    sell_step_limit, sell_limit_notes = dynamic_sell_step_limit(strategy, signals, action)
+    warnings.extend(sell_limit_notes)
+
+    target = raw_target
+    if action in {"试仓", "买入", "加仓", "重仓"}:
+        if r_cap <= 0:
+            target = cur
+            action = "观望" if cur <= 0 else "持有"
+            confidence = min(confidence, 54)
+            matched = "没有止损距离，禁止新增交易仓"
+            reasons.append("没有止损距离就无法计算亏损上限，因此不新增仓位。")
+        else:
+            limited = min(target, cur + buy_step_limit)
+            if limited + 1e-9 < target:
+                warnings.append(
+                    f"仓位限制：按止损距离计算，本次最多新增 {pct2(buy_step_limit)}，目标由 {pct(target)} 限制为 {pct(limited)}。"
+                )
+            target = limited
+    elif action in {"减仓", "大减仓", "止盈"}:
+        limited = max(target, cur - sell_step_limit)
+        if limited > target + 1e-9:
+            warnings.append(f"单次卖出限制：本次最多降 {pct2(sell_step_limit)}，目标由 {pct(target)} 限制为 {pct(limited)}。")
+        target = limited
+    elif action == "清仓":
+        target = floor
+
+    # 卖出/清仓类信号绝不能因为“系统防守仓位”高于当前仓位而反向买入。
+    # 系统防守仓位是风险状态下最多保留到哪里，不是无买点时的补仓信号。
+    sell_like_actions = {"减仓", "大减仓", "止盈", "清仓"}
+    if action in sell_like_actions and target > cur + 1e-9:
+        warnings.append("卖出/清仓类信号下，系统不会为了补足防守仓位而反向买入。")
+        target = cur
+        action = "持有" if cur > 0 else "观望"
+        matched = f"{matched}（当前仓位已低于防守目标）"
+        reasons.append("当前仓位已经低于系统防守仓位，本次不追加卖出，也不因防守仓位差额买入。")
+
+    # 计划资金就是100%上限，不再根据标的类型设置上限。
+    target = clamp(target, 0.0, 0.9999)
+
+    # 防守性目标低于当前仓位时，动作不能仍显示“观望/持有”。
+    # 例如未站上200日线且当前仓位过高，规则会把目标降到防守仓位，动作应明确为“减仓”。
+    if target < cur - 0.005 and action in {"观望", "持有"}:
+        action = "清仓" if target <= 0.005 else "减仓"
+        reasons.append("目标仓位已经低于当前仓位，按防守规则降低仓位。")
+
+    # 目标仓位已经降到接近0时，内部动作也要同步为“清仓”，避免动作和大号结果不一致。
+    if target <= 0.005 and cur > 0.005 and action in {"减仓", "大减仓"}:
+        action = "清仓"
+
+    if action not in {"清仓", "大减仓"} and abs(target - cur) < 0.005:
+        # 调整幅度低于执行阈值时，必须同步把目标仓位归回当前仓位，
+        # 避免界面显示“持有”，但建议金额仍出现小额买入/卖出。
+        target = cur
+        if action in {"试仓", "买入", "加仓", "重仓"}:
+            action = "持有" if cur > 0 else "观望"
+            reasons.append("计算后的调整幅度低于0.5%，不建议为了小波动频繁操作。")
+        elif action in {"减仓", "止盈"}:
+            action = "持有"
+            reasons.append("减仓幅度过小，先用移动止损观察。")
+        elif action == "观望" and cur > 0:
+            action = "持有"
+
+    if risk >= 85 and action in {"清仓", "大减仓"}:
+        confidence = max(confidence, 88)
+    elif risk >= 60 and action in {"买入", "加仓", "重仓"}:
+        confidence = min(confidence, 58)
+    elif t_score >= 60 and action in {"加仓", "重仓"}:
+        confidence = min(92, confidence + 5)
+    confidence = int(clamp(confidence, 1, 99))
+
+    return Decision(
+        action=action,
+        target_position=target,
+        confidence=confidence,
+        reason=reasons,
+        warnings=warnings,
+        matched_rule=matched,
+        risk_score=risk,
+        trend_score=t_score,
+        risk_cap=r_cap,
+        buy_step_limit=buy_step_limit,
+        sell_step_limit=sell_step_limit,
+        stop_distance=signals["stop_loss_pct"],
+        valuation_adjustment=applied_val_adj,
+        quality_adjustment=applied_q_adj,
+        core_floor=floor,
+        signal_quality=signal_quality,
+        expected_reward_r=expected_r,
+        trade_frequency=trade_frequency,
+        opportunity_grade=opportunity_grade,
+    )
+
+
+def amount_payload(cfg: Dict[str, Any], result: Decision) -> Dict[str, Any]:
+    plan = max(as_float(cfg.get("plan_amount"), 0.0), 0.0)
+    current_amount = max(as_float(cfg.get("current_position_amount"), 0.0), 0.0)
+    cur_pos = current_position(cfg)
+    target_amount = result.target_position * plan
+    diff = target_amount - current_amount
+    return {
+        "current_pos": cur_pos,
+        "target_amount": target_amount,
+        "diff": diff,
+        "direction": "买入" if diff > 1e-9 else ("卖出" if diff < -1e-9 else "不操作"),
+    }
+
+
+def join_reason_text(items: List[Any]) -> str:
+    """把多条解释合并成一句，避免出现“。；”这种重复标点。"""
+    cleaned: List[str] = []
+    for item in items:
+        text = str(item).strip()
+        text = re.sub(r"[。；;\s]+$", "", text)
+        if text:
+            cleaned.append(text)
+    if not cleaned:
+        return "当前信号不足，按规则维持原仓位。"
+    return "；".join(cleaned) + "。"
+
+
+def decision_to_payload(cfg: Dict[str, Any], result: Decision) -> Dict[str, Any]:
+    amount = amount_payload(cfg, result)
+    cur_pos = amount["current_pos"]
+    delta = result.target_position - cur_pos
+    strategy = get_strategy(cfg)
+
+    reason_text = join_reason_text(result.reason)
+
+    # 顶部【实时计算结果】显示“动作 + 本次仓位变化”，而不是只显示买入/卖出。
+    # 例如当前 10%、目标 22%，显示“加仓 +12%”；当前 50%、目标 20%，显示“减仓 -30%”。
+    if delta > 0.005:
+        action_label = "加仓" if cur_pos > 0.005 else "买入"
+        action_delta_text = f"+{pct(delta)}"
+        action_text = f"{action_label}{action_delta_text}"
+        action_tone = "buy"
+        headline = action_text
+        subline = reason_text
+    elif delta < -0.005:
+        action_label = "清仓" if result.target_position <= 0.005 or result.action == "清仓" else ("止盈" if result.action == "止盈" else "减仓")
+        action_delta_text = f"-{pct(abs(delta))}"
+        action_text = f"{action_label}{action_delta_text}"
+        action_tone = "sell"
+        headline = action_text
+        subline = reason_text
+    else:
+        action_label = "持有" if cur_pos > 0.005 else "观望"
+        action_delta_text = f"维持 {pct(result.target_position)}"
+        action_text = action_label
+        action_tone = "hold"
+        headline = action_delta_text
+        subline = reason_text
+
+    if amount["direction"] == "买入":
+        amount_action = f"买入 {money(amount['diff'])}"
+    elif amount["direction"] == "卖出":
+        amount_action = f"卖出 {money(-amount['diff'])}"
+    else:
+        amount_action = "不操作"
+
+    metrics = [
+        {"label": "当前仓位", "value": pct(amount["current_pos"])},
+        {"label": "目标仓位", "value": pct(result.target_position)},
+        {"label": "建议金额", "value": amount_action},
+        {"label": "风险分", "value": f"{result.risk_score}/100"},
+        {"label": "趋势分", "value": f"{result.trend_score:+d}"},
+        {"label": "信号质量", "value": f"{result.signal_quality}/100"},
+        {"label": "预期赔率", "value": "--" if result.expected_reward_r <= 0 else f"{result.expected_reward_r:.2f}R（{result.opportunity_grade}）"},
+        {"label": "操作频率", "value": result.trade_frequency},
+        {"label": "止损距离", "value": pct2(result.stop_distance)},
+        {"label": "风险仓位上限", "value": pct2(result.risk_cap)},
+        {"label": "本次买入上限", "value": pct2(result.buy_step_limit)},
+        {"label": "本次卖出上限", "value": pct2(result.sell_step_limit)},
+        {"label": "估值修正", "value": pct2(result.valuation_adjustment)},
+        {"label": "ROE修正", "value": pct2(result.quality_adjustment)},
+        {"label": "系统防守仓位", "value": pct2(result.core_floor)},
+        {"label": "计划金额", "value": money(as_float(cfg.get("plan_amount"), 0.0))},
+        {"label": "当前持仓", "value": money(as_float(cfg.get("current_position_amount"), 0.0))},
+        {"label": "目标持仓", "value": money(amount["target_amount"])},
+        {"label": "标的", "value": f"{cfg.get('symbol_name') or '--'} {cfg.get('symbol') or ''}".strip(), "wide": True},
+        {"label": "策略", "value": f"{strategy['name']}：{strategy['desc']}", "wide": True},
+        {"label": "仓位模式", "value": "长期底仓 + 交易仓" if cfg.get("position_mode") == "core_satellite" else "纯交易仓", "wide": True},
+        {"label": "命中规则", "value": result.matched_rule, "wide": True},
+    ]
+
+    return {
+        "action": result.action,
+        "action_text": action_text,
+        "action_tone": action_tone,
+        "action_delta_text": action_delta_text,
+        "target_position": result.target_position,
+        "target_position_text": pct(result.target_position),
+        "confidence": result.confidence,
+        "reason": result.reason,
+        "warnings": result.warnings,
+        "matched_rule": result.matched_rule,
+        "risk_score": result.risk_score,
+        "headline": headline,
+        "subline": subline,
+        "metrics": metrics,
+    }
+
+
+# ----------------------------- 数据获取与自动填充 -----------------------------
+
+def _normalize_query(q: str) -> str:
+    return re.sub(r"\s+", "", str(q or "").strip().lower())
+
+
+def local_symbol_search(query: str) -> List[Dict[str, str]]:
+    q = _normalize_query(query)
+    if not q:
+        return []
+
+    alias_symbols = set(ALIASES.get(q, []))
+    results: List[Dict[str, str]] = []
+
+    for item in LOCAL_SYMBOLS:
+        text = _normalize_query(item["symbol"] + item["name"])
+        if item["symbol"] in alias_symbols or q in text:
+            results.append(item.copy())
+
+    # 如果用户直接输入美股代码或6位国内代码，也直接给候选。
+    raw = str(query or "").strip().upper()
+    if re.fullmatch(r"[A-Z]{1,6}(\.[A-Z]{1,4})?", raw):
+        results.insert(0, {"symbol": raw, "name": raw, "market": "US", "asset_kind": "stock", "source": "yfinance"})
+    if re.fullmatch(r"\d{6}", raw):
+        market = "CN"
+        source = "akshare"
+        kind = "fund" if raw.startswith(("00", "16", "20", "27", "51", "52", "56", "58")) else "stock"
+        results.insert(0, {"symbol": raw, "name": raw, "market": market, "asset_kind": kind, "source": source})
+
+    # 去重
+    seen = set()
+    unique: List[Dict[str, str]] = []
+    for item in results:
+        key = (item["symbol"], item.get("market", ""), item.get("asset_kind", ""))
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+    return unique[:10]
+
+
+def search_yfinance(query: str) -> List[Dict[str, str]]:
+    try:
+        import yfinance as yf  # type: ignore
+    except Exception:
+        return []
+
+    results: List[Dict[str, str]] = []
+    try:
+        # 新版 yfinance 支持 Search；如果本地版本不支持，会被 except 捕获。
+        search_obj = yf.Search(query, max_results=8)
+        quotes = getattr(search_obj, "quotes", []) or []
+        for q in quotes:
+            symbol = q.get("symbol") or q.get("ticker")
+            if not symbol:
+                continue
+            quote_type = str(q.get("quoteType", "stock")).lower()
+            kind = "etf" if "etf" in quote_type else ("index" if "index" in quote_type else "stock")
+            results.append({
+                "symbol": symbol,
+                "name": q.get("longname") or q.get("shortname") or symbol,
+                "market": "US",
+                "asset_kind": kind,
+                "source": "yfinance",
+            })
+    except Exception:
+        pass
+    return results
+
+
+def search_akshare(query: str) -> List[Dict[str, str]]:
+    try:
+        import akshare as ak  # type: ignore
+    except Exception:
+        return []
+
+    q = str(query or "").strip()
+    if not q:
+        return []
+    results: List[Dict[str, str]] = []
+
+    def add(symbol: Any, name: Any, kind: str):
+        if symbol is None:
+            return
+        s = str(symbol).strip()
+        n = str(name or s).strip()
+        if q.lower() in s.lower() or q.lower() in n.lower():
+            results.append({"symbol": s, "name": n, "market": "CN", "asset_kind": kind, "source": "akshare"})
+
+    # 这些接口会联网，失败就跳过，不影响本地候选。
+    try:
+        df = ak.stock_info_a_code_name()
+        for _, row in df.head(6000).iterrows():
+            add(row.get("code") or row.get("证券代码"), row.get("name") or row.get("证券简称"), "stock")
+            if len(results) >= 8:
+                break
+    except Exception:
+        pass
+
+    try:
+        df = ak.fund_name_em()
+        code_col = "基金代码" if "基金代码" in df.columns else df.columns[0]
+        name_col = "基金简称" if "基金简称" in df.columns else df.columns[1]
+        for _, row in df.head(12000).iterrows():
+            add(row.get(code_col), row.get(name_col), "fund")
+            if len(results) >= 16:
+                break
+    except Exception:
+        pass
+
+    return results[:10]
+
+
+def dedupe_symbols(items: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    seen = set()
+    out = []
+    for item in items:
+        key = (item.get("symbol"), item.get("market"), item.get("asset_kind"), item.get("source"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def pandas_to_records(df: Any) -> List[Dict[str, float]]:
+    import pandas as pd  # type: ignore
+
+    if df is None or len(df) == 0:
+        return []
+    data = df.copy()
+    # 扁平化 yfinance 可能返回的 MultiIndex。
+    if hasattr(data.columns, "levels"):
+        data.columns = [str(c[0]).lower() for c in data.columns]
+    data.columns = [str(c).strip().lower() for c in data.columns]
+
+    rename_map = {
+        "open": "open", "开盘": "open",
+        "high": "high", "最高": "high",
+        "low": "low", "最低": "low",
+        "close": "close", "收盘": "close", "单位净值": "close", "累计净值": "close",
+        "volume": "volume", "成交量": "volume",
+        "amount": "amount", "成交额": "amount",
+    }
+    new_cols = {}
+    for col in data.columns:
+        if col in rename_map:
+            new_cols[col] = rename_map[col]
+    data = data.rename(columns=new_cols)
+
+    if "date" not in data.columns:
+        # AKShare 常见日期列
+        for c in ["日期", "净值日期", "trade_date", "datetime"]:
+            if c.lower() in data.columns:
+                data = data.rename(columns={c.lower(): "date"})
+                break
+    if "date" not in data.columns:
+        data = data.reset_index().rename(columns={"index": "date", "date": "date"})
+
+    need = ["date", "open", "high", "low", "close", "volume", "amount"]
+    for col in need:
+        if col not in data.columns:
+            data[col] = 0.0
+
+    for col in ["open", "high", "low", "close", "volume", "amount"]:
+        data[col] = pd.to_numeric(data[col], errors="coerce")
+
+    data = data.dropna(subset=["close"]).tail(260)
+    out: List[Dict[str, float]] = []
+    for _, row in data.iterrows():
+        out.append({
+            "date": str(row.get("date"))[:10],
+            "open": float(row.get("open") or row.get("close") or 0),
+            "high": float(row.get("high") or row.get("close") or 0),
+            "low": float(row.get("low") or row.get("close") or 0),
+            "close": float(row.get("close") or 0),
+            "volume": float(row.get("volume") or 0),
+            "amount": float(row.get("amount") or 0),
+        })
+    return out
+
+
+
+@dataclass
+class FetchOptions:
+    proxy_mode: str = "system"
+    proxy_url: str = ""
+    timeout: float = 12.0
+    retry_count: int = 2
+    danjuan_cookie: str = ""
+    valuation_method: str = "system_calc"
+
+
+def fetch_options_from_cfg(cfg: Dict[str, Any]) -> FetchOptions:
+    mode = str(cfg.get("proxy_mode", "system") or "system")
+    if mode not in {"system", "custom", "none"}:
+        mode = "system"
+    return FetchOptions(
+        proxy_mode=mode,
+        proxy_url=str(cfg.get("proxy_url", "") or "").strip(),
+        timeout=clamp(as_float(cfg.get("request_timeout_sec"), 12.0), 3.0, 60.0),
+        retry_count=int(clamp(as_float(cfg.get("retry_count"), 2.0), 0.0, 5.0)),
+        danjuan_cookie=str(cfg.get("danjuan_cookie", "") or "").strip(),
+        valuation_method=str(cfg.get("valuation_method", "system_calc") or "system_calc"),
+    )
+
+
+def request_proxies(options: FetchOptions) -> Optional[Dict[str, str]]:
+    """requests 的代理配置：None=跟随系统环境；{}=明确不用代理。"""
+    if options.proxy_mode == "custom" and options.proxy_url:
+        return {"http": options.proxy_url, "https": options.proxy_url}
+    if options.proxy_mode == "none":
+        return {}
+    return None
+
+
+@contextlib.contextmanager
+def proxy_environment(options: FetchOptions):
+    """给 yfinance / akshare 这类内部请求库提供临时代理环境。"""
+    keys = ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]
+    old = {k: os.environ.get(k) for k in keys}
+    try:
+        if options.proxy_mode == "custom" and options.proxy_url:
+            os.environ["HTTP_PROXY"] = options.proxy_url
+            os.environ["HTTPS_PROXY"] = options.proxy_url
+            os.environ["http_proxy"] = options.proxy_url
+            os.environ["https_proxy"] = options.proxy_url
+        elif options.proxy_mode == "none":
+            for k in keys:
+                os.environ.pop(k, None)
+        yield
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def retry_call(label: str, fn: Callable[[], Tuple[List[Dict[str, float]], Dict[str, Any]]], options: FetchOptions) -> Tuple[List[Dict[str, float]], Dict[str, Any], List[Dict[str, Any]]]:
+    trace: List[Dict[str, Any]] = []
+    last_error = ""
+    total = max(1, options.retry_count + 1)
+    for i in range(total):
+        started = time.time()
+        try:
+            records, fundamentals = fn()
+            if len(records) < 60:
+                raise ValueError(f"行情数据太少：{len(records)} 条")
+            trace.append({
+                "source": label,
+                "attempt": i + 1,
+                "ok": True,
+                "rows": len(records),
+                "elapsed_ms": int((time.time() - started) * 1000),
+            })
+            return records, fundamentals, trace
+        except Exception as e:
+            last_error = str(e)
+            trace.append({
+                "source": label,
+                "attempt": i + 1,
+                "ok": False,
+                "error": last_error[:240],
+                "elapsed_ms": int((time.time() - started) * 1000),
+            })
+            if i < total - 1:
+                time.sleep(min(0.35 * (i + 1), 1.2))
+    raise RuntimeError(f"{label} 获取失败：{last_error}")
+
+
+def yahoo_symbol_candidates(symbol: str, market: str, asset_kind: str) -> List[str]:
+    raw = str(symbol or "").strip().upper()
+    if not raw:
+        return []
+    if market == "CN" or re.fullmatch(r"\d{6}", raw):
+        # 上海：股票6开头、场内基金/ETF多数5开头；深圳：0/1/2/3开头。
+        if raw.startswith(("5", "6", "9")):
+            return [f"{raw}.SS"]
+        return [f"{raw}.SZ", f"{raw}.SS"]
+    return [raw]
+
+
+
+
+def eastmoney_secid(symbol: str) -> str:
+    """东方财富 secid：沪市多数为 1，深市多数为 0。
+
+    注意：常见中证/上证指数代码 000300、000016、000905、000852、000688
+    虽然以 0 开头，但东方财富 secid 应使用 1.xxxxxx。
+    """
+    s = re.sub(r"\D", "", str(symbol or ""))
+    if not re.fullmatch(r"\d{6}", s):
+        s = "510300"
+    prefix = "1" if s.startswith(("5", "6", "9", "000")) else "0"
+    return f"{prefix}.{s}"
+
+
+def eastmoney_headers() -> Dict[str, str]:
+    return {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Referer": "https://quote.eastmoney.com/",
+        "Connection": "keep-alive",
+    }
+
+
+def fetch_eastmoney_kline(symbol: str, options: FetchOptions) -> Tuple[List[Dict[str, float]], Dict[str, Any]]:
+    """东方财富历史 K 线 HTTP 兜底链路，主要给国内股票/ETF/场内基金使用。"""
+    import requests  # type: ignore
+
+    secid = eastmoney_secid(symbol)
+    params = {
+        "secid": secid,
+        "klt": "101",
+        "fqt": "1",
+        "beg": "20200101",
+        "end": "29991231",
+        "lmt": "1000",
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+    }
+    last_error = ""
+    for base_url in [
+        "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+        "http://push2his.eastmoney.com/api/qt/stock/kline/get",
+    ]:
+        try:
+            resp = requests.get(base_url, params=params, headers=eastmoney_headers(), timeout=options.timeout, proxies=request_proxies(options))
+            resp.raise_for_status()
+            payload = resp.json() if resp.text else {}
+            data = payload.get("data") if isinstance(payload, dict) else None
+            klines = (data or {}).get("klines") or []
+            if not klines:
+                raise ValueError(f"东方财富无K线：status={resp.status_code}")
+            records: List[Dict[str, float]] = []
+            for line in klines:
+                parts = str(line).split(",")
+                if len(parts) < 6:
+                    continue
+                records.append({
+                    "date": parts[0],
+                    "open": as_float(parts[1]),
+                    "close": as_float(parts[2]),
+                    "high": as_float(parts[3]),
+                    "low": as_float(parts[4]),
+                    "volume": as_float(parts[5]),
+                    "amount": as_float(parts[6]) if len(parts) > 6 else 0.0,
+                })
+            return records[-260:], {"long_name": (data or {}).get("name"), "eastmoney_secid": secid, "eastmoney_url": resp.url}
+        except Exception as e:
+            last_error = str(e)
+            continue
+    raise RuntimeError(last_error or "东方财富K线获取失败")
+
+
+def yfinance_download_with_fallback(yf: Any, symbol: str, options: FetchOptions) -> Any:
+    """兼容新版 yfinance MultiIndex/空表问题：download 失败时改用 Ticker.history。"""
+    kwargs = dict(
+        period="2y",
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
+        threads=False,
+        timeout=options.timeout,
+    )
+    try:
+        hist = yf.download(symbol, multi_level_index=False, **kwargs)
+    except TypeError:
+        hist = yf.download(symbol, **kwargs)
+    if hist is not None and len(hist) > 0:
+        return hist
+    return yf.Ticker(symbol).history(period="2y", interval="1d", auto_adjust=True)
+
+def fetch_yahoo_chart_api(symbol: str, options: FetchOptions) -> Tuple[List[Dict[str, float]], Dict[str, Any]]:
+    import requests  # type: ignore
+
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {"range": "2y", "interval": "1d", "events": "div,splits", "includeAdjustedClose": "true"}
+    headers = {"User-Agent": "Mozilla/5.0 trend-risk-position-tool"}
+    resp = requests.get(url, params=params, headers=headers, timeout=options.timeout, proxies=request_proxies(options))
+    resp.raise_for_status()
+    payload = resp.json()
+    result = ((payload.get("chart") or {}).get("result") or [None])[0]
+    if not result:
+        err = ((payload.get("chart") or {}).get("error") or {}).get("description") or "Yahoo无返回"
+        raise ValueError(err)
+    ts = result.get("timestamp") or []
+    quote = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+    adj = ((result.get("indicators") or {}).get("adjclose") or [{}])[0].get("adjclose") or []
+    opens = quote.get("open") or []
+    highs = quote.get("high") or []
+    lows = quote.get("low") or []
+    closes = adj or (quote.get("close") or [])
+    volumes = quote.get("volume") or []
+    records: List[Dict[str, float]] = []
+    for idx, t in enumerate(ts):
+        c = closes[idx] if idx < len(closes) else None
+        if c is None:
+            continue
+        from datetime import timezone
+        date = datetime.fromtimestamp(int(t), tz=timezone.utc).strftime("%Y-%m-%d")
+        records.append({
+            "date": date,
+            "open": float(opens[idx] if idx < len(opens) and opens[idx] is not None else c),
+            "high": float(highs[idx] if idx < len(highs) and highs[idx] is not None else c),
+            "low": float(lows[idx] if idx < len(lows) and lows[idx] is not None else c),
+            "close": float(c),
+            "volume": float(volumes[idx] if idx < len(volumes) and volumes[idx] is not None else 0),
+            "amount": 0.0,
+        })
+    meta = result.get("meta") or {}
+    return records[-260:], {"currency": meta.get("currency"), "long_name": meta.get("symbol")}
+
+
+def fetch_stooq_daily(symbol: str, options: FetchOptions) -> Tuple[List[Dict[str, float]], Dict[str, Any]]:
+    import pandas as pd  # type: ignore
+    import requests  # type: ignore
+
+    raw = str(symbol or "").strip().lower()
+    if "." not in raw:
+        raw = f"{raw}.us"
+    url = "https://stooq.com/q/d/l/"
+    params = {"s": raw, "i": "d"}
+    headers = {"User-Agent": "Mozilla/5.0 trend-risk-position-tool"}
+    resp = requests.get(url, params=params, headers=headers, timeout=options.timeout, proxies=request_proxies(options))
+    resp.raise_for_status()
+    text = resp.text.strip()
+    if not text or "No data" in text or len(text.splitlines()) < 30:
+        raise ValueError("Stooq无有效数据")
+    df = pd.read_csv(StringIO(text))
+    records = pandas_to_records(df)
+    return records, {"long_name": symbol}
+
+
+def fetch_yfinance(symbol: str, options: Optional[FetchOptions] = None) -> Tuple[List[Dict[str, float]], Dict[str, Any]]:
+    import yfinance as yf  # type: ignore
+
+    options = options or FetchOptions()
+    with proxy_environment(options):
+        hist = yfinance_download_with_fallback(yf, symbol, options)
+        records = pandas_to_records(hist)
+        fundamentals: Dict[str, Any] = {}
+        try:
+            info = yf.Ticker(symbol).get_info()
+            fundamentals["current_pe"] = info.get("trailingPE") or info.get("forwardPE")
+            roe = info.get("returnOnEquity")
+            fundamentals["roe_pct"] = float(roe) * 100 if roe is not None else None
+            fundamentals["currency"] = info.get("currency")
+            fundamentals["long_name"] = info.get("longName") or info.get("shortName")
+        except Exception:
+            pass
+    return records, fundamentals
+
+
+def fetch_akshare(symbol: str, asset_kind: str, options: Optional[FetchOptions] = None) -> Tuple[List[Dict[str, float]], Dict[str, Any]]:
+    import akshare as ak  # type: ignore
+
+    options = options or FetchOptions()
+    s = re.sub(r"\D", "", symbol)
+    records: List[Dict[str, float]] = []
+    fundamentals: Dict[str, Any] = {}
+
+    with proxy_environment(options):
+        if asset_kind == "index":
+            try:
+                df = ak.index_zh_a_hist(symbol=s, period="daily", start_date="20200101", end_date=datetime.now().strftime("%Y%m%d"))
+                records = pandas_to_records(df)
+            except Exception:
+                pass
+        elif asset_kind == "fund":
+            # ETF/场内基金优先用ETF行情；开放基金退化为净值曲线。
+            try:
+                df = ak.fund_etf_hist_em(symbol=s, period="daily", adjust="qfq")
+                records = pandas_to_records(df)
+            except Exception:
+                try:
+                    df = ak.fund_open_fund_info_em(symbol=s, indicator="单位净值走势")
+                    records = pandas_to_records(df)
+                except Exception:
+                    pass
+        else:
+            try:
+                df = ak.stock_zh_a_hist(symbol=s, period="daily", adjust="qfq")
+                records = pandas_to_records(df)
+            except Exception:
+                pass
+
+        # A股个股：优先用 AKShare / 乐咕历史估值自算 PE/PB 百分位；失败不影响行情。
+        try:
+            extra = fetch_akshare_lg_valuation(symbol=s, options=options)
+            fundamentals = merge_missing_fundamentals(fundamentals, extra)
+        except Exception:
+            pass
+
+    return records, fundamentals
+
+
+
+
+def _norm_index_code(symbol: str, asset_kind: str = "", symbol_name: str = "") -> Optional[str]:
+    raw = str(symbol or "").strip().upper()
+    digits = re.sub(r"\D", "", raw)
+    name = str(symbol_name or "").upper()
+
+    if raw in INDEX_CODE_MAP:
+        return INDEX_CODE_MAP[raw]
+    if digits in FUND_INDEX_MAP:
+        return FUND_INDEX_MAP[digits]
+    if digits in INDEX_CODE_MAP:
+        return INDEX_CODE_MAP[digits]
+
+    text = f"{raw} {name}"
+    for rule in INDEX_KEYWORD_RULES:
+        keys = rule.get("keywords") or []
+        code = str(rule.get("index_code") or "").strip().upper()
+        if code and any(str(k).upper() in text for k in keys):
+            return code
+
+    if str(asset_kind or "").lower() == "index" and re.fullmatch(r"\d{6}", digits):
+        if digits.startswith("399"):
+            return f"SZ{digits}"
+        if digits.startswith("000"):
+            return f"SH{digits}"
+    return None
+
+
+def _column_by_names(columns: List[Any], exact_names: set[str], contains_any: Tuple[str, ...] = (), exclude_any: Tuple[str, ...] = ()) -> Optional[Any]:
+    for col in columns:
+        text = str(col).strip().lower().replace(" ", "").replace("_", "")
+        if any(x in text for x in exclude_any):
+            continue
+        if text in exact_names:
+            return col
+    for col in columns:
+        text = str(col).strip().lower().replace(" ", "").replace("_", "")
+        if any(x in text for x in exclude_any):
+            continue
+        if contains_any and any(x in text for x in contains_any):
+            return col
+    return None
+
+
+def _normalize_percentile_value(value: Any) -> Optional[float]:
+    v = as_float(value, float("nan"))
+    if math.isnan(v) or math.isinf(v):
+        return None
+    # 有些源用 0~1 表示百分位。
+    if 0 <= v <= 1:
+        v *= 100
+    return round(clamp(v, 0.0, 100.0), 2)
+
+
+def extract_valuation_from_df(df: Any, source_label: str) -> Dict[str, Any]:
+    """从不同来源的估值表里尽量解析 PE/PB/ROE 与百分位。
+
+    优先使用源内自带百分位；没有百分位时，用历史 PE/PB 序列自行计算当前值所在百分位。
+    """
+    import pandas as pd  # type: ignore
+
+    if df is None or getattr(df, "empty", True):
+        raise ValueError("估值表为空")
+    cols = list(df.columns)
+    result: Dict[str, Any] = {"valuation_source": source_label}
+
+    pe_pct_col = _column_by_names(cols, {"pe百分位", "pe分位", "pepercentile", "pepercentilettm", "pe分位点"}, ("pe百分位", "pe分位", "pepercentile"))
+    pb_pct_col = _column_by_names(cols, {"pb百分位", "pb分位", "pbpercentile", "pb分位点"}, ("pb百分位", "pb分位", "pbpercentile"))
+    pe_col = _column_by_names(cols, {"pe", "pettm", "pettm", "市盈率", "市盈率ttm", "滚动市盈率"}, ("市盈率", "pe"), ("百分位", "分位", "percentile"))
+    pb_col = _column_by_names(cols, {"pb", "市净率"}, ("市净率", "pb"), ("百分位", "分位", "percentile"))
+    roe_col = _column_by_names(cols, {"roe", "净资产收益率", "roe加权"}, ("roe", "净资产收益率"), ("百分位", "分位", "percentile"))
+
+    def last_valid(col: Any) -> Optional[float]:
+        if col is None:
+            return None
+        series = pd.to_numeric(df[col], errors="coerce").dropna()
+        if series.empty:
+            return None
+        return float(series.iloc[-1])
+
+    if pe_pct_col is not None:
+        result["pe_percentile"] = _normalize_percentile_value(last_valid(pe_pct_col))
+    if pb_pct_col is not None:
+        result["pb_percentile"] = _normalize_percentile_value(last_valid(pb_pct_col))
+
+    if pe_col is not None:
+        pe_series = pd.to_numeric(df[pe_col], errors="coerce").dropna()
+        pe_series = pe_series[pe_series > 0]
+        if len(pe_series) >= 1:
+            current = float(pe_series.iloc[-1])
+            result["current_pe"] = round(current, 4)
+            if result.get("pe_percentile") is None and len(pe_series) >= 30:
+                result["pe_percentile"] = round(float((pe_series <= current).mean() * 100), 2)
+
+    if pb_col is not None:
+        pb_series = pd.to_numeric(df[pb_col], errors="coerce").dropna()
+        pb_series = pb_series[pb_series > 0]
+        if len(pb_series) >= 1:
+            current_pb = float(pb_series.iloc[-1])
+            result["current_pb"] = round(current_pb, 4)
+            if result.get("pb_percentile") is None and len(pb_series) >= 30:
+                result["pb_percentile"] = round(float((pb_series <= current_pb).mean() * 100), 2)
+
+    if roe_col is not None:
+        roe = last_valid(roe_col)
+        if roe is not None:
+            if -1 <= roe <= 1:
+                roe *= 100
+            result["roe_pct"] = round(float(roe), 2)
+
+    clean = {k: v for k, v in result.items() if v is not None}
+    if not any(k in clean for k in ("pe_percentile", "pb_percentile", "current_pe", "roe_pct")):
+        raise ValueError("未解析到 PE/PB/ROE 字段")
+    return clean
+
+
+
+
+def _date_column(cols: List[Any]) -> Optional[Any]:
+    return _column_by_names(
+        cols,
+        {"日期", "date", "trade_date", "tradedate", "时间", "统计日期"},
+        ("日期", "date", "trade"),
+    )
+
+
+def _as_date_string(value: Any) -> Optional[str]:
+    """尽量把不同数据源的日期值标准化为 YYYY-MM-DD。"""
+    if value is None or value == "":
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    text = text.replace("/", "-").replace(".", "-")
+    try:
+        # 兼容 20241001 / 2024-10-01 / pandas Timestamp
+        if re.fullmatch(r"\d{8}", text):
+            return datetime.strptime(text, "%Y%m%d").date().isoformat()
+        return datetime.fromisoformat(text[:10]).date().isoformat()
+    except Exception:
+        return None
+
+
+def _rolling_percentiles_by_date(items: List[Tuple[str, Optional[float]]], years: int = 10, min_count: int = 30) -> Dict[str, Optional[float]]:
+    """只使用当日及以前数据计算百分位，避免回测未来函数。
+
+    近似蛋卷常见的“近10年百分位”：若10年窗口数据不足 min_count，则退化为当日前扩展窗口。
+    """
+    parsed: List[Tuple[date, str, float]] = []
+    for ds, val in items:
+        if val is None or val <= 0 or math.isnan(float(val)) or math.isinf(float(val)):
+            continue
+        try:
+            parsed.append((datetime.fromisoformat(ds).date(), ds, float(val)))
+        except Exception:
+            continue
+    parsed.sort(key=lambda x: x[0])
+    out: Dict[str, Optional[float]] = {}
+    all_past: List[Tuple[date, float]] = []
+    for d, ds, val in parsed:
+        all_past.append((d, val))
+        window_start = d - timedelta(days=int(years * 365.25))
+        window = [v for dt0, v in all_past if dt0 >= window_start]
+        hist = window if len(window) >= min_count else [v for _, v in all_past]
+        if len(hist) < max(5, min_count // 3):
+            out[ds] = None
+        else:
+            out[ds] = round(float(sum(x <= val for x in hist) / len(hist) * 100), 2)
+    return out
+
+
+def extract_valuation_series_from_df(df: Any, source_label: str) -> Dict[str, Dict[str, Any]]:
+    """从估值历史表生成逐日估值序列。
+
+    返回：{YYYY-MM-DD: {current_pe, pe_percentile, current_pb, pb_percentile, roe_pct, valuation_source}}
+    百分位优先使用源自带字段；没有时按当日以前历史自算，避免未来函数。
+    """
+    import pandas as pd  # type: ignore
+
+    if df is None or getattr(df, "empty", True):
+        raise ValueError("历史估值表为空")
+    cols = list(df.columns)
+    date_col = _date_column(cols)
+    if date_col is None:
+        raise ValueError("历史估值表缺少日期列")
+
+    pe_pct_col = _column_by_names(cols, {"pe百分位", "pe分位", "pepercentile", "pepercentilettm", "pe分位点"}, ("pe百分位", "pe分位", "pepercentile"))
+    pb_pct_col = _column_by_names(cols, {"pb百分位", "pb分位", "pbpercentile", "pb分位点"}, ("pb百分位", "pb分位", "pbpercentile"))
+    pe_col = _column_by_names(cols, {"pe", "pettm", "市盈率", "市盈率ttm", "滚动市盈率"}, ("市盈率", "pe"), ("百分位", "分位", "percentile"))
+    pb_col = _column_by_names(cols, {"pb", "市净率"}, ("市净率", "pb"), ("百分位", "分位", "percentile"))
+    roe_col = _column_by_names(cols, {"roe", "净资产收益率", "roe加权"}, ("roe", "净资产收益率"), ("百分位", "分位", "percentile"))
+
+    rows: List[Tuple[str, int]] = []
+    for idx, raw in enumerate(df[date_col].tolist()):
+        ds = _as_date_string(raw)
+        if ds:
+            rows.append((ds, idx))
+    rows.sort(key=lambda x: x[0])
+    if not rows:
+        raise ValueError("历史估值表日期无法解析")
+
+    def numeric_at(col: Any, idx: int) -> Optional[float]:
+        if col is None:
+            return None
+        try:
+            v = pd.to_numeric(df[col], errors="coerce").iloc[idx]
+            if pd.isna(v):
+                return None
+            v = float(v)
+            if math.isnan(v) or math.isinf(v):
+                return None
+            return v
+        except Exception:
+            return None
+
+    pe_items = [(ds, numeric_at(pe_col, idx)) for ds, idx in rows]
+    pb_items = [(ds, numeric_at(pb_col, idx)) for ds, idx in rows]
+    pe_pct_calc = _rolling_percentiles_by_date(pe_items)
+    pb_pct_calc = _rolling_percentiles_by_date(pb_items)
+
+    series: Dict[str, Dict[str, Any]] = {}
+    for ds, idx in rows:
+        item: Dict[str, Any] = {"valuation_source": source_label, "valuation_note": "历史估值序列"}
+        pe_v = numeric_at(pe_col, idx)
+        pb_v = numeric_at(pb_col, idx)
+        roe_v = numeric_at(roe_col, idx)
+        if pe_v is not None and pe_v > 0:
+            item["current_pe"] = round(pe_v, 4)
+        if pb_v is not None and pb_v > 0:
+            item["current_pb"] = round(pb_v, 4)
+        if pe_pct_col is not None:
+            item["pe_percentile"] = _normalize_percentile_value(numeric_at(pe_pct_col, idx))
+        if item.get("pe_percentile") is None:
+            item["pe_percentile"] = pe_pct_calc.get(ds)
+        if pb_pct_col is not None:
+            item["pb_percentile"] = _normalize_percentile_value(numeric_at(pb_pct_col, idx))
+        if item.get("pb_percentile") is None:
+            item["pb_percentile"] = pb_pct_calc.get(ds)
+        if roe_v is not None:
+            if -1 <= roe_v <= 1 and roe_v != 0:
+                roe_v *= 100
+            item["roe_pct"] = round(roe_v, 2)
+        clean = {k: v for k, v in item.items() if v is not None}
+        if any(k in clean for k in ("pe_percentile", "pb_percentile", "current_pe", "current_pb", "roe_pct")):
+            series[ds] = clean
+    if not series:
+        raise ValueError("历史估值序列没有有效 PE/PB/ROE 字段")
+    return series
+
+
+def merge_valuation_series(base: Dict[str, Dict[str, Any]], extra: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    merged = {k: dict(v) for k, v in (base or {}).items()}
+    for ds, item in (extra or {}).items():
+        cur = merged.setdefault(ds, {})
+        for k, v in item.items():
+            if cur.get(k) in (None, "") and v not in (None, ""):
+                cur[k] = v
+    return merged
+
+
+def recompute_history_percentiles(series: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """对已合并的 PE/PB 历史序列重新计算滚动百分位。
+
+    用途：蛋卷 pe_history/pb_history 可能是图表采样点，而 detail 接口会更快给出
+    最新交易日数据。把 detail 最新点补进序列后，必须重新计算百分位，避免
+    “估值序列最新日期”落后于页面最新日期。
+    """
+    if not series:
+        return series
+    keys = sorted(series.keys())
+
+    def safe_num(value: Any) -> Optional[float]:
+        try:
+            if value is None or value == "":
+                return None
+            v = float(value)
+            if math.isnan(v) or math.isinf(v) or v <= 0:
+                return None
+            return v
+        except Exception:
+            return None
+
+    pe_items = [(ds, safe_num((series.get(ds) or {}).get("current_pe"))) for ds in keys]
+    pb_items = [(ds, safe_num((series.get(ds) or {}).get("current_pb"))) for ds in keys]
+    pe_pct = _rolling_percentiles_by_date(pe_items)
+    pb_pct = _rolling_percentiles_by_date(pb_items)
+
+    out = {k: dict(v) for k, v in series.items()}
+    for ds in keys:
+        if pe_pct.get(ds) is not None:
+            out.setdefault(ds, {})["pe_percentile"] = pe_pct[ds]
+        if pb_pct.get(ds) is not None:
+            out.setdefault(ds, {})["pb_percentile"] = pb_pct[ds]
+    return out
+
+
+def merge_danjuan_detail_current_into_history_series(
+    series: Dict[str, Dict[str, Any]],
+    symbol: str,
+    asset_kind: str,
+    options: FetchOptions,
+    symbol_name: str = "",
+) -> Dict[str, Dict[str, Any]]:
+    """把蛋卷 detail 当前页面最新点补进历史估值序列。
+
+    pe_history/pb_history/roe_history 主要用于回测历史曲线，但它们可能比 detail
+    当前页面慢一个交易日。detail 里的 ts/date 是页面最新估值日期；当它晚于历史
+    曲线最后一日时，追加该点并重新自算 PE/PB 百分位。
+    """
+    if not series:
+        return series
+    try:
+        detail = fetch_danjuan_detail_valuation(symbol, asset_kind, options, symbol_name)
+    except Exception:
+        return series
+    ds = _as_date_string(detail.get("valuation_date") or detail.get("date"))
+    if not ds:
+        return series
+
+    merged = {k: dict(v) for k, v in series.items()}
+    item = merged.setdefault(ds, {})
+    changed = False
+    for key in ("current_pe", "current_pb", "roe_pct"):
+        if detail.get(key) is not None:
+            item[key] = detail.get(key)
+            changed = True
+    if changed:
+        item["valuation_source"] = "danjuan_detail_current+history"
+        item["valuation_note"] = "蛋卷历史序列补入 detail 最新估值点后自算百分位"
+        item["valuation_page_date"] = ds
+        item["valuation_page_pe_percentile"] = detail.get("pe_percentile")
+        item["valuation_page_pb_percentile"] = detail.get("pb_percentile")
+        merged = recompute_history_percentiles(merged)
+    return merged
+
+
+def _validate_history_percentile_series(series: Dict[str, Dict[str, Any]], label: str, min_rows: int = 30) -> Dict[str, Dict[str, Any]]:
+    """系统自算 PE 百分位必须拿到真正的历史序列。
+
+    只返回 1 行的“当前估值”不能用于系统自算百分位；这种情况应当明确失败，
+    避免日志显示成功但 PE 百分位仍为空。
+    """
+    rows = len(series or {})
+    pe_rows = sum(1 for v in (series or {}).values() if v.get("current_pe") is not None)
+    pe_pct_rows = sum(1 for v in (series or {}).values() if v.get("pe_percentile") is not None)
+    if rows < min_rows or pe_pct_rows <= 0:
+        raise ValueError(f"{label} 历史估值序列不足：{rows} 条，PE有效点 {pe_rows} 条，PE百分位点 {pe_pct_rows} 条；系统自算至少需要 {min_rows} 条历史估值")
+    return series
+
+
+
+
+def _diag_text(value: Any, limit: int = 260) -> str:
+    """用于数据源日志的短文本，避免前端被超长错误刷屏。"""
+    text = str(value).replace("\n", " ").replace("\r", " ").strip()
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _df_debug_summary(df: Any) -> str:
+    """返回 DataFrame 的行列概况，专门用于 AKShare 历史估值诊断。"""
+    try:
+        rows = len(df) if df is not None else 0
+    except Exception:
+        rows = -1
+    try:
+        cols = [str(c) for c in list(getattr(df, "columns", []))]
+    except Exception:
+        cols = []
+    preview_cols = ",".join(cols[:12]) if cols else "无列名"
+    if len(cols) > 12:
+        preview_cols += f",...共{len(cols)}列"
+    return f"返回{rows}行，列=[{preview_cols}]"
+
+
+def _valuation_series_debug_summary(seq: Dict[str, Dict[str, Any]]) -> str:
+    rows = len(seq or {})
+    pe_rows = sum(1 for v in (seq or {}).values() if v.get("current_pe") is not None)
+    pe_pct_rows = sum(1 for v in (seq or {}).values() if v.get("pe_percentile") is not None)
+    pb_rows = sum(1 for v in (seq or {}).values() if v.get("current_pb") is not None)
+    pb_pct_rows = sum(1 for v in (seq or {}).values() if v.get("pb_percentile") is not None)
+    sample_dates = list((seq or {}).keys())[:3]
+    return f"序列{rows}条，PE有效{pe_rows}条，PE百分位{pe_pct_rows}条，PB有效{pb_rows}条，PB百分位{pb_pct_rows}条，样例日期={sample_dates}"
+
+
+LEGULEGU_INDEX_PAGE_MAP: Dict[str, str] = {
+    "SH000300": "hs300-ttm-lyr",   # 沪深300
+    "SH000016": "sz50-ttm-lyr",    # 上证50
+    "SH000010": "sz180-ttm-lyr",   # 上证180
+    "SH000905": "zz500-ttm-lyr",   # 中证500
+    "SH000906": "zz800-ttm-lyr",   # 中证800
+    "SH000852": "zz1000-ttm-lyr",  # 中证1000；若乐咕页面无此 slug，会在诊断中提示
+    "SZ399330": "sz399330-ttm-lyr", # 深证100
+    "SZ399303": "gz2000-ttm-lyr",  # 国证2000
+    "SZ399673": "sz399673-ttm-lyr", # 创业板50
+}
+
+# AKShare 当前版本可用的乐咕指数历史 PE 接口：ak.stock_index_pe_lg。
+# 注意它不覆盖所有指数；例如科创50不在该接口支持列表里。
+AK_STOCK_INDEX_PE_LG_SYMBOL_MAP: Dict[str, str] = {
+    "SH000016": "上证50",
+    "SH000300": "沪深300",
+    "SH000905": "中证500",
+    "SH000852": "中证1000",
+    "SH000010": "上证180",
+    "SH000009": "上证380",
+    "SZ399330": "深证100",
+    "SH000922": "中证红利",  # 若接口不支持会在诊断中失败，不影响其他链路。
+}
+
+
+
+def _legulegu_slugs_for_index(code: str, name: str, digits: str) -> List[str]:
+    """给系统自算历史 PE 百分位准备乐咕页面候选。
+
+    AKShare 1.15.52 之后已移除 funddb 相关接口，当前版本不再有
+    index_value_hist_funddb。这里直接访问乐咕公开页面并自行解析历史 PE，
+    作为“系统自算”而非蛋卷估值。
+    """
+    slugs: List[str] = []
+    if code in LEGULEGU_INDEX_PAGE_MAP:
+        slugs.append(LEGULEGU_INDEX_PAGE_MAP[code])
+    if digits == "000300" and "hs300-ttm-lyr" not in slugs:
+        slugs.append("hs300-ttm-lyr")
+    if digits == "000016" and "sz50-ttm-lyr" not in slugs:
+        slugs.append("sz50-ttm-lyr")
+    if digits == "000905" and "zz500-ttm-lyr" not in slugs:
+        slugs.append("zz500-ttm-lyr")
+    if digits == "399330" and "sz399330-ttm-lyr" not in slugs:
+        slugs.append("sz399330-ttm-lyr")
+    if digits == "399303" and "gz2000-ttm-lyr" not in slugs:
+        slugs.append("gz2000-ttm-lyr")
+    # 名称兜底：只加明确能从公开搜索确认的常见页面。
+    if "沪深300" in name and "hs300-ttm-lyr" not in slugs:
+        slugs.append("hs300-ttm-lyr")
+    if "上证50" in name and "sz50-ttm-lyr" not in slugs:
+        slugs.append("sz50-ttm-lyr")
+    if "中证500" in name and "zz500-ttm-lyr" not in slugs:
+        slugs.append("zz500-ttm-lyr")
+    if "中证800" in name and "zz800-ttm-lyr" not in slugs:
+        slugs.append("zz800-ttm-lyr")
+    if "深证100" in name and "sz399330-ttm-lyr" not in slugs:
+        slugs.append("sz399330-ttm-lyr")
+    if "国证2000" in name and "gz2000-ttm-lyr" not in slugs:
+        slugs.append("gz2000-ttm-lyr")
+    return slugs
+
+
+def _legulegu_headers() -> Dict[str, str]:
+    return {
+        "User-Agent": "Mozilla/5.0 trend-risk-position-tool",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": "https://legulegu.com/",
+    }
+
+
+def _pick_legulegu_pe_from_numbers(nums: List[float]) -> Optional[float]:
+    """从乐咕页面一行日期附近的数字中选 PE。
+
+    乐咕 PE 页面通常同时出现：静态中位数、静态等权、静态PE、TTM中位数、
+    TTM等权、TTM PE。优先取第 6 个数字（TTM 市值加权 PE），不足时取最后
+    一个合理 PE。此函数只用于系统自算百分位；若解析不到足够历史点，会失败，
+    不会伪造 PE 百分位。
+    """
+    clean = [float(x) for x in nums if 0 < float(x) < 300]
+    if not clean:
+        return None
+    if len(clean) >= 6:
+        return clean[5]
+    return clean[-1]
+
+
+def _extract_legulegu_history_from_html(html: str, source_label: str) -> Any:
+    import pandas as pd  # type: ignore
+    import html as html_lib
+
+    if not html:
+        raise ValueError("乐咕页面为空")
+    text = html_lib.unescape(html)
+    rows: List[Tuple[str, float]] = []
+
+    # 1) 常见图表/脚本结构：['2020-01-01', 1, 2, ...] 或 ["2020-01-01", ...]
+    arr_pattern = re.compile(r"\[\s*['\"](?P<date>20\d{2}[-/]\d{1,2}[-/]\d{1,2})['\"]\s*,(?P<body>[^\]]{1,600})\]", re.S)
+    for m in arr_pattern.finditer(text):
+        ds = _as_date_string(m.group("date"))
+        if not ds:
+            continue
+        nums = []
+        for raw in re.findall(r"[-+]?\d+(?:\.\d+)?", m.group("body")):
+            try:
+                nums.append(float(raw))
+            except Exception:
+                pass
+        pe = _pick_legulegu_pe_from_numbers(nums)
+        if pe is not None:
+            rows.append((ds, pe))
+
+    # 2) HTML 表格结构：日期后面跟多个 <td> 数字。
+    tr_pattern = re.compile(r"<tr[^>]*>(?P<tr>.*?)</tr>", re.S | re.I)
+    td_pattern = re.compile(r"<t[dh][^>]*>(.*?)</t[dh]>", re.S | re.I)
+    tag_re = re.compile(r"<[^>]+>")
+    for tr_m in tr_pattern.finditer(text):
+        cells = [tag_re.sub("", c).strip() for c in td_pattern.findall(tr_m.group("tr"))]
+        if not cells:
+            continue
+        ds = None
+        nums: List[float] = []
+        for cell in cells:
+            cell_text = cell.replace(",", "")
+            if ds is None:
+                dm = re.search(r"20\d{2}[-/]\d{1,2}[-/]\d{1,2}", cell_text)
+                if dm:
+                    ds = _as_date_string(dm.group(0))
+                    continue
+            try:
+                if re.fullmatch(r"[-+]?\d+(?:\.\d+)?%?", cell_text):
+                    nums.append(float(cell_text.replace("%", "")))
+            except Exception:
+                pass
+        if ds:
+            pe = _pick_legulegu_pe_from_numbers(nums)
+            if pe is not None:
+                rows.append((ds, pe))
+
+    # 3) 文本兜底：日期附近的数值，避免某些页面不用表格/数组。
+    # 限制窗口长度和 PE 合理范围，解析不到足够点则失败，不污染计算。
+    if len(rows) < 30:
+        date_pat = re.compile(r"(?P<date>20\d{2}[-/]\d{1,2}[-/]\d{1,2})(?P<body>.{0,260})", re.S)
+        for m in date_pat.finditer(text.replace("\n", " ")):
+            ds = _as_date_string(m.group("date"))
+            if not ds:
+                continue
+            nums = []
+            for raw in re.findall(r"[-+]?\d+(?:\.\d+)?", m.group("body")):
+                try:
+                    nums.append(float(raw))
+                except Exception:
+                    pass
+            pe = _pick_legulegu_pe_from_numbers(nums)
+            if pe is not None:
+                rows.append((ds, pe))
+
+    # 去重：同日取最后一次出现的值。
+    by_date: Dict[str, float] = {}
+    for ds, pe in rows:
+        if pe and 0 < pe < 300:
+            by_date[ds] = pe
+    if len(by_date) < 30:
+        raise ValueError(f"乐咕页面未解析到足够历史 PE：{len(by_date)} 条")
+    data = [{"日期": ds, "市盈率": pe} for ds, pe in sorted(by_date.items())]
+    return pd.DataFrame(data)
+
+
+def fetch_akshare_stock_index_pe_lg_series(symbol: str, asset_kind: str, options: Optional[FetchOptions] = None, symbol_name: str = "") -> Dict[str, Dict[str, Any]]:
+    """用 AKShare 当前可用接口 stock_index_pe_lg 获取指数历史 PE 序列。
+
+    该接口返回乐咕乐股指数历史 PE，包含【滚动市盈率】等列。
+    我们优先使用【滚动市盈率】作为 TTM PE，并在本地按当日及以前
+    数据计算历史 PE 百分位，避免使用未来数据。
+    """
+    import akshare as ak  # type: ignore
+
+    options = options or FetchOptions()
+    code = _norm_index_code(symbol, asset_kind, symbol_name)
+    if not code:
+        raise ValueError("未匹配到 AKShare stock_index_pe_lg 指数代码")
+    name = AK_STOCK_INDEX_PE_LG_SYMBOL_MAP.get(code)
+    if not name:
+        raise ValueError(f"AKShare stock_index_pe_lg 暂不支持该指数：{code} / {AK_INDEX_NAME_MAP.get(code, symbol_name or code)}")
+    with proxy_environment(options):
+        fn = getattr(ak, "stock_index_pe_lg", None)
+        if fn is None:
+            raise ValueError("当前 AKShare 版本没有 ak.stock_index_pe_lg")
+        df = fn(symbol=name)
+    seq = extract_valuation_series_from_df(df, f"akshare:stock_index_pe_lg:{name}:history")
+    return _validate_history_percentile_series(seq, f"akshare:stock_index_pe_lg:{name}")
+
+
+def fetch_legulegu_index_valuation_series(symbol: str, asset_kind: str, options: Optional[FetchOptions] = None, symbol_name: str = "") -> Dict[str, Dict[str, Any]]:
+    import requests  # type: ignore
+
+    options = options or FetchOptions()
+    code = _norm_index_code(symbol, asset_kind, symbol_name)
+    if not code:
+        raise ValueError("未匹配到乐咕指数代码")
+    name = AK_INDEX_NAME_MAP.get(code, code)
+    digits = re.sub(r"\D", "", code)
+    slugs = _legulegu_slugs_for_index(code, name, digits)
+    if not slugs:
+        raise ValueError(f"乐咕暂未配置该指数页面：code={code}, name={name}")
+    diagnostics: List[str] = [f"输入symbol={symbol}, code={code}, name={name}, slugs={slugs}"]
+    with proxy_environment(options):
+        for slug in slugs:
+            url = f"https://legulegu.com/stockdata/{slug}"
+            try:
+                resp = requests.get(url, headers=_legulegu_headers(), timeout=options.timeout, proxies=request_proxies(options))
+                preview = (resp.text or "")[:80].replace("\n", " ")
+                resp.raise_for_status()
+                df = _extract_legulegu_history_from_html(resp.text, f"legulegu:{slug}:history")
+                seq = extract_valuation_series_from_df(df, f"legulegu:{slug}:history")
+                seq = _validate_history_percentile_series(seq, f"legulegu:{slug}")
+                diagnostics.append(f"{url} -> {_df_debug_summary(df)} -> {_valuation_series_debug_summary(seq)}")
+                return seq
+            except Exception as e:
+                diagnostics.append(f"{url} -> 失败：{_diag_text(e)}; preview={_diag_text(preview, 120) if 'preview' in locals() else '--'}")
+    raise ValueError("乐咕历史估值诊断：" + "；".join(diagnostics[-8:]))
+
+def fetch_akshare_lg_valuation_series(symbol: str, options: Optional[FetchOptions] = None) -> Dict[str, Dict[str, Any]]:
+    import akshare as ak  # type: ignore
+
+    options = options or FetchOptions()
+    s = re.sub(r"\D", "", symbol or "")
+    if not re.fullmatch(r"\d{6}", s):
+        raise ValueError("不是A股6位代码")
+    with proxy_environment(options):
+        errors: List[str] = []
+        for fn_name in ("stock_a_indicator_lg", "stock_a_lg_indicator"):
+            fn = getattr(ak, fn_name, None)
+            if fn is None:
+                continue
+            try:
+                df = fn(symbol=s)
+                seq = extract_valuation_series_from_df(df, f"akshare:{fn_name}:history")
+                return _validate_history_percentile_series(seq, f"akshare:{fn_name}")
+            except Exception as e:
+                errors.append(str(e))
+        raise ValueError("；".join(errors[-2:]) or "当前 AKShare 没有可用乐咕历史估值接口")
+
+
+def fetch_akshare_index_valuation_series(symbol: str, asset_kind: str, options: Optional[FetchOptions] = None, symbol_name: str = "") -> Dict[str, Dict[str, Any]]:
+    import akshare as ak  # type: ignore
+
+    options = options or FetchOptions()
+    code = _norm_index_code(symbol, asset_kind, symbol_name)
+    if not code:
+        raise ValueError("未匹配到指数估值代码")
+    name = AK_INDEX_NAME_MAP.get(code, code)
+    digits = re.sub(r"\D", "", code)
+
+    diagnostics: List[str] = []
+    diagnostics.append(f"输入symbol={symbol}, asset_kind={asset_kind}, symbol_name={symbol_name or '--'}")
+    diagnostics.append(f"映射结果 code={code}, name={name}, digits={digits}")
+    diagnostics.append(f"akshare版本={getattr(ak, '__version__', 'unknown')}")
+
+    # 系统自算只接受“历史估值”接口，不接受只返回当前 1 行的估值接口。
+    # 有些 AKShare 版本/源会把 index_value_hist_funddb 返回成 1 行，必须判为失败。
+    symbols_to_try: List[str] = []
+    for sym in (name, f"{name}指数", code, digits):
+        if sym and sym not in symbols_to_try:
+            symbols_to_try.append(sym)
+    diagnostics.append(f"尝试symbol={symbols_to_try}")
+
+    # 优先使用 AKShare 当前版本可用的 stock_index_pe_lg 历史 PE 接口。
+    # 这条链路能直接拿到多年【滚动市盈率】历史序列，然后本地自算百分位。
+    try:
+        pe_lg_seq = fetch_akshare_stock_index_pe_lg_series(symbol, asset_kind, options, symbol_name)
+        diagnostics.append(f"stock_index_pe_lg成功：{_valuation_series_debug_summary(pe_lg_seq)}")
+        return pe_lg_seq
+    except Exception as e:
+        diagnostics.append(f"stock_index_pe_lg失败：{_diag_text(e)}")
+
+    calls: List[Tuple[str, Dict[str, Any]]] = []
+    for sym in symbols_to_try:
+        calls.extend([
+            ("index_value_hist_funddb", {"symbol": sym, "indicator": "市盈率"}),
+            ("index_value_hist_funddb", {"symbol": sym, "indicator": "市净率"}),
+            ("index_value_hist_funddb", {"symbol": sym}),
+        ])
+
+    merged: Dict[str, Dict[str, Any]] = {}
+    with proxy_environment(options):
+        for fn_name, kwargs in calls:
+            fn = getattr(ak, fn_name, None)
+            if fn is None:
+                diagnostics.append(f"函数不存在：ak.{fn_name}")
+                continue
+            try:
+                df = fn(**kwargs)
+                df_info = _df_debug_summary(df)
+                try:
+                    seq = extract_valuation_series_from_df(df, f"akshare:{fn_name}:{kwargs.get('symbol')}:history")
+                except Exception as parse_error:
+                    diagnostics.append(f"{fn_name}({kwargs}) -> {df_info} -> 解析失败：{_diag_text(parse_error)}")
+                    continue
+
+                seq_info = _valuation_series_debug_summary(seq)
+                diagnostics.append(f"{fn_name}({kwargs}) -> {df_info} -> {seq_info}")
+                if len(seq) < 30:
+                    continue
+                merged = merge_valuation_series(merged, seq)
+            except Exception as e:
+                diagnostics.append(f"{fn_name}({kwargs}) -> 请求失败：{_diag_text(e)}")
+            if len(merged) >= 120 and any(v.get("pe_percentile") is not None for v in merged.values()):
+                break
+
+    # AKShare 1.15.52 之后已移除 funddb 相关接口；如果当前版本没有
+    # index_value_hist_funddb，则直接走乐咕页面解析历史 PE，再系统自算百分位。
+    try:
+        legu_seq = fetch_legulegu_index_valuation_series(symbol, asset_kind, options, symbol_name)
+        diagnostics.append(f"乐咕直接历史估值成功：{_valuation_series_debug_summary(legu_seq)}")
+        merged = merge_valuation_series(merged, legu_seq)
+    except Exception as e:
+        diagnostics.append(f"乐咕直接历史估值失败：{_diag_text(e)}")
+
+    if not merged:
+        raise ValueError("AKShare/乐咕历史指数估值诊断：" + "；".join(diagnostics[-24:]))
+    try:
+        return _validate_history_percentile_series(merged, f"akshare_or_legulegu:index:{name}")
+    except Exception as e:
+        raise ValueError(f"{e}；AKShare/乐咕历史指数估值诊断：" + "；".join(diagnostics[-24:]))
+
+def fetch_historical_valuation_series(symbol: str, market: str, asset_kind: str, cfg: Dict[str, Any], symbol_name: str = "") -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
+    """回测用历史估值序列。优先国内指数/ETF/基金映射；A股个股尝试乐咕。"""
+    options = fetch_options_from_cfg(cfg)
+    market_u = str(market or "auto").upper()
+    kind = str(asset_kind or "auto").lower()
+    errors: List[str] = []
+    system_candidates: List[Tuple[str, Callable[[], Dict[str, Dict[str, Any]]]]] = []
+    danjuan_candidates: List[Tuple[str, Callable[[], Dict[str, Dict[str, Any]]]]] = []
+    if (market_u == "CN" or kind in {"index", "fund", "etf"} or _norm_index_code(symbol, kind, symbol_name)):
+        system_candidates.append(("akshare_index_history", lambda: fetch_akshare_index_valuation_series(symbol, kind, options, symbol_name)))
+        danjuan_candidates.append(("danjuan_history_pe_pb_roe", lambda: fetch_danjuan_full_history_series(symbol, kind, options, symbol_name)))
+    if (market_u == "CN" or re.fullmatch(r"\d{6}", re.sub(r"\D", "", symbol or ""))) and kind not in {"fund", "etf", "index"}:
+        system_candidates.append(("akshare_lg_history", lambda: fetch_akshare_lg_valuation_series(symbol, options)))
+
+    method = str(cfg.get("valuation_method", "system_calc") or "system_calc")
+    if method == "danjuan":
+        candidates = danjuan_candidates + system_candidates
+    elif method == "system_calc":
+        candidates = system_candidates
+    else:
+        candidates = system_candidates + danjuan_candidates
+    for label, fn in candidates:
+        try:
+            seq = fn()
+            if seq:
+                return seq, [f"历史估值：{label} 成功，{len(seq)} 条"]
+        except Exception as e:
+            errors.append(f"历史估值：{label} 失败：{str(e)[:160]}")
+    return {}, errors or ["历史估值：当前标的暂不支持历史估值序列"]
+
+
+def historical_valuation_for_date(series: Dict[str, Dict[str, Any]], ds: str) -> Dict[str, Any]:
+    """取不晚于 ds 的最近历史估值，避免未来函数。
+
+    PE/PB/ROE 的历史接口日期可能不同步；这里按字段分别向前查找，
+    避免某天只有 ROE/PB 而把较早的 PE 百分位覆盖丢失。
+    """
+    if not series:
+        return {}
+    keys = sorted([k for k in series.keys() if k <= ds], reverse=True)
+    if not keys:
+        return {}
+    fields = [
+        "current_pe", "pe_percentile", "current_pb", "pb_percentile", "roe_pct",
+        "valuation_source", "valuation_note", "valuation_extra_note",
+    ]
+    out: Dict[str, Any] = {}
+    used_dates: List[str] = []
+    for key in keys:
+        item = series.get(key) or {}
+        for field in fields:
+            if out.get(field) in (None, "") and item.get(field) not in (None, ""):
+                out[field] = item.get(field)
+                if key not in used_dates:
+                    used_dates.append(key)
+        if all(out.get(f) not in (None, "") for f in ["current_pe", "pe_percentile", "current_pb", "pb_percentile", "roe_pct"]):
+            break
+    if used_dates:
+        out["valuation_date"] = max(used_dates)
+    return out
+
+
+
+def latest_valuation_from_history_series(series: Dict[str, Dict[str, Any]], source_label: str = "historical_latest") -> Dict[str, Any]:
+    """实时页面使用：从历史估值序列取最新一日。
+
+    系统自算 PE 百分位必须基于真实历史序列。
+    如果历史点数不足或没有算出 pe_percentile，就明确失败，
+    不再把“当前 1 行估值”误报为系统自算成功。
+    """
+    series = _validate_history_percentile_series(series, source_label)
+    rows = len(series)
+    pe_rows = sum(1 for v in series.values() if v.get("current_pe") is not None)
+    pe_pct_rows = sum(1 for v in series.values() if v.get("pe_percentile") is not None)
+    latest_ds = max(series.keys())
+    item = historical_valuation_for_date(series, latest_ds)
+    if item.get("pe_percentile") is not None:
+        item["valuation_source"] = f"{source_label}:{item.get('valuation_source') or 'history'}"
+        item["valuation_note"] = f"系统自算历史百分位：{rows}条，PE有效{pe_rows}条"
+        item["valuation_date"] = item.get("valuation_date") or latest_ds
+        item["_history_rows"] = rows
+        item["_history_pe_rows"] = pe_rows
+        item["_history_pe_percentile_rows"] = pe_pct_rows
+        return item
+    raise ValueError(f"历史估值序列没有可用 PE 百分位：{rows} 条")
+
+def fetch_akshare_lg_valuation_latest_from_history(symbol: str, options: Optional[FetchOptions] = None) -> Dict[str, Any]:
+    series = fetch_akshare_lg_valuation_series(symbol, options)
+    return latest_valuation_from_history_series(series, "akshare_lg_history_latest")
+
+
+def fetch_akshare_index_valuation_latest_from_history(symbol: str, asset_kind: str, options: Optional[FetchOptions] = None, symbol_name: str = "") -> Dict[str, Any]:
+    series = fetch_akshare_index_valuation_series(symbol, asset_kind, options, symbol_name)
+    return latest_valuation_from_history_series(series, "akshare_index_history_latest")
+
+def fetch_akshare_lg_valuation(symbol: str, options: Optional[FetchOptions] = None) -> Dict[str, Any]:
+    import akshare as ak  # type: ignore
+
+    options = options or FetchOptions()
+    s = re.sub(r"\D", "", symbol or "")
+    if not re.fullmatch(r"\d{6}", s):
+        raise ValueError("不是A股6位代码")
+    with proxy_environment(options):
+        last_error = ""
+        for fn_name in ("stock_a_indicator_lg", "stock_a_lg_indicator"):
+            fn = getattr(ak, fn_name, None)
+            if fn is None:
+                continue
+            try:
+                df = fn(symbol=s)
+                return extract_valuation_from_df(df, f"akshare:{fn_name}")
+            except Exception as e:
+                last_error = str(e)
+        raise ValueError(last_error or "当前 AKShare 没有可用乐咕估值接口")
+
+
+def fetch_akshare_index_valuation(symbol: str, asset_kind: str, options: Optional[FetchOptions] = None, symbol_name: str = "") -> Dict[str, Any]:
+    import akshare as ak  # type: ignore
+
+    options = options or FetchOptions()
+    code = _norm_index_code(symbol, asset_kind, symbol_name)
+    if not code:
+        raise ValueError("未匹配到指数估值代码")
+    name = AK_INDEX_NAME_MAP.get(code, code)
+    digits = re.sub(r"\D", "", code)
+
+    # 不同 AKShare 版本函数名和参数有变化，这里按最常见形态逐个试。
+    calls: List[Tuple[str, Dict[str, Any]]] = [
+        ("index_value_hist_funddb", {"symbol": name}),
+        ("index_value_hist_funddb", {"symbol": code}),
+        ("index_value_hist_funddb", {"symbol": digits}),
+        ("index_value_name_funddb", {"symbol": name}),
+        ("stock_zh_index_value_csindex", {"symbol": digits}),
+        ("index_value_csindex", {"symbol": digits}),
+    ]
+    with proxy_environment(options):
+        last_error = ""
+        for fn_name, kwargs in calls:
+            fn = getattr(ak, fn_name, None)
+            if fn is None:
+                continue
+            try:
+                df = fn(**kwargs)
+                return extract_valuation_from_df(df, f"akshare:{fn_name}:{kwargs.get('symbol')}")
+            except Exception as e:
+                last_error = str(e)
+        raise ValueError(last_error or "AKShare 未返回指数估值")
+
+
+def _normalise_percent(value: Any) -> Optional[float]:
+    """把 0~1 或 0~100 的百分位统一成 0~100。"""
+    if value is None or value == "":
+        return None
+    try:
+        text = str(value).strip().replace("%", "").replace(",", "")
+        v = float(text)
+        if math.isnan(v) or math.isinf(v):
+            return None
+        if 0 < v <= 1:
+            v *= 100
+        return round(clamp(v, 0.0, 100.0), 4)
+    except Exception:
+        return None
+
+
+def _normalise_number(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        text = str(value).strip().replace("%", "").replace(",", "")
+        v = float(text)
+        if math.isnan(v) or math.isinf(v):
+            return None
+        return round(v, 6)
+    except Exception:
+        return None
+
+
+def _walk_json(obj: Any, path: str = ""):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            key = str(k)
+            next_path = f"{path}.{key}" if path else key
+            yield next_path, key, v
+            yield from _walk_json(v, next_path)
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            next_path = f"{path}[{i}]"
+            yield from _walk_json(v, next_path)
+
+
+def _extract_valuation_from_json(payload: Any, source: str) -> Dict[str, Any]:
+    """尽量兼容不同估值 JSON 字段名。不会伪造缺失的百分位。"""
+    result: Dict[str, Any] = {"valuation_source": source, "valuation_note": "--"}
+
+    pe_pct_keys = ("pe_percentile", "pe_percent", "pepercentile", "pe_percentile_ttm", "pe_ttm_percentile", "pe分位", "pe百分位")
+    pb_pct_keys = ("pb_percentile", "pb_percent", "pbpercentile", "pb分位", "pb百分位")
+    pe_keys = ("pe", "pe_ttm", "pettm", "pe_value", "pevalue")
+    pb_keys = ("pb", "pb_value", "pbvalue")
+    roe_keys = ("roe", "roe_pct", "roepercent", "净资产收益率")
+
+    def key_text(path: str, key: str) -> str:
+        return (path + "." + key).lower().replace("-", "_")
+
+    for path, key, value in _walk_json(payload):
+        if isinstance(value, (dict, list)):
+            continue
+        kt = key_text(path, key)
+        k_low = str(key).lower().replace("-", "_")
+        if result.get("pe_percentile") is None and any(x in kt for x in pe_pct_keys):
+            v = _normalise_percent(value)
+            if v is not None:
+                result["pe_percentile"] = v
+                continue
+        if result.get("pb_percentile") is None and any(x in kt for x in pb_pct_keys):
+            v = _normalise_percent(value)
+            if v is not None:
+                result["pb_percentile"] = v
+                continue
+        if result.get("current_pe") is None and any(k_low == x or kt.endswith("." + x) for x in pe_keys) and "percent" not in kt and "分位" not in kt:
+            v = _normalise_number(value)
+            if v is not None and v > 0:
+                result["current_pe"] = v
+                continue
+        if result.get("current_pb") is None and any(k_low == x or kt.endswith("." + x) for x in pb_keys) and "percent" not in kt and "分位" not in kt:
+            v = _normalise_number(value)
+            if v is not None and v > 0:
+                result["current_pb"] = v
+                continue
+        if result.get("roe_pct") is None and any(x in kt for x in roe_keys):
+            v = _normalise_number(value)
+            if v is not None:
+                # 有些接口用 0.18 表示 18%，有些直接用 18。
+                if -1 <= v <= 1 and v != 0:
+                    v *= 100
+                result["roe_pct"] = round(v, 4)
+                continue
+    if not any(result.get(k) is not None for k in ("pe_percentile", "pb_percentile", "roe_pct", "current_pe", "current_pb")):
+        raise ValueError("蛋卷 JSON 未解析到估值字段")
+    return result
+
+
+def _danjuan_headers(options: FetchOptions) -> Dict[str, str]:
+    headers = {
+        "User-Agent": "Apifox/1.0.0 (https://apifox.com)",
+        "Accept": "*/*",
+        "Host": "danjuanfunds.com",
+        "Connection": "keep-alive",
+        "Referer": "https://danjuanfunds.com/djmodule/value-center",
+    }
+    if options.danjuan_cookie:
+        headers["Cookie"] = options.danjuan_cookie
+    return headers
+
+
+def fetch_danjuan_json_raw(code: str, options: FetchOptions) -> Tuple[Any, Dict[str, Any]]:
+    import requests  # type: ignore
+
+    url = f"https://danjuanfunds.com/djapi/index_eva/detail/{code}"
+    resp = requests.get(url, headers=_danjuan_headers(options), timeout=options.timeout, proxies=request_proxies(options))
+    text = resp.text
+    resp.raise_for_status()
+    try:
+        payload = resp.json()
+    except Exception as e:
+        raise ValueError(f"蛋卷返回不是 JSON：{e}; preview={text[:180]}")
+    return payload, {"url": url, "status_code": resp.status_code, "response_preview": text[:800]}
+
+def fetch_danjuan_detail_valuation(symbol: str, asset_kind: str, options: FetchOptions, symbol_name: str = "") -> Dict[str, Any]:
+    """蛋卷（雪球）detail 当前页面估值。
+
+    实时仓位助手固定使用这个接口读取当前 PE/PB/ROE/百分位，避免把
+    7天采样的历史图表序列和页面当前分位混为一谈。
+    """
+    code = _norm_index_code(symbol, asset_kind, symbol_name)
+    if not code:
+        raise ValueError("未匹配到蛋卷指数代码")
+    payload, meta = fetch_danjuan_json_raw(code, options)
+    detail = _extract_valuation_from_json(payload, f"danjuan_detail:{code}")
+    raw_data = payload.get("data") if isinstance(payload, dict) else None
+    if isinstance(raw_data, dict):
+        detail_date = _danjuan_ts_to_date(raw_data.get("ts") or raw_data.get("date"))
+        if detail_date:
+            detail["valuation_date"] = detail_date
+        if raw_data.get("date") is not None:
+            detail["valuation_display_date"] = str(raw_data.get("date"))
+        if raw_data.get("updated_at") is not None:
+            detail["valuation_updated_at"] = raw_data.get("updated_at")
+    detail["valuation_endpoint"] = meta.get("url")
+    detail["valuation_note"] = "蛋卷（雪球）当前页面估值"
+    return detail
+
+
+def fetch_danjuan_metric_history_raw(code: str, metric: str, options: FetchOptions) -> Tuple[Any, Dict[str, Any]]:
+    import requests  # type: ignore
+
+    metric = str(metric).strip().lower()
+    if metric not in {"pe", "pb", "roe"}:
+        raise ValueError(f"不支持的蛋卷历史估值指标：{metric}")
+    url = f"https://danjuanfunds.com/djapi/index_eva/{metric}_history/{code}?day=all"
+    headers = _danjuan_headers(options)
+    headers["Accept"] = "application/json, text/plain, */*"
+    headers["Referer"] = f"https://danjuanfunds.com/dj-valuation-table-detail/{code}"
+    resp = requests.get(url, headers=headers, timeout=options.timeout, proxies=request_proxies(options))
+    text = resp.text or ""
+    resp.raise_for_status()
+    try:
+        payload = resp.json()
+    except Exception as e:
+        raise ValueError(f"蛋卷历史{metric.upper()}返回不是 JSON：{e}; preview={text[:180]}")
+    return payload, {"url": url, "status_code": resp.status_code, "response_preview": text[:800]}
+
+
+def _find_danjuan_metric_history_items(payload: Any, value_key: str) -> List[Dict[str, Any]]:
+    """从蛋卷历史 JSON 中递归找带 value_key/ts 的历史数组。"""
+    value_key = str(value_key)
+    candidates: List[List[Dict[str, Any]]] = []
+
+    def walk(x: Any) -> None:
+        if isinstance(x, list):
+            dicts = [i for i in x if isinstance(i, dict)]
+            if dicts and sum(1 for i in dicts if value_key in i and ("ts" in i or "date" in i or "time" in i)) >= max(3, len(dicts) // 2):
+                candidates.append(dicts)
+            for i in x[:20]:
+                walk(i)
+        elif isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+
+    walk(payload)
+    if not candidates:
+        return []
+    candidates.sort(key=len, reverse=True)
+    return candidates[0]
+
+
+def fetch_danjuan_metric_history_series(symbol: str, asset_kind: str, options: FetchOptions, symbol_name: str, metric: str) -> Dict[str, Dict[str, Any]]:
+    """蛋卷历史 PE/PB/ROE 曲线 → 本地生成逐日估值序列。"""
+    import pandas as pd  # type: ignore
+
+    metric = str(metric).strip().lower()
+    code = _norm_index_code(symbol, asset_kind, symbol_name)
+    if not code:
+        raise ValueError("未匹配到蛋卷指数代码")
+    value_key = {"pe": "pe", "pb": "pb", "roe": "roe"}.get(metric)
+    col_name = {"pe": "滚动市盈率", "pb": "市净率", "roe": "roe"}.get(metric)
+    if not value_key or not col_name:
+        raise ValueError(f"不支持的蛋卷历史估值指标：{metric}")
+
+    payload, meta = fetch_danjuan_metric_history_raw(code, metric, options)
+    items = _find_danjuan_metric_history_items(payload, value_key)
+    rows: List[Dict[str, Any]] = []
+    for item in items:
+        try:
+            value = float(str(item.get(value_key, "")).replace(",", ""))
+        except Exception:
+            continue
+        ds = _danjuan_ts_to_date(item.get("ts") or item.get("date") or item.get("time"))
+        if ds and value > 0:
+            # ROE 接口通常用 0.1204 表示 12.04%，extract_valuation_series_from_df 会统一转成百分数。
+            upper_limit = 500 if metric in {"pe", "pb"} else 10
+            if value < upper_limit:
+                rows.append({"日期": ds, col_name: value})
+
+    by_date: Dict[str, float] = {}
+    for row in rows:
+        by_date[str(row["日期"])] = float(row[col_name])
+    if len(by_date) < 10:
+        raise ValueError(f"蛋卷历史{metric.upper()}序列不足：{len(by_date)} 条；url={meta.get('url')}")
+    df = pd.DataFrame([{"日期": ds, col_name: value} for ds, value in sorted(by_date.items())])
+    seq = extract_valuation_series_from_df(df, f"danjuan_{metric}_history:{code}")
+    if metric == "pe":
+        return _validate_history_percentile_series(seq, f"danjuan_{metric}_history:{code}")
+    return seq
+
+
+def fetch_danjuan_full_history_series(symbol: str, asset_kind: str, options: FetchOptions, symbol_name: str = "") -> Dict[str, Dict[str, Any]]:
+    """蛋卷历史 PE/PB/ROE 曲线合并。
+
+    PE 是主序列；PB 和 ROE 能获取就补充，失败不影响 PE 百分位主计算。
+    """
+    errors: List[str] = []
+    try:
+        seq = fetch_danjuan_metric_history_series(symbol, asset_kind, options, symbol_name, "pe")
+    except Exception as e:
+        raise ValueError(f"蛋卷历史PE失败：{e}")
+    for metric in ("pb", "roe"):
+        try:
+            extra = fetch_danjuan_metric_history_series(symbol, asset_kind, options, symbol_name, metric)
+            seq = merge_valuation_series(seq, extra)
+        except Exception as e:
+            errors.append(f"{metric.upper()}失败：{str(e)[:120]}")
+    # detail 当前页面可能比历史曲线多一个最新交易日；补入后重新自算百分位。
+    seq = merge_danjuan_detail_current_into_history_series(seq, symbol, asset_kind, options, symbol_name)
+    # 保留补充失败提示，但不污染用于计算的字段。
+    if errors:
+        for item in seq.values():
+            item.setdefault("valuation_extra_note", "；".join(errors))
+    return _validate_history_percentile_series(seq, "danjuan_full_history")
+
+
+def fetch_danjuan_pe_history_raw(code: str, options: FetchOptions) -> Tuple[Any, Dict[str, Any]]:
+    import requests  # type: ignore
+
+    url = f"https://danjuanfunds.com/djapi/index_eva/pe_history/{code}?day=all"
+    headers = _danjuan_headers(options)
+    headers["Accept"] = "application/json, text/plain, */*"
+    headers["Referer"] = f"https://danjuanfunds.com/dj-valuation-table-detail/{code}"
+    resp = requests.get(url, headers=headers, timeout=options.timeout, proxies=request_proxies(options))
+    text = resp.text or ""
+    resp.raise_for_status()
+    try:
+        payload = resp.json()
+    except Exception as e:
+        raise ValueError(f"蛋卷历史PE返回不是 JSON：{e}; preview={text[:180]}")
+    return payload, {"url": url, "status_code": resp.status_code, "response_preview": text[:800]}
+
+
+def _find_danjuan_pe_history_items(payload: Any) -> List[Dict[str, Any]]:
+    """从蛋卷 pe_history JSON 中递归找带 pe/ts 的历史数组。"""
+    candidates: List[List[Dict[str, Any]]] = []
+
+    def walk(x: Any) -> None:
+        if isinstance(x, list):
+            dicts = [i for i in x if isinstance(i, dict)]
+            if dicts and sum(1 for i in dicts if "pe" in i and ("ts" in i or "date" in i or "time" in i)) >= max(3, len(dicts) // 2):
+                candidates.append(dicts)
+            for i in x[:20]:
+                walk(i)
+        elif isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+
+    walk(payload)
+    if not candidates:
+        return []
+    candidates.sort(key=len, reverse=True)
+    return candidates[0]
+
+
+def _danjuan_ts_to_date(value: Any) -> Optional[str]:
+    """蛋卷接口 ts 是按北京时间交易日给的 00:00:00。
+
+    之前用 UTC 解析会把 2026-06-05 00:00:00+08:00 显示成
+    2026-06-04，导致“估值序列最新日期”比页面 date 慢一天。
+    这里固定按 UTC+8 转日期，和蛋卷页面的 date 字段对齐。
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts > 10_000_000_000:
+            ts = ts / 1000.0
+        try:
+            china_tz = timezone(timedelta(hours=8))
+            return datetime.fromtimestamp(ts, china_tz).date().isoformat()
+        except Exception:
+            return None
+    return _as_date_string(value)
+
+
+def fetch_danjuan_pe_history_series(symbol: str, asset_kind: str, options: FetchOptions, symbol_name: str = "") -> Dict[str, Dict[str, Any]]:
+    """蛋卷 pe_history 历史 PE 序列 → 本地自算历史 PE 百分位。
+
+    与 /detail 接口不同，这里使用历史 PE 曲线，不直接采用当前 PE 百分位。
+    适合科创50等 AKShare stock_index_pe_lg 暂不支持但蛋卷支持的指数。
+    """
+    import pandas as pd  # type: ignore
+
+    code = _norm_index_code(symbol, asset_kind, symbol_name)
+    if not code:
+        raise ValueError("未匹配到蛋卷指数代码")
+    payload, meta = fetch_danjuan_pe_history_raw(code, options)
+    items = _find_danjuan_pe_history_items(payload)
+    rows: List[Dict[str, Any]] = []
+    for item in items:
+        try:
+            pe = float(str(item.get("pe", "")).replace(",", ""))
+        except Exception:
+            continue
+        ds = _danjuan_ts_to_date(item.get("ts") or item.get("date") or item.get("time"))
+        if ds and pe > 0 and pe < 500:
+            rows.append({"日期": ds, "滚动市盈率": pe})
+    # 同日去重，保留最后一条。
+    by_date: Dict[str, float] = {}
+    for row in rows:
+        by_date[str(row["日期"])] = float(row["滚动市盈率"])
+    if len(by_date) < 30:
+        raise ValueError(f"蛋卷历史PE序列不足：{len(by_date)} 条；url={meta.get('url')}")
+    df = pd.DataFrame([{"日期": ds, "滚动市盈率": pe} for ds, pe in sorted(by_date.items())])
+    seq = extract_valuation_series_from_df(df, f"danjuan_pe_history:{code}")
+    return _validate_history_percentile_series(seq, f"danjuan_pe_history:{code}")
+
+
+def fetch_danjuan_valuation_latest_from_history(symbol: str, asset_kind: str, options: FetchOptions, symbol_name: str = "") -> Dict[str, Any]:
+    series = fetch_danjuan_full_history_series(symbol, asset_kind, options, symbol_name)
+    return latest_valuation_from_history_series(series, "danjuan_history_latest")
+
+
+def fetch_danjuan_valuation(symbol: str, asset_kind: str, options: FetchOptions, symbol_name: str = "") -> Dict[str, Any]:
+    """蛋卷估值：优先用 pe_history 历史 PE 序列自算 PE 百分位，再用 detail 补 PB/ROE。"""
+    code = _norm_index_code(symbol, asset_kind, symbol_name)
+    if not code:
+        raise ValueError("未匹配到蛋卷指数代码")
+
+    result: Dict[str, Any] = {}
+    history_error = ""
+    try:
+        result = fetch_danjuan_valuation_latest_from_history(symbol, asset_kind, options, symbol_name)
+    except Exception as e:
+        history_error = str(e)
+
+    detail_error = ""
+    try:
+        payload, meta = fetch_danjuan_json_raw(code, options)
+        detail = _extract_valuation_from_json(payload, f"danjuan_json:{code}")
+        detail["valuation_endpoint"] = meta.get("url")
+        # 只补空值，避免 detail 的当前 PE 百分位覆盖 pe_history 自算结果。
+        result = merge_missing_fundamentals(result, detail)
+        result.setdefault("valuation_endpoint", meta.get("url"))
+    except Exception as e:
+        detail_error = str(e)
+
+    if result:
+        if result.get("valuation_source") is None:
+            result["valuation_source"] = f"danjuan:{code}"
+        result.setdefault("valuation_note", "--")
+        return result
+    raise ValueError("蛋卷估值失败：" + "；".join(x for x in [history_error, detail_error] if x))
+
+
+def merge_missing_fundamentals(base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
+    """只补空值，避免覆盖更精确的数据；估值来源只在补到估值字段时更新。"""
+    merged = dict(base or {})
+    filled_any = False
+    for key, value in (extra or {}).items():
+        if value is None or value == "":
+            continue
+        if key in {"valuation_source", "valuation_note"}:
+            continue
+        if merged.get(key) in (None, ""):
+            merged[key] = value
+            if key in {"pe_percentile", "pb_percentile", "current_pe", "current_pb", "roe_pct"}:
+                filled_any = True
+    if filled_any and extra.get("valuation_source") and not merged.get("valuation_source"):
+        merged["valuation_source"] = extra.get("valuation_source")
+    return merged
+
+
+def retry_valuation_call(label: str, fn: Callable[[], Dict[str, Any]], options: FetchOptions) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    trace: List[Dict[str, Any]] = []
+    total = max(1, min(options.retry_count + 1, 3))  # 估值链路通常较慢，最多3次即可。
+    last_error = ""
+    for i in range(total):
+        started = time.time()
+        try:
+            data = fn()
+            if "history_latest" in label and data.get("pe_percentile") is None:
+                raise ValueError("历史估值链路未返回 PE 百分位")
+            if not any(data.get(k) is not None for k in ("pe_percentile", "pb_percentile", "current_pe", "roe_pct")):
+                raise ValueError("未返回有效估值字段")
+            trace.append({
+                "source": label,
+                "attempt": f"valuation-{i + 1}",
+                "ok": True,
+                "rows": int(data.get("_history_rows") or 1),
+                "elapsed_ms": int((time.time() - started) * 1000),
+            })
+            return data, trace
+        except Exception as e:
+            last_error = str(e)
+            trace.append({
+                "source": label,
+                "attempt": f"valuation-{i + 1}",
+                "ok": False,
+                "error": last_error[:1600],
+                "elapsed_ms": int((time.time() - started) * 1000),
+            })
+            if i < total - 1:
+                time.sleep(min(0.35 * (i + 1), 1.0))
+    return None, trace
+
+
+def enrich_fundamentals_with_public_valuation(
+    symbol: str,
+    market: str,
+    asset_kind: str,
+    fundamentals: Dict[str, Any],
+    options: FetchOptions,
+    symbol_name: str = "",
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """多来源补充估值：AKShare/乐咕 -> AKShare指数估值 -> 蛋卷兜底。
+
+    未拿到 PE 百分位时不写长提示；前端【估值提示】显示 --。
+    """
+    base = dict(fundamentals or {})
+    traces: List[Dict[str, Any]] = []
+    market = str(market or "auto").upper()
+    kind = str(asset_kind or "auto").lower()
+    digits = re.sub(r"\D", "", symbol or "")
+
+    history_candidates: List[Tuple[str, Callable[[], Dict[str, Any]]]] = []
+    current_candidates: List[Tuple[str, Callable[[], Dict[str, Any]]]] = []
+    if (market == "CN" or re.fullmatch(r"\d{6}", digits)) and kind not in {"fund", "etf", "index"}:
+        history_candidates.append(("valuation:akshare_lg_history_latest", lambda: fetch_akshare_lg_valuation_latest_from_history(symbol, options)))
+        current_candidates.append(("valuation:akshare_lg", lambda: fetch_akshare_lg_valuation(symbol, options)))
+    if market == "CN" or kind in {"index", "fund", "etf"} or _norm_index_code(symbol, kind, symbol_name):
+        history_candidates.append(("valuation:akshare_index_history_latest", lambda: fetch_akshare_index_valuation_latest_from_history(symbol, kind, options, symbol_name)))
+        current_candidates.append(("valuation:akshare_index", lambda: fetch_akshare_index_valuation(symbol, kind, options, symbol_name)))
+    danjuan_history_candidates: List[Tuple[str, Callable[[], Dict[str, Any]]]] = []
+    danjuan_candidates: List[Tuple[str, Callable[[], Dict[str, Any]]]] = []
+    danjuan_detail_candidates: List[Tuple[str, Callable[[], Dict[str, Any]]]] = []
+    if market == "CN" or kind in {"index", "fund", "etf"} or _norm_index_code(symbol, kind, symbol_name):
+        danjuan_detail_candidates.append(("valuation:danjuan_detail", lambda: fetch_danjuan_detail_valuation(symbol, kind, options, symbol_name)))
+        danjuan_history_candidates.append(("valuation:danjuan_history_latest", lambda: fetch_danjuan_valuation_latest_from_history(symbol, kind, options, symbol_name)))
+        danjuan_candidates.append(("valuation:danjuan", lambda: fetch_danjuan_valuation(symbol, kind, options, symbol_name)))
+
+    method = str(getattr(options, "valuation_method", "system_calc") or "system_calc")
+    if method == "danjuan_detail":
+        # 实时仓位助手固定使用蛋卷 detail 当前页面分位，不受回测来源设置影响。
+        candidates = danjuan_detail_candidates + current_candidates
+    elif method == "danjuan":
+        # 蛋卷优先时，也优先使用 pe_history 历史PE曲线自算百分位；detail 只作补充。
+        candidates = danjuan_history_candidates + danjuan_candidates + history_candidates + current_candidates
+    elif method == "system_calc":
+        # 用户明确选择系统自算时，只跑 AKShare/乐咕历史序列，不走蛋卷。
+        candidates = history_candidates
+    else:
+        # 兼容旧配置 auto：先系统自算，再用蛋卷历史PE兜底，最后才使用当前估值。
+        candidates = history_candidates + danjuan_history_candidates + current_candidates + danjuan_candidates
+
+    # 实时仓位页 method=danjuan_detail 时，即使行情源已有估值，也优先用蛋卷 detail 当前页面值覆盖/校准。
+    # 其他模式下，如果行情源已经给了 PE 百分位，就不用再跑网络估值。
+    if method != "danjuan_detail" and base.get("pe_percentile") is not None:
+        base.setdefault("valuation_note", "--")
+        return base, traces
+
+    for label, fn in candidates:
+        extra, trace = retry_valuation_call(label, fn, options)
+        traces.extend(trace)
+        if extra:
+            if method == "danjuan_detail" and label == "valuation:danjuan_detail":
+                # 实时仓位助手以蛋卷 detail 当前页面为准，直接覆盖估值相关字段。
+                for k, v in extra.items():
+                    if v is not None and v != "":
+                        base[k] = v
+            else:
+                base = merge_missing_fundamentals(base, extra)
+        if base.get("pe_percentile") is not None:
+            break
+
+    base.setdefault("valuation_note", "--")
+    return base, traces
+
+def fetch_market_data(symbol: str, market: str, asset_kind: str, source: str, cfg: Dict[str, Any]) -> Tuple[List[Dict[str, float]], Dict[str, Any], List[Dict[str, Any]], str]:
+    """多链路获取：按源顺序重试，返回成功链路和每次尝试的日志。"""
+    options = fetch_options_from_cfg(cfg)
+    source = str(source or "auto").lower()
+    market = str(market or "auto").upper()
+    asset_kind = str(asset_kind or "auto").lower()
+    trace_all: List[Dict[str, Any]] = []
+    candidates: List[Tuple[str, Callable[[], Tuple[List[Dict[str, float]], Dict[str, Any]]]]] = []
+
+    def add(label: str, fn: Callable[[], Tuple[List[Dict[str, float]], Dict[str, Any]]]):
+        if label not in [x[0] for x in candidates]:
+            candidates.append((label, fn))
+
+    if source in {"auto", "akshare"} and (market == "CN" or re.fullmatch(r"\d{6}", symbol)):
+        add("akshare", lambda: fetch_akshare(symbol, asset_kind, options))
+
+    # 国内行情 HTTP 兜底：AKShare 失败时，直接走东方财富 K 线接口。
+    if source in {"auto", "akshare", "eastmoney"} and (market == "CN" or re.fullmatch(r"\d{6}", symbol)):
+        add("eastmoney_kline", lambda: fetch_eastmoney_kline(symbol, options))
+
+    if source in {"auto", "yfinance"}:
+        for ys in yahoo_symbol_candidates(symbol, market, asset_kind):
+            add(f"yfinance:{ys}", lambda ys=ys: fetch_yfinance(ys, options))
+
+    # Yahoo Chart API 是 yfinance 的轻量备用链路，常用于 yfinance 间歇失败时兜底。
+    if source in {"auto", "yfinance", "yahoo"}:
+        for ys in yahoo_symbol_candidates(symbol, market, asset_kind):
+            add(f"yahoo_chart:{ys}", lambda ys=ys: fetch_yahoo_chart_api(ys, options))
+
+    # Stooq 主要兜底美股/ETF日线，不提供完整基本面。
+    if market != "CN" and source in {"auto", "yfinance", "stooq"}:
+        add(f"stooq:{symbol}", lambda: fetch_stooq_daily(symbol, options))
+
+    # 用户强制 akshare 但国内链路全挂时，仍尝试 Yahoo 后缀兜底。
+    if source == "akshare":
+        for ys in yahoo_symbol_candidates(symbol, market, asset_kind):
+            add(f"yahoo_chart:{ys}", lambda ys=ys: fetch_yahoo_chart_api(ys, options))
+
+    if not candidates:
+        add("yfinance", lambda: fetch_yfinance(symbol, options))
+
+    for label, fn in candidates:
+        try:
+            records, fundamentals, trace = retry_call(label, fn, options)
+            trace_all.extend(trace)
+            valuation_options = FetchOptions(
+                proxy_mode=options.proxy_mode,
+                proxy_url=options.proxy_url,
+                timeout=options.timeout,
+                retry_count=options.retry_count,
+                danjuan_cookie=options.danjuan_cookie,
+                valuation_method="danjuan_detail",
+            )
+            fundamentals, valuation_trace = enrich_fundamentals_with_public_valuation(
+                symbol=symbol,
+                market=market,
+                asset_kind=asset_kind,
+                fundamentals=fundamentals,
+                options=valuation_options,
+                symbol_name=str(cfg.get("symbol_name") or ""),
+            )
+            trace_all.extend(valuation_trace)
+            return records, fundamentals, trace_all, label
+        except Exception as e:
+            # retry_call 已经记录了每次失败；这里保留兜底错误，继续下一链路。
+            if trace_all and trace_all[-1].get("source") == label:
+                continue
+            trace_all.append({"source": label, "attempt": "all", "ok": False, "error": str(e)[:240]})
+            continue
+
+    detail = "；".join([f"{x.get('source')}#{x.get('attempt')}: {x.get('error', '失败')}" for x in trace_all if not x.get("ok")])
+    raise RuntimeError(detail or "所有数据源均失败")
+
+def compute_indicators(records: List[Dict[str, float]], fundamentals: Dict[str, Any]) -> Dict[str, Any]:
+    if not records:
+        raise ValueError("没有拿到行情数据")
+
+    closes = [r["close"] for r in records if r.get("close")]
+    highs = [r.get("high") or r.get("close") for r in records]
+    lows = [r.get("low") or r.get("close") for r in records]
+    vols = [r.get("volume") or 0 for r in records]
+    if len(closes) < 60:
+        raise ValueError("行情数据太少，至少需要约60个交易日")
+
+    def sma(values: List[float], n: int) -> Optional[float]:
+        if len(values) < n:
+            return None
+        return sum(values[-n:]) / n
+
+    close = closes[-1]
+    prev_close = closes[-2] if len(closes) >= 2 else close
+    ma20 = sma(closes, 20)
+    ma50 = sma(closes, 50)
+    ma200 = sma(closes, 200)
+    ma200_prev = sma(closes[:-20], 200) if len(closes) >= 220 else None
+
+    trs: List[float] = []
+    for i in range(1, len(records)):
+        h = highs[i]
+        l = lows[i]
+        pc = closes[i - 1]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    atr14 = sum(trs[-14:]) / 14 if len(trs) >= 14 else None
+    stop_loss_pct = (atr14 * 2 / close * 100) if atr14 and close else 6.0
+
+    vol20 = sum(vols[-20:]) / 20 if len(vols) >= 20 and any(vols[-20:]) else None
+    volume_ratio = vols[-1] / vol20 if vol20 else None
+
+    # 自动趋势状态。
+    market_state = "sideways"
+    if ma200:
+        ma200_down = ma200_prev is not None and ma200 < ma200_prev
+        if close < ma200 and ma200_down:
+            market_state = "bear"
+        elif close < ma200:
+            market_state = "below_200"
+        elif ma50 and close > ma50 > ma200:
+            market_state = "strong_bull"
+        else:
+            market_state = "above_200"
+
+    # 自动入场/退出/量价：保守生成，允许用户手动覆盖。
+    entry_state = "none"
+    prev_60_high = max(closes[-61:-1]) if len(closes) >= 61 else None
+    prev_20_high = max(closes[-21:-1]) if len(closes) >= 21 else None
+    last_high = highs[-1] if highs else close
+    last_low = lows[-1] if lows else close
+    last_open = records[-1].get("open") or close
+
+    touched_ma20 = bool(ma20 and last_low <= ma20 * 1.01 and close >= ma20)
+    touched_ma50 = bool(ma50 and last_low <= ma50 * 1.01 and close >= ma50)
+    pullback_hold_auto = market_state in {"above_200", "strong_bull"} and (touched_ma20 or touched_ma50) and close >= prev_close
+
+    if market_state in {"above_200", "strong_bull"} and prev_60_high and close > prev_60_high:
+        entry_state = "breakout"
+    if market_state == "strong_bull" and prev_20_high and close > prev_20_high:
+        entry_state = "continuation_high"
+    if entry_state == "none" and pullback_hold_auto:
+        entry_state = "pullback_hold"
+    if ma50 and close > ma50 and prev_close < ma50 and market_state in {"below_200", "above_200"}:
+        entry_state = "reversal_50"
+
+    breakout_failed_auto = bool(prev_60_high and last_high > prev_60_high and close <= prev_60_high)
+    exit_state = "none"
+    if ma200 and close < ma200:
+        exit_state = "below_200"
+    elif ma50 and close < ma50:
+        exit_state = "below_50"
+    elif ma20 and close < ma20:
+        exit_state = "below_20"
+    elif breakout_failed_auto:
+        exit_state = "failed_breakout"
+
+    far_from_ma = False
+    if ma20 and atr14:
+        far_from_ma = (close - ma20) > atr14 * 2.2
+
+    candle_range = max(last_high - last_low, 0.0)
+    upper_wick = max(last_high - max(close, last_open), 0.0)
+    upper_shadow_auto = bool(candle_range > 0 and upper_wick / candle_range >= 0.45 and volume_ratio and volume_ratio >= 1.25)
+    failed_close_auto = bool(breakout_failed_auto or (prev_20_high and last_high > prev_20_high and close <= prev_20_high and volume_ratio and volume_ratio >= 1.2))
+
+    data = {
+        "last_date": records[-1].get("date"),
+        "close": round(close, 4),
+        "ma20": round(ma20, 4) if ma20 else None,
+        "ma50": round(ma50, 4) if ma50 else None,
+        "ma200": round(ma200, 4) if ma200 else None,
+        "atr14": round(atr14, 4) if atr14 else None,
+        "stop_loss_pct": round(clamp(stop_loss_pct, 1.0, 80.0), 2),
+        "volume_ratio_20d": round(volume_ratio, 2) if volume_ratio else None,
+        "market_state": market_state,
+        "entry_state": entry_state,
+        "exit_state": exit_state,
+        "far_from_ma": far_from_ma,
+        "volume_confirm": bool(volume_ratio and volume_ratio >= 1.35 and entry_state in {"breakout", "continuation_high"}),
+        "pullback_volume_dry": bool(volume_ratio and volume_ratio <= 0.90 and entry_state == "pullback_hold"),
+        "upper_shadow": upper_shadow_auto,
+        "failed_close": failed_close_auto,
+        "current_pe": fundamentals.get("current_pe"),
+        "pe_percentile": fundamentals.get("pe_percentile"),
+        "current_pb": fundamentals.get("current_pb"),
+        "pb_percentile": fundamentals.get("pb_percentile"),
+        "roe_pct": fundamentals.get("roe_pct"),
+        "valuation_source": fundamentals.get("valuation_source"),
+        "valuation_note": fundamentals.get("valuation_note") or "--",
+        "currency": fundamentals.get("currency"),
+        "long_name": fundamentals.get("long_name"),
+        "source_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    return data
+
+
+def enrich_indicators_with_user_position(indicators: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """根据用户填写的当前涨跌幅/持仓盈亏率，自动推断盈利阶段和初始止损。
+
+    用户直接填“当前涨跌幅 %”，脚本不再要求买入价/成本价。
+    - 盈利 R 倍数 = 当前涨跌幅 / 止损距离。
+    - 初始止损只在“有持仓 + 当前涨跌幅 <= -止损距离”时自动触发。
+
+    注意：风险仓位上限低于当前仓位，不等于触发初始止损；
+    触发初始止损只代表价格已经跌到买入前设定的止损线。
+    """
+    profit_pct = as_float(cfg.get("current_profit_pct"), 0.0)
+    stop_pct = as_float(indicators.get("stop_loss_pct"), 0.0)
+    current_amount = max(as_float(cfg.get("current_position_amount"), 0.0), 0.0)
+
+    indicators["current_profit_pct"] = round(profit_pct, 2)
+    indicators["profit_pct"] = round(profit_pct, 2)
+    indicators["profit_r"] = None
+    indicators["profit_state"] = "none"
+
+    if profit_pct > 0 and stop_pct > 0:
+        profit_r = profit_pct / stop_pct
+        indicators["profit_r"] = round(profit_r, 2)
+        if profit_r >= 3:
+            indicators["profit_state"] = "profit_3r"
+        elif profit_r >= 2:
+            indicators["profit_state"] = "profit_2r"
+        elif profit_r >= 1:
+            indicators["profit_state"] = "profit_1r"
+
+    # 自动触发【初始止损】的唯一量化条件：
+    # 有持仓，并且当前持仓盈亏已经跌穿买入前设定的止损距离。
+    if current_amount > 0 and stop_pct > 0 and profit_pct <= -stop_pct:
+        indicators["exit_state"] = "hit_stop"
+        indicators["stop_triggered_auto"] = True
+    else:
+        indicators["stop_triggered_auto"] = False
+
+    return indicators
+
+
+
+def _preview_text(value: Any, limit: int = 900) -> str:
+    try:
+        if isinstance(value, (dict, list)):
+            text = json.dumps(value, ensure_ascii=False)
+        else:
+            text = str(value)
+    except Exception:
+        text = repr(value)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit]
+
+
+def _make_test_result(name: str, url: str, started: float, ok: bool, **kwargs: Any) -> Dict[str, Any]:
+    item = {
+        "name": name,
+        "url": url,
+        "ok": bool(ok),
+        "elapsed_ms": int((time.time() - started) * 1000),
+    }
+    item.update(kwargs)
+    return item
+
+
+def run_connection_tests(cfg: Dict[str, Any], symbol: str = "", market: str = "", asset_kind: str = "") -> List[Dict[str, Any]]:
+    """设置页接口连通性测试。每条测试只跑一次，不走业务层多次重试。"""
+    import requests  # type: ignore
+
+    options = fetch_options_from_cfg(cfg)
+    raw_symbol = str(symbol or cfg.get("symbol") or "NVDA").strip() or "NVDA"
+    raw_market = str(market or cfg.get("market") or "US").upper()
+    raw_kind = str(asset_kind or cfg.get("asset_kind") or "stock").lower()
+    if raw_market == "AUTO":
+        raw_market = "CN" if re.fullmatch(r"\d{6}", raw_symbol) else "US"
+    yahoo_symbol = (yahoo_symbol_candidates(raw_symbol, raw_market, raw_kind) or ["NVDA"])[0]
+    danjuan_code = _norm_index_code(raw_symbol, raw_kind, str(cfg.get("symbol_name") or "")) or "SH000300"
+
+    results: List[Dict[str, Any]] = []
+
+    # 1) Yahoo Chart API：直接 HTTP，便于判断网络/代理是否能访问 Yahoo。
+    started = time.time()
+    yahoo_url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}"
+    try:
+        params = {"range": "1mo", "interval": "1d", "events": "div,splits", "includeAdjustedClose": "true"}
+        resp = requests.get(yahoo_url, params=params, headers={"User-Agent": "Mozilla/5.0 trend-risk-position-tool"}, timeout=options.timeout, proxies=request_proxies(options))
+        text = resp.text
+        payload = resp.json() if text else {}
+        chart = payload.get("chart") or {}
+        result = (chart.get("result") or [None])[0]
+        timestamps = result.get("timestamp") if result else []
+        ok = resp.ok and bool(timestamps)
+        results.append(_make_test_result(
+            "yahoo_chart",
+            resp.url,
+            started,
+            ok,
+            status_code=resp.status_code,
+            rows=len(timestamps or []),
+            parsed={"symbol": yahoo_symbol, "rows": len(timestamps or [])},
+            response_preview=_preview_text(payload),
+            error=None if ok else _preview_text((chart.get("error") or {}) or text, 240),
+        ))
+    except Exception as e:
+        results.append(_make_test_result("yahoo_chart", yahoo_url, started, False, error=str(e)[:300]))
+
+    # 2) yfinance：测试 Python 库链路。先 download，再 Ticker.history 兜底。
+    started = time.time()
+    try:
+        import yfinance as yf  # type: ignore
+        with proxy_environment(options):
+            try:
+                hist = yf.download(yahoo_symbol, period="1mo", interval="1d", auto_adjust=True, progress=False, threads=False, timeout=options.timeout, multi_level_index=False)
+            except TypeError:
+                hist = yf.download(yahoo_symbol, period="1mo", interval="1d", auto_adjust=True, progress=False, threads=False, timeout=options.timeout)
+            rows_download = 0 if hist is None else len(hist)
+            used = "download"
+            if rows_download <= 0:
+                hist2 = yf.Ticker(yahoo_symbol).history(period="1mo", interval="1d", auto_adjust=True)
+                if hist2 is not None and len(hist2) > 0:
+                    hist = hist2
+                    used = "Ticker.history"
+        rows = 0 if hist is None else len(hist)
+        preview = hist.tail(3).to_string() if rows else ""
+        results.append(_make_test_result(
+            "yfinance",
+            f"yf.{used}({yahoo_symbol}, period=1mo)",
+            started,
+            rows > 0,
+            status_code=None,
+            rows=rows,
+            parsed={"symbol": yahoo_symbol, "rows": rows, "method": used, "columns": list(map(str, getattr(hist, "columns", [])))[:12]},
+            response_preview=_preview_text(preview),
+            error=None if rows > 0 else "yfinance download 与 Ticker.history 均返回空数据；优先看 yahoo_chart 是否可用",
+        ))
+    except Exception as e:
+        results.append(_make_test_result("yfinance", f"yf.download/Ticker.history({yahoo_symbol})", started, False, error=str(e)[:300]))
+
+    # 3) 蛋卷 JSON：按你给的 /djapi/index_eva/detail/{code} 测试。
+    started = time.time()
+    danjuan_url = f"https://danjuanfunds.com/djapi/index_eva/detail/{danjuan_code}"
+    try:
+        payload, meta = fetch_danjuan_json_raw(danjuan_code, options)
+        parsed = _extract_valuation_from_json(payload, f"danjuan_json:{danjuan_code}")
+        results.append(_make_test_result(
+            "danjuan_json",
+            meta.get("url") or danjuan_url,
+            started,
+            True,
+            status_code=meta.get("status_code"),
+            rows=1,
+            parsed={k: parsed.get(k) for k in ["current_pe", "pe_percentile", "current_pb", "pb_percentile", "roe_pct", "valuation_source"]},
+            response_preview=meta.get("response_preview") or _preview_text(payload),
+        ))
+    except Exception as e:
+        results.append(_make_test_result("danjuan_json", danjuan_url, started, False, error=str(e)[:300]))
+
+    # 4) Stooq：美股历史行情备用链路。
+    started = time.time()
+    stooq_symbol = raw_symbol.lower() if "." in raw_symbol else f"{raw_symbol.lower()}.us"
+    stooq_url = "https://stooq.com/q/d/l/"
+    try:
+        resp = requests.get(stooq_url, params={"s": stooq_symbol, "i": "d"}, headers={"User-Agent": "Mozilla/5.0 trend-risk-position-tool"}, timeout=options.timeout, proxies=request_proxies(options))
+        text = resp.text.strip()
+        lines = text.splitlines()
+        ok = resp.ok and len(lines) > 3 and "No data" not in text[:80]
+        results.append(_make_test_result(
+            "stooq_csv",
+            resp.url,
+            started,
+            ok,
+            status_code=resp.status_code,
+            rows=max(0, len(lines) - 1),
+            parsed={"symbol": stooq_symbol, "rows": max(0, len(lines) - 1)},
+            response_preview=_preview_text("\n".join(lines[:5])),
+            error=None if ok else "Stooq 返回空数据或 No data",
+        ))
+    except Exception as e:
+        results.append(_make_test_result("stooq_csv", stooq_url, started, False, error=str(e)[:300]))
+
+    # 5) 东方财富 K线：国内行情备用链路。HTTPS + Referer/User-Agent，失败时再试 HTTP。
+    started = time.time()
+    em_symbol = re.sub(r"\D", "", raw_symbol) if re.fullmatch(r"\d{6}", re.sub(r"\D", "", raw_symbol)) else "510300"
+    secid = eastmoney_secid(em_symbol)
+    em_url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    try:
+        params = {
+            "secid": secid, "klt": "101", "fqt": "1", "beg": "20240101", "end": "29991231", "lmt": "120",
+            "fields1": "f1,f2,f3,f4,f5,f6", "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        }
+        tried: List[Dict[str, Any]] = []
+        payload: Any = {}
+        resp_url = em_url
+        status_code = None
+        klines: List[Any] = []
+        for base_url in ["https://push2his.eastmoney.com/api/qt/stock/kline/get", "http://push2his.eastmoney.com/api/qt/stock/kline/get"]:
+            resp = requests.get(base_url, params=params, headers=eastmoney_headers(), timeout=options.timeout, proxies=request_proxies(options))
+            status_code = resp.status_code
+            resp_url = resp.url
+            text = resp.text
+            try:
+                payload = resp.json() if text else {}
+            except Exception:
+                payload = {"raw": text[:240]}
+            klines = ((payload.get("data") or {}).get("klines") or []) if isinstance(payload, dict) else []
+            tried.append({"url": resp.url, "status_code": resp.status_code, "rows": len(klines)})
+            if resp.ok and klines:
+                break
+        ok = bool(klines)
+        results.append(_make_test_result(
+            "eastmoney_kline",
+            resp_url,
+            started,
+            ok,
+            status_code=status_code,
+            rows=len(klines),
+            parsed={"secid": secid, "rows": len(klines), "tried": tried},
+            response_preview=_preview_text(payload),
+            error=None if ok else "东方财富未返回 K 线；已尝试 HTTPS/HTTP 与常规 Referer",
+        ))
+    except Exception as e:
+        results.append(_make_test_result("eastmoney_kline", em_url, started, False, error=str(e)[:300]))
+
+    return results
+
+
+
+# -----------------------------
+# 历史回测模拟（网页端）
+# -----------------------------
+
+BACKTEST_METRIC_NOTES: Dict[str, str] = {
+    "策略总收益": "期末策略权益相对初始资金的收益。",
+    "买入持有总收益": "从回测起点全仓买入并持有到最后的收益，用作基准。",
+    "策略年化收益": "把策略总收益折算成年化结果。",
+    "买入持有年化收益": "买入持有基准的年化结果。",
+    "策略最大回撤": "策略权益从阶段高点到之后低点的最大跌幅。",
+    "买入持有最大回撤": "买入持有基准的最大回撤。",
+    "年化波动": "日收益波动率年化。",
+    "夏普比率": "暂按无风险利率为 0 计算。",
+    "交易次数": "回测期间实际执行的买入和卖出次数。",
+    "已实现胜率": "只按卖出时已实现盈亏统计，未平仓浮盈浮亏不计入。",
+    "盈亏因子": "已实现盈利总额 / 已实现亏损总额绝对值。",
+    "平均仓位": "回测期间平均持仓暴露。",
+    "换手率": "累计成交金额 / 初始资金。",
+    "期末权益": "回测结束时策略账户权益。",
+    "估值序列最新日期": "历史估值序列中用于对比的最新日期。",
+    "估值页面最新日期": "蛋卷（雪球）detail 当前页面估值接口返回的对比日期；若接口未提供则显示 --。",
+    "历史PE百分位": "用历史 PE 序列本地计算得到的最新 PE 百分位。",
+    "页面PE百分位": "蛋卷（雪球）detail 当前页面直接返回的 PE 百分位。",
+    "PE百分位误差": "历史序列自算 PE 百分位 - 页面直接 PE 百分位。",
+    "历史PB": "历史 PB 序列最新值。",
+    "页面PB": "蛋卷（雪球）detail 当前页面直接返回的 PB。",
+    "PB误差": "历史 PB 最新值 - 页面 PB。",
+    "历史PB百分位": "用历史 PB 序列本地计算得到的最新 PB 百分位。",
+    "页面PB百分位": "蛋卷（雪球）detail 当前页面直接返回的 PB 百分位。",
+    "PB百分位误差": "历史序列自算 PB 百分位 - 页面直接 PB 百分位。",
+    "历史ROE": "历史 ROE 序列最新值。",
+    "页面ROE": "蛋卷（雪球）detail 当前页面直接返回的 ROE。",
+    "ROE误差": "历史 ROE 最新值 - 页面 ROE。",
+}
+
+
+def parse_date_safe(value: Any, default: Optional[date] = None) -> date:
+    if isinstance(value, date):
+        return value
+    try:
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+    except Exception:
+        if default is not None:
+            return default
+        raise
+
+
+def normalize_history_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    cleaned: List[Dict[str, Any]] = []
+    for r in records:
+        try:
+            raw_date = r.get("date") or r.get("Date") or r.get("日期")
+            d = parse_date_safe(raw_date).isoformat()
+            close = as_float(r.get("close", r.get("Close", r.get("收盘"))), 0.0)
+            if close <= 0:
+                continue
+            open_ = as_float(r.get("open", r.get("Open", r.get("开盘"))), close)
+            high = as_float(r.get("high", r.get("High", r.get("最高"))), close)
+            low = as_float(r.get("low", r.get("Low", r.get("最低"))), close)
+            volume = as_float(r.get("volume", r.get("Volume", r.get("成交量"))), 0.0)
+            cleaned.append({"date": d, "open": open_, "high": high, "low": low, "close": close, "volume": volume})
+        except Exception:
+            continue
+    dedup = {r["date"]: r for r in cleaned}
+    return [dedup[k] for k in sorted(dedup)]
+
+
+def backtest_yahoo_symbol(symbol: str, market: str) -> str:
+    s = str(symbol or "").strip()
+    if market.upper() == "CN" and re.fullmatch(r"\d{6}", s):
+        # Yahoo 对国内标的需要交易所后缀：沪市 .SS，深市 .SZ。
+        # 常见指数如 000300/000016/000905/000852/000688 属于上交所指数，不能按普通 0 开头股票映射到 .SZ。
+        if s.startswith(("5", "6", "9", "000")):
+            return f"{s}.SS"
+        return f"{s}.SZ"
+    return s
+
+
+def backtest_fetch_yahoo(symbol: str, market: str, start: date, end: date, options: FetchOptions) -> Tuple[List[Dict[str, Any]], str]:
+    import requests  # type: ignore
+    ys = backtest_yahoo_symbol(symbol, market)
+    p1 = int(datetime.combine(start, datetime.min.time(), tzinfo=timezone.utc).timestamp())
+    p2 = int(datetime.combine(end + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc).timestamp())
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ys}"
+    params = {"period1": p1, "period2": p2, "interval": "1d", "events": "div,splits", "includeAdjustedClose": "true"}
+    headers = {"User-Agent": "Mozilla/5.0 trend-risk-backtest/1.0", "Accept": "application/json,*/*"}
+    resp = requests.get(url, params=params, headers=headers, timeout=options.timeout, proxies=request_proxies(options))
+    resp.raise_for_status()
+    payload = resp.json()
+    result = (payload.get("chart", {}).get("result") or [None])[0]
+    if not result:
+        raise RuntimeError(f"Yahoo Chart 无数据：{payload.get('chart', {}).get('error')}")
+    ts = result.get("timestamp") or []
+    quote = (result.get("indicators", {}).get("quote") or [{}])[0]
+    records: List[Dict[str, Any]] = []
+    for i, t in enumerate(ts):
+        close_arr = quote.get("close") or []
+        if i >= len(close_arr) or close_arr[i] is None:
+            continue
+        def q(name: str, default: float) -> float:
+            arr = quote.get(name) or []
+            return float(arr[i]) if i < len(arr) and arr[i] is not None else float(default)
+        close = float(close_arr[i])
+        records.append({
+            "date": datetime.fromtimestamp(t, timezone.utc).date().isoformat(),
+            "open": q("open", close),
+            "high": q("high", close),
+            "low": q("low", close),
+            "close": close,
+            "volume": q("volume", 0.0),
+        })
+    return normalize_history_records(records), "yahoo_chart"
+
+
+def backtest_fetch_stooq(symbol: str, market: str, start: date, end: date, options: FetchOptions) -> Tuple[List[Dict[str, Any]], str]:
+    import requests  # type: ignore
+    s = str(symbol or "").strip().lower()
+    if market.upper() == "US" and "." not in s and not s.startswith("^"):
+        s = f"{s}.us"
+    url = "https://stooq.com/q/d/l/"
+    params = {"s": s, "i": "d", "d1": start.strftime("%Y%m%d"), "d2": end.strftime("%Y%m%d")}
+    headers = {"User-Agent": "Mozilla/5.0 trend-risk-backtest/1.0", "Accept": "text/csv,*/*"}
+    resp = requests.get(url, params=params, headers=headers, timeout=options.timeout, proxies=request_proxies(options))
+    resp.raise_for_status()
+    text = resp.text
+    if "No data" in text or len(text.strip().splitlines()) <= 1:
+        raise RuntimeError("Stooq 无数据")
+    rows = list(csv.DictReader(StringIO(text)))
+    return normalize_history_records(rows), "stooq_csv"
+
+
+def backtest_fetch_eastmoney(symbol: str, start: date, end: date, options: FetchOptions) -> Tuple[List[Dict[str, Any]], str]:
+    import requests  # type: ignore
+    if not re.fullmatch(r"\d{6}", str(symbol or "")):
+        raise RuntimeError("东方财富历史K线仅支持 6 位国内代码")
+    params = {
+        "secid": eastmoney_secid(str(symbol)),
+        "klt": "101",
+        "fqt": "1",
+        "beg": start.strftime("%Y%m%d"),
+        "end": end.strftime("%Y%m%d"),
+        "lmt": "1000000",
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+    }
+    last_error = ""
+    for base_url in ["https://push2his.eastmoney.com/api/qt/stock/kline/get", "http://push2his.eastmoney.com/api/qt/stock/kline/get"]:
+        try:
+            resp = requests.get(base_url, params=params, headers=eastmoney_headers(), timeout=options.timeout, proxies=request_proxies(options))
+            resp.raise_for_status()
+            payload = resp.json()
+            klines = ((payload.get("data") or {}).get("klines") or [])
+            records = []
+            for line in klines:
+                parts = str(line).split(",")
+                if len(parts) < 7:
+                    continue
+                records.append({"date": parts[0], "open": parts[1], "close": parts[2], "high": parts[3], "low": parts[4], "volume": parts[5]})
+            out = normalize_history_records(records)
+            if out:
+                return out, "eastmoney_kline"
+            last_error = "东方财富返回空K线"
+        except Exception as exc:
+            last_error = str(exc)
+    raise RuntimeError(last_error or "东方财富历史K线失败")
+
+
+def normalize_backtest_source(source: str, market: str) -> str:
+    """把前端/设置页的数据源名称转换成回测历史行情源。
+
+    仓位助手里的 data_source 可能是 akshare、yfinance、danjuan 等，
+    其中不少只适合实时/估值获取，不是回测历史行情源。
+    回测需要的是 eastmoney / yahoo / stooq / auto。
+    """
+    raw = str(source or "auto").strip().lower()
+    if raw in {"", "auto", "multi", "自动", "自动多链路"}:
+        return "auto"
+    if raw in {"akshare", "funddb", "danjuan", "danjuan_json", "danjuan_html", "lixinger"}:
+        # AKShare/蛋卷在主程序里常用于估值或实时数据；回测历史行情改走可直接拉历史K线的链路。
+        return "auto" if market.upper() == "CN" else "auto"
+    if raw in {"yfinance", "yahoo", "yahoo_chart", "yahoo finance"}:
+        return "yahoo"
+    if raw in {"eastmoney", "eastmoney_kline", "东方财富"}:
+        return "eastmoney"
+    if raw in {"stooq", "stooq_csv"}:
+        return "stooq"
+    return "auto"
+
+
+def backtest_fetch_records(symbol: str, market: str, source: str, start: date, end: date, cfg: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str, List[str]]:
+    options = fetch_options_from_cfg(cfg)
+    errors: List[str] = []
+    source = normalize_backtest_source(source, market)
+    candidates: List[Callable[[], Tuple[List[Dict[str, Any]], str]]] = []
+
+    # 国内标的优先东方财富K线；海外标的优先 Yahoo Chart；Stooq 作为兜底。
+    if source in {"auto", "eastmoney"} and (market.upper() == "CN" or re.fullmatch(r"\d{6}", symbol or "")):
+        candidates.append(lambda: backtest_fetch_eastmoney(symbol, start, end, options))
+    if source in {"auto", "yahoo"}:
+        candidates.append(lambda: backtest_fetch_yahoo(symbol, market, start, end, options))
+    if source in {"auto", "stooq"}:
+        candidates.append(lambda: backtest_fetch_stooq(symbol, market, start, end, options))
+
+    if not candidates:
+        raise RuntimeError("没有可用的历史行情数据源")
+    for fn in candidates:
+        try:
+            records, label = fn()
+            if len(records) >= 60:
+                return records, label, errors
+            errors.append(f"{label}: 数据太少 {len(records)} 条")
+        except Exception as exc:
+            errors.append(str(exc)[:240])
+    raise RuntimeError("；".join(errors) or "所有历史行情源失败")
+
+
+def backtest_max_drawdown(values: List[float]) -> float:
+    peak = -float("inf")
+    mdd = 0.0
+    for v in values:
+        peak = max(peak, v)
+        if peak > 0:
+            mdd = min(mdd, v / peak - 1.0)
+    return mdd
+
+
+def backtest_annual_vol(returns: List[float]) -> float:
+    if len(returns) < 2:
+        return 0.0
+    mean = sum(returns) / len(returns)
+    var = sum((x - mean) ** 2 for x in returns) / (len(returns) - 1)
+    return math.sqrt(var) * math.sqrt(252)
+
+
+def backtest_cagr(e0: float, e1: float, days: int) -> float:
+    if e0 <= 0 or e1 <= 0 or days <= 0:
+        return 0.0
+    years = days / 365.25
+    return (e1 / e0) ** (1.0 / years) - 1.0 if years > 0 else 0.0
+
+
+def backtest_money(v: float) -> str:
+    return f"{v:,.2f}"
+
+
+def backtest_pct(v: float) -> str:
+    return f"{v:.2f}%"
+
+
+def _fmt_metric_number(value: Any, suffix: str = "") -> str:
+    if value is None or value == "":
+        return "--"
+    try:
+        v = float(value)
+        if math.isnan(v) or math.isinf(v):
+            return "--"
+        return f"{v:.2f}{suffix}"
+    except Exception:
+        return "--"
+
+
+def _fmt_metric_diff(value: Optional[float], suffix: str = "") -> str:
+    if value is None:
+        return "--"
+    try:
+        if math.isnan(value) or math.isinf(value):
+            return "--"
+        sign = "+" if value > 0 else ""
+        return f"{sign}{value:.2f}{suffix}"
+    except Exception:
+        return "--"
+
+
+def latest_history_item(series: Dict[str, Dict[str, Any]]) -> Tuple[str, Dict[str, Any]]:
+    if not series:
+        return "--", {}
+    ds = max(series.keys())
+    return ds, dict(series.get(ds) or {})
+
+
+def append_valuation_comparison_metrics(
+    metrics: Dict[str, Any],
+    valuation_series: Dict[str, Dict[str, Any]],
+    symbol: str,
+    asset_kind: str,
+    cfg: Dict[str, Any],
+    symbol_name: str = "",
+) -> List[str]:
+    """回测完成后，把历史序列最新测算值与蛋卷 detail 当前页面值对比写入核心指标。
+
+    这只是口径校验，不参与交易结果计算；接口失败时不会让回测失败。
+    """
+    notes: List[str] = []
+    if not valuation_series:
+        return notes
+    hist_date, hist = latest_history_item(valuation_series)
+    if not hist:
+        return notes
+    metrics["估值序列最新日期"] = hist_date
+
+    options = fetch_options_from_cfg(cfg)
+    try:
+        page = fetch_danjuan_detail_valuation(symbol, asset_kind, options, symbol_name)
+    except Exception as exc:
+        notes.append(f"估值页面对比失败：{str(exc)[:160]}")
+        return notes
+
+    metrics["估值页面最新日期"] = str(page.get("valuation_date") or page.get("date") or "--")
+
+    def diff(a: Any, b: Any) -> Optional[float]:
+        try:
+            if a is None or b is None:
+                return None
+            return float(a) - float(b)
+        except Exception:
+            return None
+
+    hist_pe_pct = hist.get("pe_percentile")
+    page_pe_pct = page.get("pe_percentile")
+    metrics["历史PE百分位"] = _fmt_metric_number(hist_pe_pct, "%")
+    metrics["页面PE百分位"] = _fmt_metric_number(page_pe_pct, "%")
+    metrics["PE百分位误差"] = _fmt_metric_diff(diff(hist_pe_pct, page_pe_pct), "%")
+
+    hist_pb = hist.get("current_pb")
+    page_pb = page.get("current_pb")
+    metrics["历史PB"] = _fmt_metric_number(hist_pb)
+    metrics["页面PB"] = _fmt_metric_number(page_pb)
+    metrics["PB误差"] = _fmt_metric_diff(diff(hist_pb, page_pb))
+
+    hist_pb_pct = hist.get("pb_percentile")
+    page_pb_pct = page.get("pb_percentile")
+    metrics["历史PB百分位"] = _fmt_metric_number(hist_pb_pct, "%")
+    metrics["页面PB百分位"] = _fmt_metric_number(page_pb_pct, "%")
+    metrics["PB百分位误差"] = _fmt_metric_diff(diff(hist_pb_pct, page_pb_pct), "%")
+
+    hist_roe = hist.get("roe_pct")
+    page_roe = page.get("roe_pct")
+    metrics["历史ROE"] = _fmt_metric_number(hist_roe, "%")
+    metrics["页面ROE"] = _fmt_metric_number(page_roe, "%")
+    metrics["ROE误差"] = _fmt_metric_diff(diff(hist_roe, page_roe), "%")
+    return notes
+
+
+def backtest_metrics_rows(metrics: Dict[str, Any]) -> List[Dict[str, Any]]:
+    order = [
+        "策略总收益", "买入持有总收益", "策略年化收益", "买入持有年化收益", "策略最大回撤", "买入持有最大回撤",
+        "年化波动", "夏普比率", "交易次数", "已实现胜率", "盈亏因子", "平均仓位", "换手率", "期末权益",
+        "估值序列最新日期", "估值页面最新日期",
+        "历史PE百分位", "页面PE百分位", "PE百分位误差",
+        "历史PB", "页面PB", "PB误差",
+        "历史PB百分位", "页面PB百分位", "PB百分位误差",
+        "历史ROE", "页面ROE", "ROE误差",
+    ]
+    keys = [k for k in order if k in metrics] + [k for k in metrics.keys() if k not in order]
+    return [{"指标": k, "数值": metrics.get(k, "--"), "备注": BACKTEST_METRIC_NOTES.get(k, "")} for k in keys]
+
+
+
+def payload_metric_value(payload_result: Dict[str, Any], label: str, default: str = "") -> str:
+    metrics = payload_result.get("metrics") or {}
+    if isinstance(metrics, dict):
+        return str(metrics.get(label, default) or default)
+    if isinstance(metrics, list):
+        for item in metrics:
+            if isinstance(item, dict) and item.get("label") == label:
+                return str(item.get("value", default) or default)
+    return default
+
+def write_backtest_csv(path: str, rows: List[Dict[str, Any]]) -> None:
+    if not rows:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fieldnames: List[str] = []
+    seen = set()
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                fieldnames.append(key)
+                seen.add(key)
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
+    symbol = str(data.get("symbol") or cfg.get("symbol") or "").strip()
+    if not symbol:
+        raise RuntimeError("请先填写回测标的代码")
+    market = str(data.get("market") or cfg.get("market") or "US").upper()
+    asset_kind = str(data.get("asset_kind") or cfg.get("asset_kind") or "stock")
+    source = str(data.get("source") or data.get("data_source") or cfg.get("data_source") or "auto")
+    start_user = parse_date_safe(data.get("start_date") or "2020-01-01")
+    end_user = parse_date_safe(data.get("end_date") or date.today().isoformat())
+    if end_user <= start_user:
+        raise RuntimeError("结束日期必须晚于开始日期")
+
+    # 需要提前拉取一段历史数据用于 MA200/ATR 等指标预热。
+    warmup_bars = int(clamp(as_float(data.get("warmup_bars"), 220), 80, 500))
+    fetch_start = start_user - timedelta(days=max(420, int(warmup_bars * 2.2)))
+
+    bt_cfg = ensure_config()
+    bt_cfg.update(cfg)
+    for key in ["proxy_mode", "proxy_url", "request_timeout_sec", "retry_count", "danjuan_cookie"]:
+        if key in data:
+            bt_cfg[key] = data.get(key)
+
+    records, source_label, fetch_errors = backtest_fetch_records(symbol, market, source, fetch_start, end_user, bt_cfg)
+    records = [r for r in records if parse_date_safe(r["date"]) <= end_user]
+    if len(records) < warmup_bars + 5:
+        raise RuntimeError(f"历史数据太少：需要至少 {warmup_bars + 5} 条，当前 {len(records)} 条")
+
+    start_index = None
+    for idx, r in enumerate(records):
+        if idx >= warmup_bars and parse_date_safe(r["date"]) >= start_user:
+            start_index = idx
+            break
+    if start_index is None or start_index >= len(records) - 2:
+        raise RuntimeError("可回测区间太短，或开始日期前没有足够预热数据")
+
+    # 回测优先使用左侧【标的与资金】里的核心配置，避免回测页重复字段与主配置不一致。
+    initial_cash = max(as_float(cfg.get("plan_amount"), as_float(data.get("initial_cash"), 100000.0)), 1.0)
+    strategy = str(cfg.get("strategy") or data.get("strategy") or "balanced")
+    if strategy not in STRATEGY_PRESETS:
+        strategy = "balanced"
+    position_mode = str(cfg.get("position_mode") or data.get("position_mode") or "core_satellite")
+    if position_mode not in {"core_satellite", "strict_trade"}:
+        position_mode = "core_satellite"
+    risk_per_trade_pct = clamp(as_float(cfg.get("risk_per_trade_pct"), data.get("risk_per_trade_pct", 1.0)), 0.1, 100.0)
+    rebalance_days = int(clamp(as_float(data.get("rebalance_days"), 5), 1, 60))
+    min_trade_pct = clamp(as_float(data.get("min_trade_pct"), 0.5), 0.0, 20.0) / 100.0
+    fee = clamp(as_float(data.get("fee_bps"), 2.0), 0.0, 1000.0) / 10000.0
+    slip = clamp(as_float(data.get("slippage_bps"), 3.0), 0.0, 1000.0) / 10000.0
+    export_files = bool(data.get("export_files"))
+
+    valuation_mode = str(data.get("valuation_mode") or "none")
+    if valuation_mode not in {"none", "fixed", "historical"}:
+        valuation_mode = "none"
+    pe = parse_optional_pct(data, "pe_percentile") if valuation_mode == "fixed" else None
+    pb = parse_optional_pct(data, "pb_percentile") if valuation_mode == "fixed" else None
+    roe = parse_optional_pct(data, "roe_pct") if valuation_mode == "fixed" else None
+    fundamentals = {
+        "pe_percentile": pe,
+        "pb_percentile": pb,
+        "roe_pct": roe,
+        "valuation_note": "回测固定估值输入" if valuation_mode == "fixed" and any(v is not None for v in [pe, pb, roe]) else "回测不使用估值修正",
+    }
+    valuation_series: Dict[str, Dict[str, Any]] = {}
+    valuation_trace: List[str] = []
+    if valuation_mode == "historical":
+        valuation_series, valuation_trace = fetch_historical_valuation_series(symbol, market, asset_kind, bt_cfg, str(cfg.get("symbol_name") or data.get("symbol_name") or ""))
+        if valuation_series:
+            fundamentals = {"valuation_note": "使用历史估值序列"}
+        else:
+            fundamentals = {"valuation_note": "历史估值序列不可用，本次回测不使用估值修正"}
+
+    cash = float(initial_cash)
+    shares = 0.0
+    avg_cost: Optional[float] = None
+    turnover_value = 0.0
+    realized_pnls: List[float] = []
+    equity_curve: List[Dict[str, Any]] = []
+    trades: List[Dict[str, Any]] = []
+    next_signal_index = start_index
+    bench_start_close = float(records[start_index]["close"])
+
+    last_signal = "等待"
+    last_target = 0.0
+
+    for i in range(start_index, len(records) - 1):
+        signal_rec = records[i]
+        next_rec = records[i + 1]
+        close = float(signal_rec["close"])
+        exec_open = float(next_rec.get("open") or next_rec["close"])
+        exec_close = float(next_rec["close"])
+        equity_signal = cash + shares * close
+        pos_value_signal = shares * close
+        profit_pct = ((close / avg_cost - 1.0) * 100.0) if (avg_cost and shares > 0) else 0.0
+
+        target_pos = (pos_value_signal / equity_signal) if equity_signal > 0 else 0.0
+        payload_result: Dict[str, Any] = {"headline": last_signal, "metrics": {}}
+        if i >= next_signal_index:
+            decision_cfg = DEFAULT_CONFIG.copy()
+            decision_cfg.update({
+                "plan_amount": equity_signal,
+                "current_position_amount": pos_value_signal,
+                "current_profit_pct": profit_pct,
+                "strategy": strategy,
+                "position_mode": position_mode,
+                "risk_per_trade_pct": risk_per_trade_pct,
+            })
+            try:
+                day_fundamentals = fundamentals.copy()
+                if valuation_mode == "historical" and valuation_series:
+                    day_fundamentals = merge_missing_fundamentals(day_fundamentals, historical_valuation_for_date(valuation_series, str(signal_rec.get("date") or "")))
+                    day_fundamentals.setdefault("valuation_note", "使用历史估值序列")
+                indicators = compute_indicators(records[: i + 1], day_fundamentals)
+                indicators = enrich_indicators_with_user_position(indicators, decision_cfg)
+                result = compute_decision(decision_cfg, indicators)
+                payload_result = decision_to_payload(decision_cfg, result)
+                target_pos = float(result.target_position)
+                last_signal = payload_result.get("headline") or result.action
+                last_target = target_pos
+            except Exception as exc:
+                last_signal = f"跳过：{str(exc)[:60]}"
+                target_pos = (pos_value_signal / equity_signal) if equity_signal > 0 else 0.0
+                last_target = target_pos
+            next_signal_index = i + rebalance_days
+        else:
+            target_pos = last_target
+
+        equity_exec = cash + shares * exec_open
+        current_value_exec = shares * exec_open
+        target_value_exec = target_pos * equity_exec
+        trade_value = target_value_exec - current_value_exec
+        if abs(trade_value) / max(equity_exec, 1e-9) < min_trade_pct:
+            trade_value = 0.0
+
+        if trade_value > 0:
+            price = exec_open * (1.0 + slip)
+            gross = min(trade_value, max(cash, 0.0))
+            if gross > 0:
+                buy_shares = gross / price
+                old_cost = (avg_cost or price) * shares
+                shares += buy_shares
+                avg_cost = (old_cost + gross) / shares if shares > 0 else None
+                cash -= gross + gross * fee
+                turnover_value += gross
+                trades.append({
+                    "信号日": signal_rec["date"], "执行日": next_rec["date"], "方向": "买入", "成交价": round(price, 4),
+                    "成交金额": round(gross, 2), "目标仓位%": round(target_pos * 100, 2), "操作建议": payload_result.get("headline", last_signal),
+                    "命中规则": payload_metric_value(payload_result, "命中规则"),
+                })
+        elif trade_value < 0 and shares > 0:
+            price = exec_open * (1.0 - slip)
+            gross = min(-trade_value, shares * price)
+            sell_shares = gross / price
+            pnl = (price - (avg_cost or price)) * sell_shares
+            realized_pnls.append(pnl)
+            shares -= sell_shares
+            cash += gross - gross * fee
+            turnover_value += gross
+            if shares <= 1e-9:
+                shares = 0.0
+                avg_cost = None
+            trades.append({
+                "信号日": signal_rec["date"], "执行日": next_rec["date"], "方向": "卖出", "成交价": round(price, 4),
+                "成交金额": round(gross, 2), "已实现盈亏": round(pnl, 2), "目标仓位%": round(target_pos * 100, 2),
+                "操作建议": payload_result.get("headline", last_signal), "命中规则": payload_metric_value(payload_result, "命中规则"),
+            })
+
+        equity_close = cash + shares * exec_close
+        exposure = (shares * exec_close / equity_close) if equity_close > 0 else 0.0
+        benchmark_equity = initial_cash * (exec_close / bench_start_close)
+        equity_curve.append({
+            "日期": next_rec["date"], "策略权益": round(equity_close, 2), "买入持有权益": round(benchmark_equity, 2),
+            "收盘价": round(exec_close, 4), "仓位比例%": round(exposure * 100, 2), "现金": round(cash, 2),
+            "操作建议": last_signal, "目标仓位%": round(target_pos * 100, 2),
+        })
+
+    if not equity_curve:
+        raise RuntimeError("没有生成权益曲线")
+
+    eq = [float(x["策略权益"]) for x in equity_curve]
+    bench = [float(x["买入持有权益"]) for x in equity_curve]
+    returns = [eq[i] / eq[i - 1] - 1.0 for i in range(1, len(eq)) if eq[i - 1] > 0]
+    total_ret = eq[-1] / initial_cash - 1.0
+    bench_ret = bench[-1] / initial_cash - 1.0
+    days = (parse_date_safe(equity_curve[-1]["日期"]) - parse_date_safe(equity_curve[0]["日期"])).days
+    vol = backtest_annual_vol(returns)
+    c = backtest_cagr(initial_cash, eq[-1], days)
+    bc = backtest_cagr(initial_cash, bench[-1], days)
+    sharpe = ((sum(returns) / len(returns)) * 252 / vol) if returns and vol > 0 else 0.0
+    wins = [x for x in realized_pnls if x > 0]
+    losses = [x for x in realized_pnls if x < 0]
+    win_rate = len(wins) / len(realized_pnls) if realized_pnls else 0.0
+    profit_factor = (sum(wins) / abs(sum(losses))) if losses else (999.0 if wins else 0.0)
+    avg_exp = sum(float(x["仓位比例%"] or 0) for x in equity_curve) / len(equity_curve)
+
+    metrics = {
+        "策略总收益": backtest_pct(total_ret * 100),
+        "买入持有总收益": backtest_pct(bench_ret * 100),
+        "策略年化收益": backtest_pct(c * 100),
+        "买入持有年化收益": backtest_pct(bc * 100),
+        "策略最大回撤": backtest_pct(backtest_max_drawdown(eq) * 100),
+        "买入持有最大回撤": backtest_pct(backtest_max_drawdown(bench) * 100),
+        "年化波动": backtest_pct(vol * 100),
+        "夏普比率": round(sharpe, 3),
+        "交易次数": len(trades),
+        "已实现胜率": backtest_pct(win_rate * 100),
+        "盈亏因子": round(profit_factor, 3),
+        "平均仓位": backtest_pct(avg_exp),
+        "换手率": backtest_pct(turnover_value / initial_cash * 100),
+        "期末权益": backtest_money(eq[-1]),
+    }
+    valuation_compare_notes = append_valuation_comparison_metrics(
+        metrics,
+        valuation_series if valuation_mode == "historical" else {},
+        symbol,
+        asset_kind,
+        bt_cfg,
+        str(cfg.get("symbol_name") or data.get("symbol_name") or ""),
+    )
+    metric_rows = backtest_metrics_rows(metrics)
+
+    exported: Dict[str, str] = {}
+    if export_files:
+        outdir = os.path.join(APP_DIR, "backtest_reports")
+        os.makedirs(outdir, exist_ok=True)
+        safe_symbol = re.sub(r"[^0-9A-Za-z\u4e00-\u9fa5_-]+", "_", symbol)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        prefix = f"{safe_symbol}_{strategy}_{position_mode}_{stamp}"
+        metric_path = os.path.join(outdir, f"核心指标_{prefix}.csv")
+        trade_path = os.path.join(outdir, f"交易记录_{prefix}.csv")
+        curve_path = os.path.join(outdir, f"权益曲线_{prefix}.csv")
+        write_backtest_csv(metric_path, metric_rows)
+        write_backtest_csv(trade_path, trades)
+        write_backtest_csv(curve_path, equity_curve)
+        exported = {"核心指标": metric_path, "交易记录": trade_path, "权益曲线": curve_path}
+
+    return {
+        "summary": {
+            "标的": symbol,
+            "市场": market,
+            "数据源": source_label,
+            "回测周期": f"{equity_curve[0]['日期']} ~ {equity_curve[-1]['日期']}",
+            "操作周期": f"每 {rebalance_days} 个交易日检查一次",
+            "K线数量": len(records),
+            "交易次数": len(trades),
+            "估值模式": {"none": "不使用估值修正", "fixed": "固定估值假设", "historical": "历史估值序列"}.get(valuation_mode, valuation_mode),
+            "估值序列条数": len(valuation_series) if valuation_series else 0,
+            "提示": "历史估值序列只使用当日及以前数据自算百分位；若不可用则不使用估值修正。" if valuation_mode == "historical" else ("PE/PB/ROE作为固定假设参与整段回测。" if valuation_mode == "fixed" else "本次回测不使用估值修正。"),
+        },
+        "metrics": metric_rows,
+        "trades": trades[-300:],
+        "trade_count": len(trades),
+        "curve_tail": equity_curve[-120:],
+        "exported": exported,
+        "fetch_errors": fetch_errors + valuation_trace + valuation_compare_notes,
+    }
+
+@app.route("/", methods=["GET"])
+def index():
+    cfg = ensure_config()
+    strategy = get_strategy(cfg)
+    return render_template(
+        "index.html",
+        cfg=cfg,
+        current_pos=current_position(cfg),
+        strategy=strategy,
+        strategies=STRATEGY_PRESETS,
+        pct=pct,
+        valuation_method_text=valuation_method_text,
+    )
+
+
+
+
+@app.get("/api/index-map")
+def api_index_map_get():
+    mapping = load_index_mapping()
+    apply_index_mapping(mapping)
+    return jsonify({
+        "ok": True,
+        "path": INDEX_MAP_PATH,
+        "mapping": INDEX_MAPPING,
+        "counts": {
+            "local_symbols": len(LOCAL_SYMBOLS),
+            "aliases": len(ALIASES),
+            "index_codes": len(INDEX_CODE_MAP),
+            "fund_index_map": len(FUND_INDEX_MAP),
+            "index_names": len(AK_INDEX_NAME_MAP),
+            "keyword_rules": len(INDEX_KEYWORD_RULES),
+        },
+    })
+
+
+@app.post("/api/index-map")
+def api_index_map_save():
+    data = request.get_json(silent=True) or {}
+    mapping = data.get("mapping", data)
+    if not isinstance(mapping, dict):
+        return jsonify({"ok": False, "message": "映射表必须是 JSON 对象"}), 400
+    try:
+        saved = save_index_mapping(mapping, apply=True)
+    except Exception as exc:
+        return jsonify({"ok": False, "message": f"映射表保存失败：{exc}"}), 400
+    return jsonify({
+        "ok": True,
+        "message": "映射表已保存并热更新",
+        "path": INDEX_MAP_PATH,
+        "mapping": saved,
+        "counts": {
+            "local_symbols": len(LOCAL_SYMBOLS),
+            "aliases": len(ALIASES),
+            "index_codes": len(INDEX_CODE_MAP),
+            "fund_index_map": len(FUND_INDEX_MAP),
+            "index_names": len(AK_INDEX_NAME_MAP),
+            "keyword_rules": len(INDEX_KEYWORD_RULES),
+        },
+    })
+
+
+@app.post("/api/config")
+def api_config():
+    cfg = ensure_config()
+    data = request.get_json(silent=True) or request.form.to_dict()
+
+    cfg["plan_amount"] = max(as_float(data.get("plan_amount"), cfg["plan_amount"]), 0.0)
+    cfg["current_position_amount"] = max(as_float(data.get("current_position_amount"), cfg["current_position_amount"]), 0.0)
+    cfg.pop("cost_basis_price", None)
+    cfg.pop("core_floor_pct", None)
+    cfg.pop("asset_type", None)
+    cfg["current_profit_pct"] = clamp(as_float(data.get("current_profit_pct"), cfg.get("current_profit_pct", 0.0)), -99.99, 9999.0)
+
+    strategy = str(data.get("strategy", cfg.get("strategy", "balanced")))
+    cfg["strategy"] = strategy if strategy in STRATEGY_PRESETS else "balanced"
+
+    mode = str(data.get("position_mode", cfg.get("position_mode", "core_satellite")))
+    cfg["position_mode"] = mode if mode in {"core_satellite", "strict_trade"} else "core_satellite"
+    cfg["risk_per_trade_pct"] = clamp(as_float(data.get("risk_per_trade_pct"), cfg.get("risk_per_trade_pct", 1.0)), 0.1, 100.0)
+
+    for key in ["symbol", "symbol_name", "market", "asset_kind", "data_source", "proxy_mode", "proxy_url", "danjuan_cookie", "valuation_method"]:
+        if key in data:
+            cfg[key] = str(data.get(key) or "")
+    if cfg.get("proxy_mode") not in {"system", "custom", "none"}:
+        cfg["proxy_mode"] = "system"
+    if cfg.get("valuation_method") not in {"system_calc", "danjuan"}:
+        # 兼容旧配置：前端已移除 auto，旧 auto 统一迁移为“乐咕乐股”。
+        cfg["valuation_method"] = "system_calc"
+    cfg["request_timeout_sec"] = clamp(as_float(data.get("request_timeout_sec"), cfg.get("request_timeout_sec", 12.0)), 3.0, 60.0)
+    cfg["retry_count"] = int(clamp(as_float(data.get("retry_count"), cfg.get("retry_count", 2)), 0.0, 5.0))
+
+    save_config(cfg)
+    strategy_obj = get_strategy(cfg)
+    mode_text = "长期底仓 + 交易仓（防守仓位动态计算）" if cfg.get("position_mode") == "core_satellite" else "纯交易仓"
+    symbol_text = f"{cfg.get('symbol_name') or '未选择'} {cfg.get('symbol') or ''}".strip()
+    return jsonify({
+        "ok": True,
+        "message": "配置已保存",
+        "current_pos_text": pct(current_position(cfg)),
+        "strategy_text": f"{strategy_obj['name']}：{strategy_obj['desc']}<br>仓位模式：{mode_text}<br>标的：{symbol_text}<br>数据容错：代理 {cfg.get('proxy_mode')} / 超时 {cfg.get('request_timeout_sec')} 秒 / 重试 {cfg.get('retry_count')} 次<br>估值来源：{valuation_method_text(cfg.get('valuation_method'))}<br>计划资金=100%上限，不按标的类型封顶。",
+        "config": cfg,
+    })
+
+
+@app.post("/api/decision")
+def api_decision():
+    cfg = ensure_config()
+    form = request.get_json(silent=True) or request.form.to_dict()
+    result = compute_decision(cfg, form)
+    return jsonify({"ok": True, "result": decision_to_payload(cfg, result)})
+
+
+@app.get("/api/search")
+def api_search():
+    query = str(request.args.get("q", "")).strip()
+    items = []
+    items.extend(local_symbol_search(query))
+    # 本地候选优先；在线搜索失败不影响功能。
+    try:
+        items.extend(search_yfinance(query))
+    except Exception:
+        pass
+    try:
+        items.extend(search_akshare(query))
+    except Exception:
+        pass
+    return jsonify({"ok": True, "results": dedupe_symbols(items)[:12]})
+
+
+
+@app.post("/api/connectivity-test")
+def api_connectivity_test():
+    data = request.get_json(silent=True) or {}
+    cfg = ensure_config()
+    for key in ["proxy_mode", "proxy_url", "request_timeout_sec", "retry_count", "danjuan_cookie", "valuation_method", "symbol", "symbol_name", "market", "asset_kind", "data_source"]:
+        if key in data:
+            cfg[key] = data.get(key)
+    try:
+        results = run_connection_tests(
+            cfg,
+            symbol=str(data.get("symbol") or cfg.get("symbol") or ""),
+            market=str(data.get("market") or cfg.get("market") or ""),
+            asset_kind=str(data.get("asset_kind") or cfg.get("asset_kind") or ""),
+        )
+        return jsonify({
+            "ok": True,
+            "tested_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "results": results,
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "message": f"连通性测试失败：{e}"}), 500
+
+@app.post("/api/fetch")
+def api_fetch():
+    data = request.get_json(silent=True) or {}
+    symbol = str(data.get("symbol") or "").strip()
+    market = str(data.get("market") or "auto").strip()
+    asset_kind = str(data.get("asset_kind") or "auto").strip()
+    source = str(data.get("source") or data.get("data_source") or "auto").strip()
+    if not symbol:
+        return jsonify({"ok": False, "message": "缺少代码"}), 400
+
+    if source == "auto":
+        source = "akshare" if market == "CN" or re.fullmatch(r"\d{6}", symbol) else "yfinance"
+    if asset_kind == "auto":
+        asset_kind = "fund" if re.fullmatch(r"\d{6}", symbol) and symbol.startswith(("00", "16", "20", "27", "51", "52", "56", "58")) else "stock"
+
+    try:
+        cfg = ensure_config()
+        # 前端可能刚改完配置但保存尚未完成，这里同步使用请求中的容错参数和当前涨跌幅。
+        for key in ["proxy_mode", "proxy_url", "request_timeout_sec", "retry_count", "danjuan_cookie", "valuation_method", "current_profit_pct", "current_position_amount", "plan_amount"]:
+            if key in data:
+                cfg[key] = data.get(key)
+        records, fundamentals, trace, source_used = fetch_market_data(symbol, market, asset_kind, source, cfg)
+        indicators = compute_indicators(records, fundamentals)
+        indicators = enrich_indicators_with_user_position(indicators, cfg)
+        indicators["source_used"] = source_used
+        indicators["fetch_trace"] = trace
+        indicators["proxy_mode"] = cfg.get("proxy_mode", "system")
+        return jsonify({
+            "ok": True,
+            "symbol": symbol,
+            "market": market,
+            "asset_kind": asset_kind,
+            "source": source_used,
+            "trace": trace,
+            "indicators": indicators,
+            "message": f"数据已获取：{source_used} 成功。已自动填入中间表单；你可以手动覆盖。",
+        })
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "message": f"自动获取失败：{e}。可以先手动填写PE百分位/ROE/趋势信号。",
+        }), 400
+
+
+@app.post("/api/backtest")
+def api_backtest():
+    data = request.get_json(silent=True) or {}
+    try:
+        cfg = ensure_config()
+        result = run_backtest_web(data, cfg)
+        return jsonify({"ok": True, "result": result})
+    except Exception as e:
+        return jsonify({"ok": False, "message": f"历史回测失败：{e}"}), 400
+
+
+if __name__ == "__main__":
+    app.run(debug=True, host="127.0.0.1", port=5000)

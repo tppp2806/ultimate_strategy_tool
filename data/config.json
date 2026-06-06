@@ -1,0 +1,19 @@
+{
+  "plan_amount": 1000.0,
+  "current_position_amount": 10.02,
+  "current_profit_pct": 6.0,
+  "strategy": "balanced",
+  "position_mode": "core_satellite",
+  "risk_per_trade_pct": 1.0,
+  "symbol": "000300",
+  "symbol_name": "沪深300指数",
+  "market": "CN",
+  "asset_kind": "index",
+  "data_source": "akshare",
+  "proxy_mode": "none",
+  "proxy_url": "",
+  "request_timeout_sec": 3.0,
+  "retry_count": 0,
+  "danjuan_cookie": "",
+  "valuation_method": "danjuan"
+}

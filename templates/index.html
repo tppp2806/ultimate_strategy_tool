@@ -1,0 +1,510 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>趋势风控仓位助手</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script defer src="{{ url_for('static', filename='app.js') }}"></script>
+</head>
+<body>
+<div class="app-shell">
+  <header class="topbar">
+    <div class="brand">
+      <h1>趋势风控仓位助手</h1>
+      <p>计划资金=100%上限；自动拉取行情，PE/ROE可自动填充也可手动覆盖</p>
+    </div>
+    <div class="top-actions">
+      <button class="ghost-btn" type="button" data-open-backtest>历史回测模拟</button>
+      <button class="ghost-btn" type="button" data-back-to-main hidden>返回仓位助手</button>
+      <button class="ghost-btn" type="button" data-open-settings>设置</button>
+      <button class="ghost-btn" type="button" data-reset-state>清空信号</button>
+    </div>
+  </header>
+
+  <aside class="config-pane">
+    <section class="card compact">
+      <div class="card-title">
+        <h2>标的与资金</h2>
+        <span class="pill neutral">计划资金=上限</span>
+      </div>
+
+      <div class="asset-search-box">
+        <label class="field" data-tip="可以输入中文名称、英文名称、股票代码或基金代码，例如 英伟达 / NVDA / 沪深300 / 510300 / 广发纳指。">
+          <span>标的搜索</span>
+          <input id="asset-search-input" type="search" placeholder="英伟达 / NVDA / 沪深300 / 510300">
+        </label>
+        <button id="asset-search-btn" class="btn mini" type="button">搜索</button>
+        <div id="asset-candidates" class="candidate-list"></div>
+      </div>
+
+      <form id="config-form" class="config-form">
+        <input type="hidden" name="symbol" value="{{ cfg.symbol }}">
+        <input type="hidden" name="symbol_name" value="{{ cfg.symbol_name }}">
+        <input type="hidden" name="market" value="{{ cfg.market }}">
+        <input type="hidden" name="asset_kind" value="{{ cfg.asset_kind }}">
+
+        <div id="settings-modal" class="settings-modal" hidden aria-hidden="true">
+          <div class="settings-backdrop" data-close-settings></div>
+          <section class="settings-panel" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+            <div class="settings-head">
+              <div>
+                <h2 id="settings-title">数据源 / 代理设置</h2>
+                <p>配置网络容错，并可一键测试 Yahoo、yfinance、蛋卷、Stooq、东方财富等链路。</p>
+              </div>
+              <button class="ghost-btn dark" type="button" data-close-settings>关闭</button>
+            </div>
+
+            <div class="settings-grid">
+              <label class="field" data-tip="自动=按市场多链路重试；也可以强制指定某个数据源。">
+                <span>数据源顺序</span>
+                <select name="data_source">
+                  <option value="auto" {% if cfg.data_source == 'auto' %}selected{% endif %}>自动多链路</option>
+                  <option value="akshare" {% if cfg.data_source == 'akshare' %}selected{% endif %}>优先 AKShare</option>
+                  <option value="yfinance" {% if cfg.data_source == 'yfinance' %}selected{% endif %}>优先 yfinance / Yahoo</option>
+                  <option value="stooq" {% if cfg.data_source == 'stooq' %}selected{% endif %}>Stooq 兜底</option>
+                </select>
+              </label>
+
+              <label class="field" data-tip="只用于历史回测的【历史估值序列】模式。实时仓位助手固定使用蛋卷（雪球）detail 当前页面估值，不受这里影响。">
+                <span>回测历史估值来源</span>
+                <select name="valuation_method">
+                  <option value="system_calc" {% if cfg.valuation_method != 'danjuan' %}selected{% endif %}>乐咕乐股</option>
+                  <option value="danjuan" {% if cfg.valuation_method == 'danjuan' %}selected{% endif %}>蛋卷（雪球）</option>
+                </select>
+              </label>
+
+              <label class="field" data-tip="系统代理=读取电脑/环境变量 HTTP_PROXY、HTTPS_PROXY；自定义代理=使用下方代理地址；不用代理=临时清空代理环境。">
+                <span>代理模式</span>
+                <select name="proxy_mode">
+                  <option value="system" {% if cfg.proxy_mode == 'system' %}selected{% endif %}>系统代理</option>
+                  <option value="custom" {% if cfg.proxy_mode == 'custom' %}selected{% endif %}>自定义代理</option>
+                  <option value="none" {% if cfg.proxy_mode == 'none' %}selected{% endif %}>不用代理</option>
+                </select>
+              </label>
+
+              <label class="field" data-tip="例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:7890。只有代理模式=自定义代理时使用。">
+                <span>代理地址</span>
+                <input type="text" name="proxy_url" value="{{ cfg.proxy_url }}" placeholder="http://127.0.0.1:7890">
+              </label>
+
+              <label class="field" data-tip="单次请求超时时间。网络不稳定可调大，太大会让等待变久。">
+                <span>请求超时 秒</span>
+                <input type="number" step="1" min="3" max="60" name="request_timeout_sec" value="{{ cfg.request_timeout_sec }}">
+              </label>
+
+              <label class="field" data-tip="每条数据链路失败后重试次数。0=不重试，2=最多尝试3次。">
+                <span>单链路重试次数</span>
+                <input type="number" step="1" min="0" max="5" name="retry_count" value="{{ cfg.retry_count }}">
+              </label>
+
+              <label class="field wide" data-tip="可选。蛋卷接口有时需要 Cookie；建议从 Apifox/浏览器复制 Cookie，失效后重新粘贴。">
+                <span>蛋卷 Cookie（可选）</span>
+                <textarea name="danjuan_cookie" rows="3" placeholder="acw_tc=...; device_id=...; timestamp=...">{{ cfg.danjuan_cookie }}</textarea>
+              </label>
+            </div>
+
+            <details class="mapping-editor">
+              <summary>指数 / 基金映射表（外置 data/index_map.json）</summary>
+              <p class="small">用于把 ETF、联接基金、关键词映射到跟踪指数估值代码。修改后可热更新，不需要重启。</p>
+              <textarea id="index-map-editor" spellcheck="false" rows="12" placeholder="点击载入映射表"></textarea>
+              <div class="settings-actions slim">
+                <button id="index-map-load-btn" class="btn mini light" type="button">载入映射表</button>
+                <button id="index-map-save-btn" class="btn mini" type="button">保存并热更新</button>
+                <span id="index-map-status" class="small">--</span>
+              </div>
+            </details>
+
+            <div class="settings-actions">
+              <button id="connection-test-btn" class="btn mini" type="button">测试接口连通性</button>
+              <button id="settings-save-btn" class="btn mini light" type="button">保存设置</button>
+              <span class="small">测试会返回状态码、耗时、解析字段和响应预览。</span>
+            </div>
+            <div id="connection-test-results" class="connection-test-results"></div>
+          </section>
+        </div>
+
+        <div class="selected-asset" id="selected-asset" role="button" tabindex="0" title="点击展开/收起搜索栏">
+          <span>当前标的</span>
+          <strong>{{ cfg.symbol_name or '未选择' }}{% if cfg.symbol %} · {{ cfg.symbol }}{% endif %}</strong>
+          <em>{{ cfg.market }} / {{ cfg.asset_kind }} / {{ cfg.data_source }}</em>
+        </div>
+
+
+        <label class="field" data-tip="计划投入这只标的/策略的总金额。所有仓位百分比都基于这个金额计算，100%就是这笔计划资金。">
+          <span>计划资金</span>
+          <input type="number" step="0.01" min="0" name="plan_amount" value="{{ cfg.plan_amount }}">
+        </label>
+
+        <label class="field" data-hide-in-backtest data-tip="当前实际持仓市值或投入金额，用来计算当前仓位和本次买卖金额。">
+          <span>当前持仓</span>
+          <input type="number" step="0.01" min="0" name="current_position_amount" value="{{ cfg.current_position_amount }}">
+        </label>
+
+        <label class="field" data-hide-in-backtest data-tip="可选。填写你当前持仓相对成本的涨跌幅/盈亏率，例如盈利12%填12，亏损5%填-5。系统会用 当前涨跌幅 ÷ 止损距离 自动判断盈利≥1R/2R/3R。">
+          <span>当前涨跌幅 / 持仓盈亏 %</span>
+          <input type="number" step="0.01" name="current_profit_pct" value="{{ cfg.current_profit_pct }}" placeholder="可空，亏损可填负数">
+        </label>
+
+        <label class="field" data-tip="单笔交易最多允许亏掉总计划资金的多少。你可以自行调高；系统不再按标的类型封顶。">
+          <span>单笔风险预算 %</span>
+          <input type="number" step="0.1" min="0.1" max="100" name="risk_per_trade_pct" value="{{ cfg.risk_per_trade_pct }}">
+        </label>
+
+        <div class="position-tile" data-hide-in-backtest>
+          <span>当前仓位</span>
+          <strong id="current-position-text">{{ pct(current_pos) }}</strong>
+        </div>
+
+        <fieldset class="strategy-box">
+          <legend>仓位模式</legend>
+          <label class="strategy-option balanced" data-tip="适合长期看好但也想控回撤：大趋势破坏时降交易仓，防守仓位由系统根据趋势/估值/ROE/破位状态动态计算，行情坏时可以接近0。">
+            <input type="radio" name="position_mode" value="core_satellite" {% if cfg.position_mode == 'core_satellite' %}checked{% endif %}>
+            <span>长期底仓 + 交易仓</span>
+            <em>防守仓位动态计算</em>
+          </label>
+          <label class="strategy-option defensive" data-tip="适合完全按交易纪律执行：所有仓位都按趋势/止损处理，破位可以降到0。">
+            <input type="radio" name="position_mode" value="strict_trade" {% if cfg.position_mode == 'strict_trade' %}checked{% endif %}>
+            <span>纯交易仓</span>
+            <em>破位可降到0</em>
+          </label>
+        </fieldset>
+
+        <fieldset class="strategy-box">
+          <legend>策略配置</legend>
+          {% for key, item in strategies.items() %}
+          <label class="strategy-option {{ key }}" data-tip="{{ item.desc }}">
+            <input type="radio" name="strategy" value="{{ key }}" {% if cfg.strategy == key %}checked{% endif %}>
+            <span>{{ item.name }}</span>
+            <em>{{ item.desc }}</em>
+          </label>
+          {% endfor %}
+        </fieldset>
+
+        <div id="strategy-summary" class="strategy-summary">
+          {{ strategy.name }}：{{ strategy.desc }}<br>
+          仓位模式：{% if cfg.position_mode == 'core_satellite' %}长期底仓 + 交易仓（防守仓位动态计算）{% else %}纯交易仓{% endif %}<br>
+          数据容错：代理 {{ cfg.proxy_mode }} / 超时 {{ cfg.request_timeout_sec }} 秒 / 重试 {{ cfg.retry_count }} 次<br>
+          回测估值来源：{{ valuation_method_text(cfg.valuation_method) }}；实时仓位页固定使用蛋卷（雪球）当前估值。<br>
+          计划资金=100%上限，不按标的类型封顶。
+        </div>
+      </form>
+      <div id="config-toast" class="inline-toast" hidden></div>
+    </section>
+  </aside>
+
+  <main class="signal-pane local-scroll" id="signal-pane">
+    <form id="signal-form">
+      <section class="card signal-card neutral" data-section="auto-data">
+        <div class="card-title">
+          <h2>① 自动数据 / 手动覆盖</h2>
+          <span class="pill neutral">可改</span>
+        </div>
+        <div class="auto-actions">
+          <button id="fetch-data-btn" class="btn mini" type="button">拉取所选标的数据</button>
+          <span id="fetch-status" class="small">自动数据失败时，仍可手动填写。</span>
+        </div>
+        <div id="auto-data-list" class="auto-data-list"></div>
+        <div class="data-grid">
+          <label class="field" data-tip="自动获取失败时可手填。PE百分位越高越贵，计算使用连续曲线，不用硬分段。">
+            <span>历史 PE 百分位 %</span>
+            <input type="number" step="0.1" min="0" max="100" name="pe_percentile" placeholder="例如 85">
+          </label>
+          <label class="field" data-tip="ROE是质量修正，不是买卖信号。12%左右中性，18%以上较强，8%以下偏弱。">
+            <span>ROE %</span>
+            <input type="number" step="0.1" name="roe_pct" placeholder="例如 22.5">
+          </label>
+          <label class="field" data-tip="可选。金融、周期、指数有时PB比PE更有参考价值。">
+            <span>历史 PB 百分位 %</span>
+            <input type="number" step="0.1" min="0" max="100" name="pb_percentile" placeholder="可空">
+          </label>
+          <label class="field" data-tip="买入价到止损价的百分比距离。例如买入100、止损94，就填6。系统会用 单笔风险预算 ÷ 止损距离 来限制仓位。">
+            <span>买入价到止损价距离 %</span>
+            <input type="number" step="0.1" min="0" max="80" name="stop_loss_pct" value="6">
+          </label>
+        </div>
+      </section>
+
+      <section class="card signal-card neutral">
+        <div class="card-title">
+          <h2>② 大趋势环境</h2>
+          <span class="pill neutral">先判断能不能做</span>
+        </div>
+        <div class="choice-grid mixed-choice market-grid">
+          <label data-impact="wait" data-choice-group="market_state" data-tip="价格反复穿越均线，假突破较多，仓位要打折。">
+            <input type="checkbox" name="market_state" value="sideways" checked> 震荡/无趋势
+          </label>
+          <label data-impact="sell-strong" data-choice-group="market_state" data-tip="价格在200日线下方，且200日线向下；原则上不新增买入。">
+            <input type="checkbox" name="market_state" value="bear"> 200日线下方且向下
+          </label>
+          <label data-impact="wait" data-choice-group="market_state" data-tip="价格仍在200日线下方，但已开始反弹；只能小仓验证。">
+            <input type="checkbox" name="market_state" value="below_200"> 未站上200日线
+          </label>
+          <label data-impact="buy" data-choice-group="market_state" data-tip="价格在200日线上方，50日线走平或向上，可以开始做趋势仓。">
+            <input type="checkbox" name="market_state" value="above_200"> 站上200日线
+          </label>
+          <label data-impact="buy-strong" data-choice-group="market_state" data-tip="价格 > 50日线 > 200日线，且均线向上，是最适合加仓的环境。">
+            <input type="checkbox" name="market_state" value="strong_bull"> 50日线 > 200日线强多头
+          </label>
+          <label data-impact="sell" data-tip="大盘、同类ETF或板块同步跌破关键均线时，单个标的信号要降权。">
+            <input type="checkbox" name="market_risk"> 大盘/板块同步走弱
+          </label>
+        </div>
+      </section>
+
+      <section class="card signal-card event-zone" data-section="entry-setup">
+        <div class="card-title">
+          <h2>③ 入场信号</h2>
+          <span class="pill buy">只保留三类</span>
+        </div>
+        <div class="choice-grid">
+          <label data-impact="wait" data-choice-group="entry_state" data-tip="没有站回、突破、回踩不破或持续新高等明确买点。">
+            <input type="checkbox" name="entry_state" value="none" checked> 暂无买点
+          </label>
+          <label data-impact="buy" data-choice-group="entry_state" data-tip="下跌后站回50日线，但未完全确认，只能试仓。">
+            <input type="checkbox" name="entry_state" value="reversal_50"> 站回50日线反转试仓
+          </label>
+          <label data-impact="buy" data-choice-group="entry_state" data-tip="多头环境中突破平台/前高，最好用收盘价确认，而不是盘中刺破。">
+            <input type="checkbox" name="entry_state" value="breakout"> 平台/前高突破
+          </label>
+          <label data-impact="buy-strong" data-choice-group="entry_state" data-tip="多头趋势中回踩20/50日线不破，通常比追高更稳。">
+            <input type="checkbox" name="entry_state" value="pullback_hold"> 回踩20/50日线不破
+          </label>
+          <label data-impact="buy-strong" data-choice-group="entry_state" data-tip="强多头中持续创新高，适合已有盈利后加仓，不适合亏损加仓。">
+            <input type="checkbox" name="entry_state" value="continuation_high"> 强趋势持续创新高
+          </label>
+        </div>
+      </section>
+
+      <section class="card signal-card pattern-zone" data-section="volume-confirm">
+        <div class="card-title">
+          <h2>④ 量价辅助确认</h2>
+          <span class="pill wait">只加减权重</span>
+        </div>
+        <div class="check-grid volume-confirm-grid">
+          <label data-impact="wait" data-tip="没有明显放量突破、回踩缩量、冲高回落、收盘未站稳或远离均线。">
+            <input type="checkbox" name="volume_state" value="none" checked> 暂无明显量价信号
+          </label>
+          <label data-impact="buy" data-tip="突破时放量是加分项，但不能替代趋势和止损。">
+            <input type="checkbox" name="volume_confirm"> 突破时放量
+          </label>
+          <label data-impact="buy" data-tip="回踩缩量说明抛压较小，是辅助确认。">
+            <input type="checkbox" name="pullback_volume_dry"> 回踩缩量
+          </label>
+          <label data-impact="sell" data-tip="长上影/冲高回落代表上方抛压，买入仓位自动降低。">
+            <input type="checkbox" name="upper_shadow"> 放量长上影 / 冲高回落
+          </label>
+          <label data-impact="sell" data-tip="突破后没有收在关键位上方，不视为有效突破。">
+            <input type="checkbox" name="failed_close"> 收盘未站稳关键位
+          </label>
+          <label data-impact="sell" data-tip="价格明显远离20日/50日均线时，追高风险收益比变差。">
+            <input type="checkbox" name="far_from_ma"> 远离均线 / 涨速过快
+          </label>
+        </div>
+      </section>
+
+      <section class="card signal-card context-zone" data-section="exit-setup">
+        <div class="card-title">
+          <h2>⑤ 减仓 / 清仓信号</h2>
+          <span class="pill danger">风险优先</span>
+        </div>
+        <div class="choice-grid">
+          <label data-impact="wait" data-choice-group="exit_state" data-tip="没有跌破20/50/200日线、突破失败或触发初始止损。">
+            <input type="checkbox" name="exit_state" value="none" checked> 暂无破位
+          </label>
+          <label data-impact="sell" data-choice-group="exit_state" data-tip="短线趋势弱化，适合先减一部分或收紧止损。">
+            <input type="checkbox" name="exit_state" value="below_20"> 跌破20日线
+          </label>
+          <label data-impact="sell" data-choice-group="exit_state" data-tip="突破失败是常见亏损来源，优先降风险。">
+            <input type="checkbox" name="exit_state" value="failed_breakout"> 突破失败
+          </label>
+          <label data-impact="sell-strong" data-choice-group="exit_state" data-tip="50日线失守代表中期趋势破坏，至少大减仓。">
+            <input type="checkbox" name="exit_state" value="below_50"> 跌破50日线
+          </label>
+          <label data-impact="sell-strong" data-choice-group="exit_state" data-tip="200日线失守代表大趋势破坏，交易仓应退出。">
+            <input type="checkbox" name="exit_state" value="below_200"> 跌破200日线
+          </label>
+          <label data-impact="sell-strong" data-choice-group="exit_state" data-tip="初始止损触发后不要犹豫，不补亏损仓。">
+            <input type="checkbox" name="exit_state" value="hit_stop"> 触发初始止损
+          </label>
+        </div>
+      </section>
+
+      <section class="card signal-card neutral" data-section="profit-stage">
+        <div class="card-title">
+          <h2>⑥ 盈利阶段</h2>
+          <span class="pill neutral">止盈辅助</span>
+        </div>
+        <div class="choice-grid compact-choice">
+          <label data-impact="wait" data-choice-group="profit_state" data-tip="未达到 1R 盈利，或没有填写当前涨跌幅。"><input type="checkbox" name="profit_state" value="none" checked> 无明显盈利</label>
+          <label data-impact="buy" data-choice-group="profit_state"><input type="checkbox" name="profit_state" value="profit_1r"> 盈利≥1R</label>
+          <label data-impact="sell" data-choice-group="profit_state"><input type="checkbox" name="profit_state" value="profit_2r"> 盈利≥2R</label>
+          <label data-impact="sell" data-choice-group="profit_state"><input type="checkbox" name="profit_state" value="profit_3r"> 盈利≥3R</label>
+        </div>
+      </section>
+    </form>
+  </main>
+
+  <main class="backtest-config-pane local-scroll" id="backtest-config-pane" hidden aria-hidden="true">
+    <section class="card backtest-form-card">
+      <div class="card-title">
+        <h2>回测配置</h2>
+        <div class="backtest-title-actions">
+          <span class="pill neutral">使用左侧当前标的</span>
+          <span class="pill neutral">默认不导出</span>
+        </div>
+      </div>
+
+      <div class="strategy-summary backtest-current-source">
+        回测会直接使用左侧【标的与资金】和顶部【设置】里的配置：当前标的、计划资金、仓位模式、策略档位、单笔风险预算、数据源、代理、超时和重试都不再重复填写。
+      </div>
+
+      <form id="backtest-form" class="backtest-form">
+        <label class="field">
+          <span>开始日期</span>
+          <input type="date" name="start_date" value="2022-10-01">
+        </label>
+        <label class="field">
+          <span>结束日期</span>
+          <input type="date" name="end_date" value="{{ '%04d-%02d-%02d'|format(2026, 6, 6) }}">
+        </label>
+        <label class="field" data-tip="每隔多少个交易日检查并执行一次。1=每天；5≈每周；20≈每月。">
+          <span>操作周期 / 每N个交易日</span>
+          <input type="number" step="1" min="1" max="60" name="rebalance_days" value="5">
+        </label>
+
+        <label class="field" data-tip="低于这个仓位变化幅度时不执行，避免过度交易。">
+          <span>最小执行变化 %</span>
+          <input type="number" step="0.1" min="0" max="20" name="min_trade_pct" value="0.5">
+        </label>
+        <label class="field">
+          <span>手续费 bps</span>
+          <input type="number" step="0.1" min="0" name="fee_bps" value="2">
+        </label>
+        <label class="field">
+          <span>滑点 bps</span>
+          <input type="number" step="0.1" min="0" name="slippage_bps" value="3">
+        </label>
+
+        <label class="field wide" data-tip="建议先用“不使用估值修正”看纯趋势/风控效果；历史估值序列会按设置页的回测估值来源获取 PE/PB/ROE 历史序列，并只使用当日及以前数据，避免未来函数。">
+          <span>估值参与方式</span>
+          <select name="valuation_mode" id="backtest-valuation-mode">
+            <option value="none" selected>不使用估值修正</option>
+            <option value="fixed">使用固定估值假设</option>
+            <option value="historical">使用历史估值序列</option>
+          </select>
+        </label>
+
+        <label class="field backtest-fixed-valuation" data-tip="仅在【使用固定估值假设】时生效；会把同一个 PE 百分位套用于整段回测，只适合压力测试。">
+          <span>固定 PE 百分位 %</span>
+          <input type="number" step="0.1" min="0" max="100" name="pe_percentile" placeholder="可空">
+        </label>
+        <label class="field backtest-fixed-valuation">
+          <span>固定 PB 百分位 %</span>
+          <input type="number" step="0.1" min="0" max="100" name="pb_percentile" placeholder="可空">
+        </label>
+        <label class="field backtest-fixed-valuation">
+          <span>固定 ROE %</span>
+          <input type="number" step="0.1" name="roe_pct" placeholder="可空">
+        </label>
+        <label class="field export-field" data-tip="默认只在页面预览。勾选后额外写出 CSV 到 backtest_reports 文件夹。">
+          <span>导出结果表格</span>
+          <label class="inline-check"><input type="checkbox" name="export_files"> 生成 CSV 文件</label>
+        </label>
+
+        <button id="backtest-run-btn" class="btn secondary backtest-run-btn" type="submit">开始回测</button>
+      </form>
+    </section>
+  </main>
+
+
+  <aside class="result-pane local-scroll">
+    <section id="result-panel" class="result-card idle" aria-live="polite">
+      <div class="result-summary">
+        <div class="result-summary-row">
+          <strong id="result-headline" class="result-headline-text hold">修改选项后自动计算</strong>
+          <div class="confidence">
+            <span id="result-confidence">--</span>
+            <em>一致性</em>
+          </div>
+        </div>
+        <p id="result-subline" class="result-explain">置信度表示规则一致性，不是预测胜率。</p>
+      </div>
+
+      <div id="metrics" class="metrics lazy-host"></div>
+
+      <details class="details-block" open>
+        <summary>风险 / 限制</summary>
+        <ul id="warning-list" class="lazy-host"></ul>
+      </details>
+    </section>
+
+    <section class="card rules-mini">
+      <div class="card-title">
+        <h2>执行原则</h2>
+        <span class="pill neutral">稳定版</span>
+      </div>
+      <ol>
+        <li>计划资金就是该标的100%上限，不按标的类型额外封顶。</li>
+        <li>PE百分位、PB百分位、ROE使用具体数值，计算采用连续曲线。</li>
+        <li>自动数据只负责填表，任何字段都可以手动覆盖。</li>
+        <li>没有止损距离，不新增交易仓。</li>
+        <li>量价只确认，不单独主导买卖。</li>
+      </ol>
+    </section>
+  </aside>
+
+  <aside class="backtest-result-pane local-scroll" id="backtest-result-pane" hidden aria-hidden="true">
+    <section class="card backtest-result-card">
+      <div class="card-title">
+        <h2>回测结果</h2>
+        <span id="backtest-status" class="pill neutral">等待运行</span>
+      </div>
+      <div id="backtest-summary" class="strategy-summary">填写参数后点击开始回测。默认不导出表格，只在页面预览核心指标和交易记录。</div>
+
+      <details class="details-block" open>
+        <summary class="backtest-section-summary">
+          <span>核心指标</span>
+          <button class="mini-action-btn" type="button" data-preview-table="metrics">预览</button>
+        </summary>
+        <div id="backtest-metrics" class="backtest-table-wrap"></div>
+      </details>
+
+      <details class="details-block" open>
+        <summary class="backtest-section-summary">
+          <span>交易记录</span>
+          <button class="mini-action-btn" type="button" data-preview-table="trades">预览</button>
+        </summary>
+        <div id="backtest-trades" class="backtest-table-wrap"></div>
+      </details>
+
+      <details class="details-block">
+        <summary>导出文件 / 数据源信息</summary>
+        <div id="backtest-export-info" class="backtest-export-info">--</div>
+      </details>
+    </section>
+  </aside>
+
+</div>
+
+
+
+
+
+<div id="table-preview-modal" class="table-preview-modal" hidden>
+  <div class="table-preview-backdrop" data-close-preview></div>
+  <section class="table-preview-dialog" role="dialog" aria-modal="true" aria-labelledby="table-preview-title">
+    <header class="table-preview-head">
+      <div>
+        <div class="small">历史回测模拟</div>
+        <h2 id="table-preview-title">预览</h2>
+      </div>
+      <button class="ghost-btn preview-close-btn" type="button" data-close-preview>关闭</button>
+    </header>
+    <div id="table-preview-body" class="table-preview-body"></div>
+  </section>
+</div>
+
+<div id="hover-popover" class="hover-popover" hidden></div>
+</body>
+</html>
