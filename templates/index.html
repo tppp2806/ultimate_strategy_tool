@@ -98,6 +98,11 @@
                 <input type="number" step="1" min="0" max="5" name="retry_count" value="{{ cfg.retry_count }}">
               </label>
 
+              <label class="field" data-tip="用于历史回测里的夏普比率、卡玛比率和相对定投评分。2 表示年化 2%。">
+                <span>无风险收益率 %</span>
+                <input type="number" step="0.1" min="-20" max="30" name="backtest_risk_free_rate_pct" value="{{ cfg.backtest_risk_free_rate_pct }}">
+              </label>
+
               <label class="field wide" data-tip="可选。蛋卷接口有时需要 Cookie；建议从 Apifox/浏览器复制 Cookie，失效后重新粘贴。">
                 <span>蛋卷 Cookie（可选）</span>
                 <textarea name="danjuan_cookie" rows="3" placeholder="acw_tc=...; device_id=...; timestamp=...">{{ cfg.danjuan_cookie }}</textarea>
@@ -117,8 +122,9 @@
 
             <div class="settings-actions">
               <button id="connection-test-btn" class="btn mini" type="button">测试接口连通性</button>
+              <button id="cache-clear-btn" class="btn mini warn" type="button">清除所有缓存</button>
               <button id="settings-save-btn" class="btn mini light" type="button">保存设置</button>
-              <span class="small">测试会返回状态码、耗时、解析字段和响应预览。</span>
+              <span class="small">缓存只保存在本次程序运行内；清除后搜索、获取信息、回测和连通性测试会重新执行。</span>
             </div>
             <div id="connection-test-results" class="connection-test-results"></div>
           </section>
@@ -368,7 +374,7 @@
           <span>结束日期</span>
           <input type="date" name="end_date" value="{{ '%04d-%02d-%02d'|format(2026, 6, 6) }}">
         </label>
-        <label class="field" data-tip="每隔多少个交易日检查并执行一次。1=每天；5≈每周；20≈每月。">
+        <label class="field" data-tip="每隔多少个交易日检查并执行一次。1=每天；5≈每周；20≈每月。定投基准也使用这个周期，默认投入100%计划资金，并排除最后一个可观测日，避免最后一天买入看不到收益。">
           <span>操作周期 / 每N个交易日</span>
           <input type="number" step="1" min="1" max="60" name="rebalance_days" value="5">
         </label>

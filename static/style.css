@@ -898,6 +898,15 @@ textarea { resize: vertical; min-height: 74px; }
   color: #3a2b22;
   border: 1px solid #d6c4ad;
 }
+.btn.mini.warn {
+  background: #fff1df;
+  color: #7a3d16;
+  border: 1px solid #e1b98d;
+}
+.btn.mini.warn:hover {
+  background: #ffe5c7;
+  box-shadow: 0 8px 18px rgba(122, 61, 22, .12);
+}
 .connection-test-results {
   display: grid;
   gap: 8px;
@@ -1288,4 +1297,323 @@ textarea { resize: vertical; min-height: 74px; }
 }
 .backtest-fixed-valuation.is-disabled input {
   background: rgba(255,255,255,.38);
+}
+
+/* v54：标的搜索候选列表改为可滚动下拉，避免候选过多时被折叠容器裁切。 */
+.asset-search-box.is-open {
+  max-height: min(760px, calc(100dvh - 155px));
+}
+
+.candidate-list {
+  max-height: min(360px, 46dvh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 3px;
+  scrollbar-gutter: stable;
+}
+
+.candidate-list:empty {
+  display: none;
+}
+
+.candidate-list::-webkit-scrollbar {
+  width: 9px;
+}
+
+.candidate-list::-webkit-scrollbar-thumb {
+  background: #c9b9a5;
+  border-radius: 999px;
+  border: 2px solid #fff8ed;
+}
+
+.candidate-item {
+  min-height: 58px;
+}
+
+/* v56：标的搜索结果改为真正的下拉浮层。
+   v54 只是把列表变成可滚动区域，但仍在折叠容器内部，部分布局下会被高度/滚动容器裁切。
+   这里改成绝对定位浮层：搜索栏展开后只占搜索控件高度，候选结果悬浮显示并带独立滚动条。 */
+.config-pane .card.compact {
+  overflow: visible;
+}
+
+.asset-search-box {
+  position: relative;
+  z-index: 30;
+  overflow: hidden;
+}
+
+.asset-search-box.is-open {
+  max-height: 150px;
+  overflow: visible;
+  z-index: 120;
+}
+
+.asset-search-box .candidate-list {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  right: 0;
+  z-index: 999;
+  display: grid;
+  gap: 7px;
+  max-height: min(430px, 58dvh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 8px;
+  border: 1px solid #d8c9b8;
+  border-radius: 16px;
+  background: #fffaf2;
+  box-shadow: 0 18px 36px rgba(67, 49, 29, .18);
+  scrollbar-gutter: stable;
+}
+
+.asset-search-box .candidate-list:empty {
+  display: none;
+}
+
+.asset-search-box .candidate-item {
+  min-height: 58px;
+  background: rgba(255, 255, 255, .72);
+}
+
+.asset-search-box .candidate-empty {
+  display: block;
+  padding: 10px 12px;
+  border: 1px dashed #d4c4b2;
+  border-radius: 13px;
+  background: #fff7ea;
+}
+
+.asset-search-box .candidate-list::-webkit-scrollbar {
+  width: 9px;
+}
+
+.asset-search-box .candidate-list::-webkit-scrollbar-thumb {
+  background: #c9b9a5;
+  border-radius: 999px;
+  border: 2px solid #fffaf2;
+}
+
+/* v57：统一美化搜索框、日期框和常用表单控件。 */
+.field:focus-within {
+  border-color: rgba(129, 91, 48, .72);
+  background: #fffdf8;
+  box-shadow: 0 0 0 3px rgba(188, 142, 88, .16), 0 10px 22px rgba(73, 52, 31, .06);
+  transform: translateY(-1px);
+}
+
+input[type="number"],
+input[type="text"],
+input[type="search"],
+input[type="date"],
+select,
+textarea {
+  width: 100%;
+  min-height: 42px;
+  box-sizing: border-box;
+  border: 1px solid #d4c5b4;
+  border-radius: 12px;
+  padding: 9px 12px;
+  background: linear-gradient(180deg, #fffefd 0%, #fff8ee 100%);
+  color: var(--ink);
+  font: inherit;
+  font-size: 15px;
+  line-height: 1.25;
+  outline: none;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .82), 0 1px 2px rgba(82, 58, 34, .05);
+  transition: border-color .14s ease, box-shadow .14s ease, background .14s ease, transform .14s ease;
+}
+
+input[type="date"] {
+  cursor: pointer;
+  color-scheme: light;
+  letter-spacing: .2px;
+}
+
+input[type="search"] {
+  -webkit-appearance: none;
+  appearance: none;
+  padding-right: 34px;
+}
+
+input[type="number"]:focus,
+input[type="text"]:focus,
+input[type="search"]:focus,
+input[type="date"]:focus,
+select:focus,
+textarea:focus {
+  border-color: #9b7145;
+  background: #fffefb;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.9), 0 0 0 3px rgba(166, 116, 62, .18);
+}
+
+input[type="search"]::-webkit-search-cancel-button {
+  cursor: pointer;
+  opacity: .72;
+}
+
+input[type="date"]::-webkit-calendar-picker-indicator {
+  cursor: pointer;
+  border-radius: 9px;
+  padding: 4px;
+  background-color: rgba(238, 224, 204, .72);
+}
+
+.asset-search-box {
+  align-items: stretch;
+  gap: 10px;
+}
+
+.asset-search-box .field {
+  min-width: 0;
+  padding: 11px 12px;
+  border-radius: 16px;
+}
+
+.asset-search-box .field span,
+.backtest-form .field span {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.asset-search-box .btn.mini {
+  min-width: 88px;
+  min-height: 64px;
+  border-radius: 18px;
+  font-size: 16px;
+  letter-spacing: .06em;
+  box-shadow: 0 10px 22px rgba(50, 38, 30, .14);
+}
+
+.asset-search-box .btn.mini:hover {
+  transform: translateY(-1px);
+  filter: brightness(1.04);
+}
+
+.backtest-form .field {
+  padding: 12px 13px;
+  border-radius: 17px;
+}
+
+.backtest-form input[type="date"] {
+  max-width: 220px;
+}
+
+@media (max-width: 720px) {
+  .asset-search-box {
+    grid-template-columns: 1fr;
+  }
+  .asset-search-box .btn.mini {
+    min-height: 48px;
+  }
+  .backtest-form input[type="date"] {
+    max-width: none;
+  }
+}
+
+/* v61：核心指标表格精简展示 + 指标类别着色 */
+#backtest-metrics .metric-table th:nth-child(3),
+#backtest-metrics .metric-table td:nth-child(3) {
+  display: none;
+}
+.metric-table tr.metric-row {
+  position: relative;
+  border-left: 4px solid transparent;
+}
+.metric-table tr.metric-row > td:first-child {
+  font-weight: 900;
+}
+.metric-table tr.metric-row > td[data-col="数值"] {
+  font-weight: 950;
+  color: var(--ink);
+}
+.metric-table tr.metric-row[data-metric-category="score"] {
+  background: linear-gradient(90deg, rgba(176, 126, 54, .18), rgba(255,255,255,.46));
+  border-left-color: #b07e36;
+}
+.metric-table tr.metric-row[data-metric-category="score"] > td {
+  padding-top: 11px;
+  padding-bottom: 11px;
+  font-size: 14px;
+}
+.metric-table tr.metric-row.positive > td[data-col="数值"] { color: #16855f; }
+.metric-table tr.metric-row.negative > td[data-col="数值"] { color: #b84848; }
+.metric-table tr.metric-row.neutral > td[data-col="数值"] { color: #7b623f; }
+.metric-table tr.metric-row[data-metric-category="risk_adjusted"] {
+  background: linear-gradient(90deg, rgba(96, 118, 158, .13), rgba(255,255,255,.46));
+  border-left-color: #60769e;
+}
+.metric-table tr.metric-row[data-metric-category="return"] {
+  background: linear-gradient(90deg, rgba(67, 138, 96, .12), rgba(255,255,255,.46));
+  border-left-color: #438a60;
+}
+.metric-table tr.metric-row[data-metric-category="risk"] {
+  background: linear-gradient(90deg, rgba(179, 93, 73, .12), rgba(255,255,255,.46));
+  border-left-color: #b35d49;
+}
+.metric-table tr.metric-row[data-metric-category="trade"] {
+  background: linear-gradient(90deg, rgba(159, 125, 75, .12), rgba(255,255,255,.46));
+  border-left-color: #9f7d4b;
+}
+.metric-table tr.metric-row[data-metric-category="valuation"] {
+  background: linear-gradient(90deg, rgba(106, 137, 126, .12), rgba(255,255,255,.46));
+  border-left-color: #6a897e;
+}
+.metric-table tr.metric-row[data-metric-category="other"] {
+  background: rgba(255,255,255,.46);
+  border-left-color: rgba(98, 80, 63, .28);
+}
+#backtest-metrics .metric-table td:last-child {
+  min-width: 96px;
+  white-space: nowrap;
+}
+.table-preview-body .metric-table td:last-child {
+  min-width: 220px;
+  white-space: normal;
+}
+
+/* v62：三类策略百分制得分 + 交易记录按操作着色 */
+.metric-table tr.metric-row[data-metric-category="score"] {
+  background: linear-gradient(90deg, rgba(176, 126, 54, .22), rgba(255,255,255,.50));
+  border-left-color: #b07e36;
+}
+.metric-table tr.metric-row[data-metric-category="score"] > td[data-col="数值"] {
+  font-size: 14px;
+  letter-spacing: .01em;
+}
+.metric-table tr.metric-row.positive > td[data-col="数值"] { color: #16855f; }
+.metric-table tr.metric-row.negative > td[data-col="数值"] { color: #b84848; }
+.metric-table tr.metric-row.neutral > td[data-col="数值"] { color: #8a6337; }
+.trade-table tr.trade-row {
+  position: relative;
+  border-left: 4px solid rgba(98, 80, 63, .24);
+}
+.trade-table tr.trade-row > td[data-col="方向"],
+.trade-table tr.trade-row > td[data-col="操作建议"],
+.trade-table tr.trade-row > td[data-col="命中规则"] {
+  font-weight: 900;
+}
+.trade-table tr.trade-row.buy {
+  background: linear-gradient(90deg, rgba(52, 139, 101, .14), rgba(255,255,255,.48));
+  border-left-color: #348b65;
+}
+.trade-table tr.trade-row.buy > td[data-col="方向"] { color: #14734f; }
+.trade-table tr.trade-row.sell {
+  background: linear-gradient(90deg, rgba(185, 86, 71, .14), rgba(255,255,255,.48));
+  border-left-color: #b95647;
+}
+.trade-table tr.trade-row.sell > td[data-col="方向"] { color: #a33d35; }
+.trade-table tr.trade-row.clear {
+  background: linear-gradient(90deg, rgba(130, 76, 56, .18), rgba(255,255,255,.48));
+  border-left-color: #824c38;
+}
+.trade-table tr.trade-row.clear > td[data-col="方向"] { color: #7c3428; }
+.trade-table tr.trade-row.hold {
+  background: linear-gradient(90deg, rgba(103, 126, 154, .12), rgba(255,255,255,.48));
+  border-left-color: #677e9a;
+}
+.trade-table tr.trade-row.hold > td[data-col="方向"] { color: #4d6682; }
+.trade-table tr.trade-row.neutral {
+  background: rgba(255,255,255,.46);
 }

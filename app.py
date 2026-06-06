@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import copy
 import csv
+from collections import OrderedDict
+import hashlib
 import json
 import math
 import os
 import re
 import time
 import contextlib
+import html as html_lib
 from io import StringIO
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -21,6 +25,74 @@ INDEX_MAP_PATH = os.path.join(DATA_DIR, "index_map.json")
 
 app = Flask(__name__)
 app.secret_key = "local-trend-risk-position-tool"
+
+# 进程内轻量缓存：同一轮本地使用中，参数完全相同的搜索、拉取、回测、连通性测试不重复执行。
+# 不落盘，不保存原始参数；只用参数摘要作为 key，避免把 Cookie/代理等敏感配置写进缓存索引。
+RUNTIME_CACHE_VERSION = 12
+RUNTIME_CACHE_MAX_ITEMS = 160
+RUNTIME_CACHE_TTL_SEC: Dict[str, int] = {
+    "search": 6 * 60 * 60,
+    "fetch": 15 * 60,
+    "backtest": 12 * 60 * 60,
+    "connectivity": 5 * 60,
+}
+_RUNTIME_CACHE: OrderedDict[str, Dict[str, Any]] = OrderedDict()
+
+
+def _json_cache_copy(value: Any) -> Any:
+    try:
+        return copy.deepcopy(value)
+    except Exception:
+        return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+
+
+def _stable_cache_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
+
+
+def runtime_cache_key(scope: str, payload: Dict[str, Any]) -> str:
+    raw = _stable_cache_json({"v": RUNTIME_CACHE_VERSION, "scope": scope, "payload": payload})
+    return f"{scope}:{hashlib.sha256(raw.encode('utf-8')).hexdigest()}"
+
+
+def runtime_cache_get(scope: str, payload: Dict[str, Any]) -> Tuple[Optional[Any], int]:
+    key = runtime_cache_key(scope, payload)
+    item = _RUNTIME_CACHE.get(key)
+    if not item:
+        return None, 0
+    age = int(time.time() - float(item.get("time", 0)))
+    ttl = int(RUNTIME_CACHE_TTL_SEC.get(scope, 10 * 60))
+    if age > ttl:
+        _RUNTIME_CACHE.pop(key, None)
+        return None, 0
+    # LRU：命中即刷新为最近使用，避免高频参数被淘汰。
+    _RUNTIME_CACHE.move_to_end(key)
+    return _json_cache_copy(item.get("value")), age
+
+
+def runtime_cache_set(scope: str, payload: Dict[str, Any], value: Any) -> None:
+    key = runtime_cache_key(scope, payload)
+    _RUNTIME_CACHE[key] = {"time": time.time(), "value": _json_cache_copy(value)}
+    _RUNTIME_CACHE.move_to_end(key)
+    # OrderedDict 按插入/最近使用顺序保存，popitem(last=False) 为 O(1) 淘汰最老项。
+    while len(_RUNTIME_CACHE) > RUNTIME_CACHE_MAX_ITEMS:
+        _RUNTIME_CACHE.popitem(last=False)
+
+
+def runtime_cache_clear(scope: Optional[str] = None) -> None:
+    if not scope:
+        _RUNTIME_CACHE.clear()
+        return
+    prefix = f"{scope}:"
+    for key in list(_RUNTIME_CACHE.keys()):
+        if key.startswith(prefix):
+            _RUNTIME_CACHE.pop(key, None)
+
+
+def add_cache_meta(payload: Dict[str, Any], hit: bool, age_sec: int = 0) -> Dict[str, Any]:
+    out = _json_cache_copy(payload)
+    out["cache"] = {"hit": bool(hit), "age_sec": int(age_sec)}
+    return out
 
 
 STRATEGY_PRESETS: Dict[str, Dict[str, Any]] = {
@@ -54,6 +126,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "strategy": "balanced",
     "position_mode": "core_satellite",  # core_satellite / strict_trade
     "risk_per_trade_pct": 1.0,
+    "backtest_risk_free_rate_pct": 2.0,
     "symbol": "",
     "symbol_name": "",
     "market": "auto",
@@ -81,7 +154,8 @@ DEFAULT_INDEX_MAPPING: Dict[str, Any] = {
         {"symbol": "000300", "name": "沪深300指数", "market": "CN", "asset_kind": "index", "source": "akshare"},
         {"symbol": "510300", "name": "沪深300ETF", "market": "CN", "asset_kind": "etf", "source": "akshare"},
         {"symbol": "513100", "name": "纳指ETF / 纳斯达克100ETF", "market": "CN", "asset_kind": "etf", "source": "akshare"},
-        {"symbol": "270042", "name": "广发纳斯达克100ETF联接(QDII)A", "market": "CN", "asset_kind": "fund", "source": "akshare"}
+        {"symbol": "270042", "name": "广发纳斯达克100ETF联接(QDII)A", "market": "CN", "asset_kind": "fund", "source": "akshare"},
+        {"symbol": "017641", "name": "摩根标普500指数(QDII)人民币A", "market": "CN", "asset_kind": "fund", "source": "akshare"}
     ],
     "aliases": {
         "英伟达": ["NVDA"],
@@ -92,9 +166,10 @@ DEFAULT_INDEX_MAPPING: Dict[str, Any] = {
         "特斯拉": ["TSLA"],
         "纳斯达克100": ["QQQ", "513100", "270042"],
         "纳指100": ["QQQ", "513100", "270042"],
-        "标普500": ["SPY"],
-        "s&p500": ["SPY"],
-        "sp500": ["SPY"],
+        "标普500": ["SPY", "017641"],
+        "s&p500": ["SPY", "017641"],
+        "sp500": ["SPY", "017641"],
+        "摩根标普500": ["017641"],
         "沪深300": ["000300", "510300"]
     },
     "index_codes": {
@@ -129,7 +204,8 @@ DEFAULT_INDEX_MAPPING: Dict[str, Any] = {
         "270042": "NDX",
         "513500": "SP500",
         "161125": "SP500",
-        "050025": "SP500"
+        "050025": "SP500",
+        "017641": "SP500"
     },
     "index_names": {
         "SH000300": "沪深300",
@@ -365,6 +441,7 @@ def ensure_config() -> Dict[str, Any]:
     merged.pop("asset_type", None)
     merged["current_profit_pct"] = clamp(as_float(merged.get("current_profit_pct"), 0.0), -99.99, 9999.0)
     merged["risk_per_trade_pct"] = clamp(as_float(merged.get("risk_per_trade_pct"), 1.0), 0.1, 100.0)
+    merged["backtest_risk_free_rate_pct"] = clamp(as_float(merged.get("backtest_risk_free_rate_pct"), 2.0), -20.0, 30.0)
 
     for key in ["symbol", "symbol_name", "market", "asset_kind", "data_source", "proxy_mode", "proxy_url", "danjuan_cookie", "valuation_method"]:
         merged[key] = str(merged.get(key, DEFAULT_CONFIG.get(key, "")) or DEFAULT_CONFIG.get(key, ""))
@@ -388,6 +465,22 @@ def save_config(cfg: Dict[str, Any]) -> None:
 
 def get_strategy(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return STRATEGY_PRESETS.get(str(cfg.get("strategy", "balanced")), STRATEGY_PRESETS["balanced"])
+
+
+def core_asset_profile(cfg: Dict[str, Any]) -> str:
+    """仓位模式识别。
+
+    只要用户选择【长期底仓 + 交易仓】，就统一启用底仓 + 交易仓策略；
+    不再按标普500 / 纳指100 / 沪深300 / 上证50 / 普通基金做区别对待。
+    """
+    return "core" if str(cfg.get("position_mode", "core_satellite")) == "core_satellite" else ""
+
+
+def core_asset_floor_bounds(profile: str) -> Tuple[float, float]:
+    if profile:
+        # 长期底仓模式允许长期在场，但仍给熊市/破位保留降仓空间。
+        return 0.05, 0.92
+    return 0.0, 0.60
 
 
 def current_position(cfg: Dict[str, Any]) -> float:
@@ -420,62 +513,99 @@ def lower_floor(cfg: Dict[str, Any], signals: Any) -> float:
         pe = pb = roe = None
         market_risk = False
 
-    # 基础防守仓位：比旧版更克制。强多头才允许较高防守仓位，弱势/熊市不硬守。
-    base_map = {
-        "bear": 0.00,
-        "below_200": 0.03,
-        "sideways": 0.12,
-        "above_200": 0.22,
-        "strong_bull": 0.32,
-    }
+    # 长期底仓 + 交易仓：核心不是“等信号才买”，而是先建立基础暴露，
+    # 再用交易仓做增强。否则均衡/进攻档在上涨年份会长期低仓，连定投都跑不赢。
+    profile = core_asset_profile(cfg)
+    if profile:
+        base_map = {
+            "bear": 0.08,
+            "below_200": 0.18,
+            "sideways": 0.55,
+            "above_200": 0.68,
+            "strong_bull": 0.78,
+        }
+    else:
+        base_map = {
+            "bear": 0.00,
+            "below_200": 0.03,
+            "sideways": 0.18,
+            "above_200": 0.30,
+            "strong_bull": 0.42,
+        }
     floor = base_map.get(market_state, 0.12)
 
     pe_v: Optional[float] = None
     pb_v: Optional[float] = None
 
-    # 估值是防守仓位刹车：低估可以多留一点，高估会明显压低，但仍连续变化。
+    # 估值是“降速器”，不是长期底仓模式的清仓开关。
+    # 中高估会降低目标底仓，但不会让策略因为 79%~80% 这种边界长期只剩个位数仓位。
     if pe is not None:
         pe_v = clamp(as_float(pe), 0.0, 100.0)
-        floor += (50.0 - pe_v) / 100.0 * 0.12
-        if pe_v >= 80:
-            floor -= (pe_v - 80.0) / 20.0 * 0.08
+        if profile:
+            floor += (50.0 - pe_v) / 100.0 * 0.06
+            if pe_v >= 80:
+                floor -= (pe_v - 80.0) / 20.0 * 0.12
+        else:
+            floor += (50.0 - pe_v) / 100.0 * 0.12
+            if pe_v >= 80:
+                floor -= (pe_v - 80.0) / 20.0 * 0.08
     elif pb is not None:
         pb_v = clamp(as_float(pb), 0.0, 100.0)
-        floor += (50.0 - pb_v) / 100.0 * 0.08
+        floor += (50.0 - pb_v) / 100.0 * (0.05 if profile else 0.08)
         if pb_v >= 80:
-            floor -= (pb_v - 80.0) / 20.0 * 0.05
+            floor -= (pb_v - 80.0) / 20.0 * (0.08 if profile else 0.05)
 
     # ROE只做质量微调，不允许它覆盖趋势纪律。
     if roe is not None:
         roe_v = as_float(roe)
         floor += clamp((roe_v - 12.0) / 20.0, -0.04, 0.05)
 
-    # 系统性风险出现时，底仓进一步变成防守仓。
+    # 系统性风险出现时，底仓进一步变成防守仓；长期底仓模式降速，但不因单个风险标签直接清零。
     if market_risk:
-        floor *= 0.55
+        floor *= (0.68 if profile else 0.55)
 
-    # 风险事件对防守仓位设置硬上限：长期底仓不是信仰仓，行情坏时可以接近 0。
+    # 风险事件对防守仓位设置硬上限。长期底仓模式也会防守，但不会退化成纯交易仓。
+    if profile:
+        hard_caps = {
+            "bear": 0.16,
+            "below_200": 0.26,
+            "hit_stop": 0.18,
+            "below_50": 0.42,
+            "failed_breakout": 0.52,
+            "below_20": 0.60,
+        }
+    else:
+        hard_caps = {
+            "bear": 0.05,
+            "below_200": 0.10,
+            "hit_stop": 0.05,
+            "below_50": 0.15,
+            "failed_breakout": 0.20,
+            "below_20": 0.25,
+        }
+
     if market_state == "bear":
-        floor = min(floor, 0.05)
+        floor = min(floor, hard_caps["bear"])
     elif market_state == "below_200":
-        floor = min(floor, 0.10)
+        floor = min(floor, hard_caps["below_200"])
 
     if exit_state == "hit_stop":
-        floor = min(floor, 0.05)
-        if market_state in {"bear", "below_200"} or market_risk or (pe_v is not None and pe_v >= 80):
+        floor = min(floor, hard_caps["hit_stop"])
+        if not profile and (market_state in {"bear", "below_200"} or market_risk or (pe_v is not None and pe_v >= 80)):
             floor = 0.0
     elif exit_state == "below_200":
-        floor = min(floor, 0.08)
-        if market_risk or (pe_v is not None and pe_v >= 80):
+        floor = min(floor, hard_caps["below_200"])
+        if not profile and (market_risk or (pe_v is not None and pe_v >= 80)):
             floor = min(floor, 0.03)
     elif exit_state == "below_50":
-        floor = min(floor, 0.15)
+        floor = min(floor, hard_caps["below_50"])
     elif exit_state == "failed_breakout":
-        floor = min(floor, 0.20)
+        floor = min(floor, hard_caps["failed_breakout"])
     elif exit_state == "below_20":
-        floor = min(floor, 0.25)
+        floor = min(floor, hard_caps["below_20"])
 
-    return clamp(floor, 0.0, 0.45)
+    low, high = core_asset_floor_bounds(profile)
+    return clamp(floor, low, high)
 
 def parse_optional_pct(form: Dict[str, Any], key: str) -> Optional[float]:
     raw = form.get(key)
@@ -723,6 +853,57 @@ def buy_step_sensitivity(signals: Dict[str, Any]) -> Tuple[float, List[str]]:
     return clamp(mult, 0.12, 1.0), notes
 
 
+def core_allocation_step_limit(cfg: Dict[str, Any], signals: Dict[str, Any], strategy: Dict[str, Any]) -> Tuple[float, List[str]]:
+    """基础配置仓补足的单次买入上限。
+
+    基础配置仓不是一笔带止损的交易，所以不应被 risk_per_trade / stop_loss_pct
+    过度压低；否则核心宽基会长期低仓，实际跑输无脑定投。
+    """
+    notes: List[str] = []
+    profile = core_asset_profile(cfg)
+    strategy_key = str(cfg.get("strategy", "balanced"))
+    if profile:
+        # 底仓补足必须明显快于定投，否则上涨年份会被现金拖累。
+        # 防守/均衡/进攻分别约用 8/5/4 个检查周期补到 60%~70% 区间。
+        base_by_strategy = {"defensive": 0.10, "balanced": 0.18, "aggressive": 0.24}
+    else:
+        base_by_strategy = {"defensive": 0.05, "balanced": 0.08, "aggressive": 0.11}
+
+    step = base_by_strategy.get(strategy_key, base_by_strategy["balanced"])
+    market = str(signals.get("market_state", "sideways"))
+    if market == "strong_bull":
+        step *= 1.15
+    elif market == "above_200":
+        step *= 1.00
+    elif market == "sideways":
+        step *= (0.88 if profile else 0.75)
+    elif market == "below_200":
+        step *= (0.50 if profile else 0.45)
+    else:
+        step *= 0.25
+
+    pe = signals.get("pe_percentile")
+    if pe is not None:
+        pe_v = clamp(as_float(pe), 0.0, 100.0)
+        if pe_v >= 95:
+            step *= 0.45 if profile else 0.30
+        elif pe_v >= 90:
+            step *= 0.65 if profile else 0.40
+        elif pe_v >= 80:
+            step *= 0.85 if profile else 0.62
+        elif pe_v <= 30:
+            step *= 1.10
+
+    if signals.get("market_risk"):
+        step *= 0.55
+    if signals.get("far_from_ma"):
+        step *= 0.70
+
+    if signals.get("allocation_fill"):
+        label = "长期底仓" if profile else "基础配置"
+        notes.append(f"{label}补足按配置仓节奏执行，本次最多新增 {pct2(step)}，不按单笔交易止损预算过度压低。")
+    return clamp(step, 0.01, float(strategy.get("buy_step", 0.28))), notes
+
 
 
 def signal_quality_score(signals: Dict[str, Any], action: str) -> Tuple[int, List[str]]:
@@ -800,10 +981,17 @@ def signal_quality_score(signals: Dict[str, Any], action: str) -> Tuple[int, Lis
     buy_actions = {"试仓", "买入", "加仓", "重仓"}
     sell_actions = {"减仓", "大减仓", "止盈", "清仓"}
     if action in buy_actions:
-        score = market_score * 0.50 + entry_score * 0.38 + 50 * 0.12 + volume_adj + valuation_adj
-        if entry == "none":
-            score -= 25
-            notes.append("没有明确买点，信号质量不支持主动加仓。")
+        if signals.get("allocation_fill"):
+            # 基础配置仓补足不是短线买点，不按“没有入场信号”重罚；
+            # 但它也不能被当成高质量交易机会，只给中等信号质量。
+            entry_score = 52
+            score = market_score * 0.62 + entry_score * 0.26 + 50 * 0.12 + volume_adj * 0.5 + valuation_adj
+            notes.append("本次属于基础配置仓补足，不等同于交易买点，仓位应逐步提高而不是一次追满。")
+        else:
+            score = market_score * 0.50 + entry_score * 0.38 + 50 * 0.12 + volume_adj + valuation_adj
+            if entry == "none":
+                score -= 25
+                notes.append("没有明确买点，信号质量不支持主动加仓。")
         if market in {"bear", "below_200"} and entry != "reversal_50":
             score -= 12
         if score >= 75:
@@ -836,6 +1024,28 @@ def expected_reward_r(signals: Dict[str, Any], action: str) -> Tuple[float, str,
     buy_actions = {"试仓", "买入", "加仓", "重仓"}
     if action not in buy_actions:
         return 0.0, "--", notes
+
+    if signals.get("allocation_fill"):
+        # 基础配置仓补足不是赔率型交易，不要求突破/回踩买点；
+        # 但为了避免在明显无赔率的位置追高，只给温和的合格赔率。
+        market = signals.get("market_state", "sideways")
+        base = {"sideways": 1.15, "above_200": 1.45, "strong_bull": 1.65}.get(market, 1.10)
+        pe = signals.get("pe_percentile")
+        if pe is not None:
+            pe_v = clamp(as_float(pe), 0.0, 100.0)
+            if pe_v >= 95:
+                base -= 0.45
+            elif pe_v >= 90:
+                base -= 0.30
+            elif pe_v >= 80:
+                base -= 0.15
+            elif pe_v <= 30:
+                base += 0.10
+        r = clamp(base, 0.0, 2.0)
+        grade = "配置赔率合格" if r >= 1.2 else "配置赔率偏低"
+        if r < 1.0:
+            notes.append("基础配置仓补足的估算赔率不足，系统会暂停新增。")
+        return r, grade, notes
 
     entry = signals.get("entry_state", "none")
     market = signals.get("market_state", "sideways")
@@ -920,6 +1130,10 @@ def trade_frequency_profile(signals: Dict[str, Any], action: str) -> Tuple[str, 
 
     if action not in buy_actions:
         return "不操作 / 等待信号", 1.0, notes
+
+    if signals.get("allocation_fill"):
+        notes.append("基础配置仓补足按低频再平衡处理，避免频繁小额追买。")
+        return "低频基础配置补足", 0.78, notes
 
     if entry == "pullback_hold":
         return "低频优先买点", 1.0, notes
@@ -1089,7 +1303,25 @@ def raw_target_by_signal(cfg: Dict[str, Any], signals: Dict[str, Any], cur: floa
             reason.append("20日线失守，但当前仓位已经低于系统防守仓位，本次不追加卖出，也不因防守仓位差额买入。")
         return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
 
-    # 3. 大趋势不利时，不主动新增买入。
+    # 3. 长期底仓 + 交易仓：基础配置仓补足。
+    # 这不是“交易追买”，而是当趋势未坏、没有卖出信号、也没有明显追高风险时，
+    # 允许把极低仓位逐步补到动态防守仓位附近，避免宽基/核心资产长期只有个位数仓位。
+    if (
+        cfg.get("position_mode") == "core_satellite"
+        and exit_state == "none"
+        and market in {"sideways", "above_200", "strong_bull"}
+        and not signals.get("market_risk")
+        and floor > cur + 0.01
+    ):
+        signals["allocation_fill"] = True
+        action = "加仓"
+        target = floor
+        matched = "补足长期底仓"
+        confidence = 65 if market == "sideways" else 70
+        reason.append("长期底仓+交易仓模式下，只要趋势没有破坏且当前仓位低于动态底仓，就按检查周期持续补足底仓；入场形态、上影线、远离均线只影响补仓速度，不再直接阻断底仓建设。")
+        return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
+
+    # 4. 大趋势不利时，不主动新增买入。
     if market == "bear":
         action = "观望" if cur <= floor else "减仓"
         target = min(cur, floor)
@@ -1098,7 +1330,7 @@ def raw_target_by_signal(cfg: Dict[str, Any], signals: Dict[str, Any], cur: floa
         reason.append("价格在200日线下方且200日线向下，不做新增买入。")
         return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
 
-    # 4. 入场 / 加仓。不按标的类型设上限，统一以计划资金100%为上限。
+    # 5. 入场 / 加仓。不按标的类型设上限，统一以计划资金100%为上限。
     if market == "below_200":
         if entry == "reversal_50":
             action = "试仓"
@@ -1260,15 +1492,27 @@ def compute_decision(cfg: Dict[str, Any], form: Dict[str, Any]) -> Decision:
     elif q_notes and signals.get("roe_pct") is not None:
         warnings.append("ROE仅作为买入质量修正；当前不是新增仓位信号，因此不改变目标仓位。")
 
-    base_buy_step_limit = min(float(strategy["buy_step"]), r_cap)
+    is_allocation_fill = bool(signals.get("allocation_fill"))
+    if is_allocation_fill:
+        base_buy_step_limit, allocation_step_notes = core_allocation_step_limit(cfg, signals, strategy)
+        warnings.extend(allocation_step_notes)
+    else:
+        base_buy_step_limit = min(float(strategy["buy_step"]), r_cap)
     buy_step_limit = base_buy_step_limit
     if action in buy_actions:
         buy_mult, buy_mult_notes = buy_step_sensitivity(signals)
         opp_mult, opp_notes, reject_for_odds = buy_opportunity_multiplier(signal_quality, expected_r, frequency_mult)
-        buy_step_limit = base_buy_step_limit * buy_mult * opp_mult
-        if buy_mult < 0.999 and base_buy_step_limit > 0:
+        if is_allocation_fill:
+            # 底仓补足不是赔率型短线交易。它的核心目标是“比无脑定投更早建立长期暴露”，
+            # 因此不再被信号质量/赔率/频率二次打折；估值、趋势、风险降速已在
+            # core_allocation_step_limit 中完成。
+            buy_step_limit = base_buy_step_limit
+            reject_for_odds = False
+        else:
+            buy_step_limit = base_buy_step_limit * buy_mult * opp_mult
+        if buy_mult < 0.999 and base_buy_step_limit > 0 and not is_allocation_fill:
             warnings.extend(buy_mult_notes)
-        if opp_mult < 0.999 and base_buy_step_limit > 0:
+        if opp_mult < 0.999 and base_buy_step_limit > 0 and not is_allocation_fill:
             warnings.extend(opp_notes)
         if reject_for_odds:
             raw_target = cur
@@ -1278,7 +1522,7 @@ def compute_decision(cfg: Dict[str, Any], form: Dict[str, Any]) -> Decision:
 
     target = raw_target
     if action in {"试仓", "买入", "加仓", "重仓"}:
-        if r_cap <= 0:
+        if r_cap <= 0 and not is_allocation_fill:
             target = cur
             action = "观望" if cur <= 0 else "持有"
             confidence = min(confidence, 54)
@@ -1287,9 +1531,14 @@ def compute_decision(cfg: Dict[str, Any], form: Dict[str, Any]) -> Decision:
         else:
             limited = min(target, cur + buy_step_limit)
             if limited + 1e-9 < target:
-                warnings.append(
-                    f"仓位限制：按止损距离计算，本次最多新增 {pct2(buy_step_limit)}，目标由 {pct(target)} 限制为 {pct(limited)}。"
-                )
+                if is_allocation_fill:
+                    warnings.append(
+                        f"配置仓补足限制：本次最多新增 {pct2(buy_step_limit)}，目标由 {pct(target)} 限制为 {pct(limited)}。"
+                    )
+                else:
+                    warnings.append(
+                        f"仓位限制：按止损距离计算，本次最多新增 {pct2(buy_step_limit)}，目标由 {pct(target)} 限制为 {pct(limited)}。"
+                    )
             target = limited
     elif action in {"减仓", "大减仓", "止盈"}:
         limited = max(target, cur - sell_step_limit)
@@ -1481,6 +1730,66 @@ def _normalize_query(q: str) -> str:
     return re.sub(r"\s+", "", str(q or "").strip().lower())
 
 
+CN_A_SHARE_CODE_RE = re.compile(r"^(000|001|002|003|300|301|600|601|603|605|688|689|900)\d{3}$")
+CN_EXCHANGE_FUND_PREFIXES = ("15", "51", "52", "56", "58")
+CN_OPEN_FUND_PREFIXES = (
+    "00", "01", "02", "04", "05", "07", "08", "09", "10", "11", "12", "13", "14",
+    "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27",
+    "31", "32", "40", "48", "50", "53",
+)
+CN_FUND_NAME_HINTS = ("基金", "QDII", "联接", "LOF", "FOF", "增强", "指数")
+
+
+def guess_cn_asset_kind(symbol: str, symbol_name: str = "") -> str:
+    """根据 6 位国内代码和名称猜测标的类型。
+
+    017641 这类场外基金代码不会出现在股票 K 线接口里；旧逻辑只认 00/16/20/27/51/52/56/58，
+    会把 01 开头基金误判成 stock，进而走 Yahoo/东方财富股票 K 线。
+    """
+    raw = str(symbol or "").strip().upper()
+    digits = re.sub(r"\D", "", raw)
+    name = str(symbol_name or "").upper()
+    if not re.fullmatch(r"\d{6}", digits):
+        return "auto"
+    if raw in INDEX_CODE_MAP or digits in INDEX_CODE_MAP:
+        return "index"
+    if digits in FUND_INDEX_MAP:
+        return "etf" if digits.startswith(CN_EXCHANGE_FUND_PREFIXES) else "fund"
+    if digits.startswith(CN_EXCHANGE_FUND_PREFIXES):
+        return "etf"
+    if any(hint in name for hint in CN_FUND_NAME_HINTS):
+        return "etf" if digits.startswith(CN_EXCHANGE_FUND_PREFIXES) else "fund"
+    if CN_A_SHARE_CODE_RE.fullmatch(digits):
+        return "stock"
+    if digits.startswith(CN_OPEN_FUND_PREFIXES):
+        return "fund"
+    return "stock"
+
+
+def resolve_asset_kind(symbol: str, market: str, asset_kind: str = "auto", symbol_name: str = "") -> str:
+    """统一修正前端/旧配置传来的 asset_kind。
+
+    重点：如果旧配置里已把 017641 保存成 stock，也要在抓取和回测前自动改回 fund。
+    """
+    kind = str(asset_kind or "auto").strip().lower()
+    market_u = str(market or "auto").strip().upper()
+    guessed = guess_cn_asset_kind(symbol, symbol_name)
+    is_cn_code = bool(re.fullmatch(r"\d{6}", re.sub(r"\D", "", str(symbol or ""))))
+    if (market_u == "CN" or is_cn_code) and guessed != "auto":
+        if kind in {"", "auto"}:
+            return guessed
+        if kind == "stock" and guessed in {"fund", "etf", "index"}:
+            return guessed
+    return kind or "auto"
+
+
+def is_cn_open_fund_like(symbol: str, market: str, asset_kind: str = "", symbol_name: str = "") -> bool:
+    kind = resolve_asset_kind(symbol, market, asset_kind or "auto", symbol_name)
+    market_u = str(market or "auto").strip().upper()
+    is_cn_code = bool(re.fullmatch(r"\d{6}", re.sub(r"\D", "", str(symbol or ""))))
+    return kind in {"fund", "fof", "qdii", "fund_of_funds"} and (market_u == "CN" or is_cn_code)
+
+
 def local_symbol_search(query: str) -> List[Dict[str, str]]:
     q = _normalize_query(query)
     if not q:
@@ -1499,10 +1808,15 @@ def local_symbol_search(query: str) -> List[Dict[str, str]]:
     if re.fullmatch(r"[A-Z]{1,6}(\.[A-Z]{1,4})?", raw):
         results.insert(0, {"symbol": raw, "name": raw, "market": "US", "asset_kind": "stock", "source": "yfinance"})
     if re.fullmatch(r"\d{6}", raw):
-        market = "CN"
-        source = "akshare"
-        kind = "fund" if raw.startswith(("00", "16", "20", "27", "51", "52", "56", "58")) else "stock"
-        results.insert(0, {"symbol": raw, "name": raw, "market": market, "asset_kind": kind, "source": source})
+        known = next((item.copy() for item in LOCAL_SYMBOLS if str(item.get("symbol") or "").upper() == raw), None)
+        if known:
+            known["asset_kind"] = resolve_asset_kind(raw, known.get("market", "CN"), known.get("asset_kind", "auto"), known.get("name", ""))
+            results.insert(0, known)
+        else:
+            market = "CN"
+            source = "akshare"
+            kind = guess_cn_asset_kind(raw)
+            results.insert(0, {"symbol": raw, "name": raw, "market": market, "asset_kind": kind, "source": source})
 
     # 去重
     seen = set()
@@ -1587,11 +1901,61 @@ def search_akshare(query: str) -> List[Dict[str, str]]:
     return results[:10]
 
 
-def dedupe_symbols(items: List[Dict[str, str]]) -> List[Dict[str, str]]:
+def is_placeholder_symbol_candidate(item: Dict[str, str]) -> bool:
+    """判断搜索结果是不是“只按代码猜出来”的占位候选。
+
+    例如直接输入 001422 时，本地兜底旧逻辑会先造出
+    {symbol: 001422, name: 001422, asset_kind: stock}，但在线基金列表随后能返回
+    “景顺长城安享回报混合A”。这种占位项不应该显示在真正命名结果前面，
+    否则用户会误点成股票。
+    """
+    symbol = str(item.get("symbol") or "").strip().upper()
+    name = str(item.get("name") or "").strip().upper()
+    return not name or bool(symbol and name == symbol)
+
+
+def symbol_result_rank(item: Dict[str, str], exact_query: str = "") -> Tuple[int, int, int, str]:
+    symbol = str(item.get("symbol") or "").strip().upper()
+    source = str(item.get("source") or "").strip().lower()
+    kind = str(item.get("asset_kind") or "").strip().lower()
+    exact_score = 0 if exact_query and symbol == exact_query else 1
+    placeholder_score = 1 if is_placeholder_symbol_candidate(item) else 0
+    # 精确代码搜索时，基金/ETF/指数优先于股票占位项；真实有名称的股票仍会保留。
+    kind_order = {"fund": 0, "fof": 0, "qdii": 0, "etf": 1, "index": 2, "stock": 3, "auto": 4}.get(kind, 5)
+    source_order = {"akshare": 0, "danjuan": 1, "eastmoney": 2, "yfinance": 3}.get(source, 4)
+    return (exact_score, placeholder_score, kind_order + source_order, symbol)
+
+
+def dedupe_symbols(items: List[Dict[str, str]], query: str = "") -> List[Dict[str, str]]:
+    exact_query = str(query or "").strip().upper()
+
+    normalized: List[Dict[str, str]] = []
+    for raw in items:
+        item = dict(raw or {})
+        symbol = str(item.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        item["symbol"] = symbol
+        item["name"] = str(item.get("name") or symbol).strip()
+        item["market"] = str(item.get("market") or ("CN" if re.fullmatch(r"\d{6}", symbol) else "US")).strip().upper()
+        item["asset_kind"] = resolve_asset_kind(symbol, item.get("market", ""), item.get("asset_kind", "auto"), item.get("name", ""))
+        item["source"] = str(item.get("source") or "auto").strip()
+        normalized.append(item)
+
+    # 如果同一个代码已经有真实名称结果，删除 name == symbol 的占位结果。
+    symbols_with_named_result = {
+        str(item.get("symbol") or "").upper()
+        for item in normalized
+        if not is_placeholder_symbol_candidate(item)
+    }
+
     seen = set()
-    out = []
-    for item in items:
-        key = (item.get("symbol"), item.get("market"), item.get("asset_kind"), item.get("source"))
+    out: List[Dict[str, str]] = []
+    for item in sorted(normalized, key=lambda x: symbol_result_rank(x, exact_query)):
+        symbol = str(item.get("symbol") or "").upper()
+        if symbol in symbols_with_named_result and is_placeholder_symbol_candidate(item):
+            continue
+        key = (symbol, item.get("market"), item.get("asset_kind"), item.get("source"), item.get("name"))
         if key in seen:
             continue
         seen.add(key)
@@ -1828,6 +2192,147 @@ def fetch_eastmoney_kline(symbol: str, options: FetchOptions) -> Tuple[List[Dict
             last_error = str(e)
             continue
     raise RuntimeError(last_error or "东方财富K线获取失败")
+
+
+def fetch_danjuan_fund_detail(symbol: str, options: Optional[FetchOptions] = None) -> Dict[str, Any]:
+    """蛋卷/雪球基金详情：用于校验 017641 这类场外基金身份，并补充基金名称/净值/规模等信息。"""
+    import requests  # type: ignore
+
+    options = options or FetchOptions()
+    code = re.sub(r"\D", "", str(symbol or ""))
+    if not re.fullmatch(r"\d{6}", code):
+        raise ValueError("蛋卷基金详情仅支持 6 位基金代码")
+    url = f"https://danjuanfunds.com/djapi/fund/{code}"
+    headers = _danjuan_headers(options)
+    headers["Accept"] = "application/json, text/plain, */*"
+    headers["Referer"] = f"https://danjuanfunds.com/fund/{code}"
+    resp = requests.get(url, headers=headers, timeout=options.timeout, proxies=request_proxies(options))
+    text = resp.text or ""
+    resp.raise_for_status()
+    try:
+        payload = resp.json()
+    except Exception as e:
+        raise ValueError(f"蛋卷基金详情返回不是 JSON：{e}; preview={text[:180]}")
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict) or not data.get("fd_code"):
+        raise ValueError(f"蛋卷未识别该基金代码：{code}")
+    return data
+
+
+def danjuan_fund_fundamentals(symbol: str, options: Optional[FetchOptions] = None) -> Dict[str, Any]:
+    data = fetch_danjuan_fund_detail(symbol, options)
+    derived = data.get("fund_derived") or {}
+    fundamentals: Dict[str, Any] = {
+        "long_name": data.get("fd_name") or data.get("fd_full_name") or symbol,
+        "fund_full_name": data.get("fd_full_name"),
+        "fund_type": data.get("type_desc"),
+        "fund_manager": data.get("manager_name"),
+        "fund_size": data.get("totshare"),
+        "latest_nav": _normalise_number(derived.get("unit_nav")),
+        "latest_nav_date": derived.get("end_date"),
+        "nav_growth_day_pct": _normalise_number(derived.get("nav_grtd")),
+        "nav_growth_1y_pct": _normalise_number(derived.get("nav_grl1y")),
+        "nav_growth_base_pct": _normalise_number(derived.get("nav_grbase")),
+        "fund_source": "danjuan_fund_detail",
+    }
+    for item in data.get("sec_header_base_data") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("data_name") == "最大回撤" and item.get("data_value_number") is not None:
+            fundamentals["max_drawdown"] = item.get("data_value_number")
+    return {k: v for k, v in fundamentals.items() if v is not None and v != ""}
+
+
+def _danjuan_nav_items_to_records(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        d = item.get("date") or item.get("FSRQ") or item.get("净值日期")
+        nav = item.get("nav") or item.get("value") or item.get("DWJZ") or item.get("单位净值")
+        try:
+            ds = parse_date_safe(d).isoformat()
+            close = as_float(nav, 0.0)
+            if close <= 0:
+                continue
+            records.append({"date": ds, "open": close, "high": close, "low": close, "close": close, "volume": 0.0})
+        except Exception:
+            continue
+    return normalize_history_records(records)
+
+
+def backtest_fetch_danjuan_fund_nav(symbol: str, start: date, end: date, options: FetchOptions) -> Tuple[List[Dict[str, Any]], str]:
+    """蛋卷/雪球基金历史净值分页接口。
+
+    /djapi/fund/nav/history/{code} 返回的是场外基金净值，不是股票 K 线；
+    回测时用净值同步填充 OHLC，volume=0。
+    """
+    import requests  # type: ignore
+
+    code = re.sub(r"\D", "", str(symbol or ""))
+    if not re.fullmatch(r"\d{6}", code):
+        raise RuntimeError("蛋卷基金历史净值仅支持 6 位基金代码")
+    headers = _danjuan_headers(options)
+    headers["Accept"] = "application/json, text/plain, */*"
+    headers["Referer"] = f"https://danjuanfunds.com/fund/{code}"
+    all_items: List[Dict[str, Any]] = []
+    seen_dates: set = set()
+    total_pages: Optional[int] = None
+    url = f"https://danjuanfunds.com/djapi/fund/nav/history/{code}"
+    for page in range(1, 501):
+        params = {"page": page, "size": 20}
+        resp = requests.get(url, params=params, headers=headers, timeout=options.timeout, proxies=request_proxies(options))
+        text = resp.text or ""
+        resp.raise_for_status()
+        try:
+            payload = resp.json()
+        except Exception as e:
+            raise RuntimeError(f"蛋卷基金历史净值返回不是 JSON：{e}; preview={text[:180]}")
+        data = payload.get("data") if isinstance(payload, dict) else None
+        data = data or {}
+        items = data.get("items") or []
+        if not items:
+            break
+        try:
+            total_pages = int(data.get("total_pages") or total_pages or 0) or total_pages
+        except Exception:
+            pass
+        page_new = 0
+        oldest: Optional[date] = None
+        for item in items:
+            try:
+                dd = parse_date_safe(item.get("date") or item.get("FSRQ") or item.get("净值日期"))
+            except Exception:
+                continue
+            oldest = dd if oldest is None else min(oldest, dd)
+            if dd > end:
+                continue
+            key = dd.isoformat()
+            if key in seen_dates:
+                continue
+            seen_dates.add(key)
+            page_new += 1
+            if dd >= start:
+                all_items.append(item)
+        if total_pages and page >= total_pages:
+            break
+        if oldest is not None and oldest < start:
+            break
+        if page_new <= 0 and page > 1:
+            break
+    records = _danjuan_nav_items_to_records(all_items)
+    if not records:
+        raise RuntimeError("蛋卷基金历史净值返回空数据")
+    return records, "danjuan_fund_nav"
+
+
+def fetch_danjuan_fund_nav_recent(symbol: str, options: Optional[FetchOptions] = None) -> Tuple[List[Dict[str, float]], Dict[str, Any]]:
+    options = options or FetchOptions()
+    end = date.today()
+    start = end - timedelta(days=1100)
+    records, _ = backtest_fetch_danjuan_fund_nav(symbol, start, end, options)
+    fundamentals = danjuan_fund_fundamentals(symbol, options)
+    return records[-260:], fundamentals
 
 
 def yfinance_download_with_fallback(yf: Any, symbol: str, options: FetchOptions) -> Any:
@@ -2861,67 +3366,101 @@ def _normalise_number(value: Any) -> Optional[float]:
         return None
 
 
-def _walk_json(obj: Any, path: str = ""):
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            key = str(k)
-            next_path = f"{path}.{key}" if path else key
-            yield next_path, key, v
-            yield from _walk_json(v, next_path)
-    elif isinstance(obj, list):
-        for i, v in enumerate(obj):
-            next_path = f"{path}[{i}]"
-            yield from _walk_json(v, next_path)
+def _json_get_path(payload: Any, path: Tuple[str, ...]) -> Any:
+    cur = payload
+    for part in path:
+        if not isinstance(cur, dict) or part not in cur:
+            return None
+        cur = cur.get(part)
+    return cur
+
+
+DANJUAN_DETAIL_VALUATION_PATHS: Dict[str, Tuple[Tuple[str, ...], ...]] = {
+    # 蛋卷 detail 接口优先读 data.index_eva，避免递归扫描时被图表、同类指数、说明项等嵌套字段带偏。
+    "pe_percentile": (
+        ("data", "index_eva", "pe_percentile"),
+        ("data", "index_eva", "pe_percent"),
+        ("data", "index_eva", "pe_ttm_percentile"),
+        ("data", "index_eva", "pe_percentile_ttm"),
+        ("data", "pe_percentile"),
+        ("data", "pe_percent"),
+    ),
+    "pb_percentile": (
+        ("data", "index_eva", "pb_percentile"),
+        ("data", "index_eva", "pb_percent"),
+        ("data", "pb_percentile"),
+        ("data", "pb_percent"),
+    ),
+    "current_pe": (
+        ("data", "index_eva", "pe"),
+        ("data", "index_eva", "pe_ttm"),
+        ("data", "pe"),
+        ("data", "pe_ttm"),
+    ),
+    "current_pb": (
+        ("data", "index_eva", "pb"),
+        ("data", "index_eva", "pb_lf"),
+        ("data", "pb"),
+        ("data", "pb_lf"),
+    ),
+    "roe_pct": (
+        ("data", "index_eva", "roe"),
+        ("data", "index_eva", "roe_pct"),
+        ("data", "roe"),
+        ("data", "roe_pct"),
+    ),
+}
+
+
+def _first_json_path_value(payload: Any, paths: Tuple[Tuple[str, ...], ...]) -> Any:
+    for path in paths:
+        value = _json_get_path(payload, path)
+        if value is not None and value != "":
+            return value
+    return None
 
 
 def _extract_valuation_from_json(payload: Any, source: str) -> Dict[str, Any]:
-    """尽量兼容不同估值 JSON 字段名。不会伪造缺失的百分位。"""
+    """按蛋卷 detail 的显式 JSON Path 提取估值字段。
+
+    旧版会递归扫描整个 JSON，兼容性强但有误取风险：如果返回体里同时带有
+    图表、同类指数、历史序列或说明字段，可能先命中无关的 PE/PB/ROE。
+    这里只允许白名单路径，优先 data.index_eva，缺失时才尝试 data 顶层兼容路径。
+    """
     result: Dict[str, Any] = {"valuation_source": source, "valuation_note": "--"}
 
-    pe_pct_keys = ("pe_percentile", "pe_percent", "pepercentile", "pe_percentile_ttm", "pe_ttm_percentile", "pe分位", "pe百分位")
-    pb_pct_keys = ("pb_percentile", "pb_percent", "pbpercentile", "pb分位", "pb百分位")
-    pe_keys = ("pe", "pe_ttm", "pettm", "pe_value", "pevalue")
-    pb_keys = ("pb", "pb_value", "pbvalue")
-    roe_keys = ("roe", "roe_pct", "roepercent", "净资产收益率")
+    raw_pe_pct = _first_json_path_value(payload, DANJUAN_DETAIL_VALUATION_PATHS["pe_percentile"])
+    raw_pb_pct = _first_json_path_value(payload, DANJUAN_DETAIL_VALUATION_PATHS["pb_percentile"])
+    raw_pe = _first_json_path_value(payload, DANJUAN_DETAIL_VALUATION_PATHS["current_pe"])
+    raw_pb = _first_json_path_value(payload, DANJUAN_DETAIL_VALUATION_PATHS["current_pb"])
+    raw_roe = _first_json_path_value(payload, DANJUAN_DETAIL_VALUATION_PATHS["roe_pct"])
 
-    def key_text(path: str, key: str) -> str:
-        return (path + "." + key).lower().replace("-", "_")
+    pe_pct = _normalise_percent(raw_pe_pct)
+    if pe_pct is not None:
+        result["pe_percentile"] = pe_pct
 
-    for path, key, value in _walk_json(payload):
-        if isinstance(value, (dict, list)):
-            continue
-        kt = key_text(path, key)
-        k_low = str(key).lower().replace("-", "_")
-        if result.get("pe_percentile") is None and any(x in kt for x in pe_pct_keys):
-            v = _normalise_percent(value)
-            if v is not None:
-                result["pe_percentile"] = v
-                continue
-        if result.get("pb_percentile") is None and any(x in kt for x in pb_pct_keys):
-            v = _normalise_percent(value)
-            if v is not None:
-                result["pb_percentile"] = v
-                continue
-        if result.get("current_pe") is None and any(k_low == x or kt.endswith("." + x) for x in pe_keys) and "percent" not in kt and "分位" not in kt:
-            v = _normalise_number(value)
-            if v is not None and v > 0:
-                result["current_pe"] = v
-                continue
-        if result.get("current_pb") is None and any(k_low == x or kt.endswith("." + x) for x in pb_keys) and "percent" not in kt and "分位" not in kt:
-            v = _normalise_number(value)
-            if v is not None and v > 0:
-                result["current_pb"] = v
-                continue
-        if result.get("roe_pct") is None and any(x in kt for x in roe_keys):
-            v = _normalise_number(value)
-            if v is not None:
-                # 有些接口用 0.18 表示 18%，有些直接用 18。
-                if -1 <= v <= 1 and v != 0:
-                    v *= 100
-                result["roe_pct"] = round(v, 4)
-                continue
+    pb_pct = _normalise_percent(raw_pb_pct)
+    if pb_pct is not None:
+        result["pb_percentile"] = pb_pct
+
+    pe = _normalise_number(raw_pe)
+    if pe is not None and pe > 0:
+        result["current_pe"] = pe
+
+    pb = _normalise_number(raw_pb)
+    if pb is not None and pb > 0:
+        result["current_pb"] = pb
+
+    roe = _normalise_number(raw_roe)
+    if roe is not None:
+        # 有些接口用 0.18 表示 18%，有些直接用 18。
+        if -1 <= roe <= 1 and roe != 0:
+            roe *= 100
+        result["roe_pct"] = round(roe, 4)
+
     if not any(result.get(k) is not None for k in ("pe_percentile", "pb_percentile", "roe_pct", "current_pe", "current_pb")):
-        raise ValueError("蛋卷 JSON 未解析到估值字段")
+        tried = [".".join(path) for paths in DANJUAN_DETAIL_VALUATION_PATHS.values() for path in paths]
+        raise ValueError("蛋卷 JSON 未在显式路径中解析到估值字段；已尝试：" + ", ".join(tried[:12]))
     return result
 
 
@@ -3342,7 +3881,8 @@ def fetch_market_data(symbol: str, market: str, asset_kind: str, source: str, cf
     options = fetch_options_from_cfg(cfg)
     source = str(source or "auto").lower()
     market = str(market or "auto").upper()
-    asset_kind = str(asset_kind or "auto").lower()
+    asset_kind = resolve_asset_kind(symbol, market, asset_kind, str(cfg.get("symbol_name") or ""))
+    is_cn_fund = is_cn_open_fund_like(symbol, market, asset_kind, str(cfg.get("symbol_name") or ""))
     trace_all: List[Dict[str, Any]] = []
     candidates: List[Tuple[str, Callable[[], Tuple[List[Dict[str, float]], Dict[str, Any]]]]] = []
 
@@ -3350,19 +3890,22 @@ def fetch_market_data(symbol: str, market: str, asset_kind: str, source: str, cf
         if label not in [x[0] for x in candidates]:
             candidates.append((label, fn))
 
+    if source in {"auto", "akshare", "fund", "danjuan"} and is_cn_fund:
+        add("danjuan_fund_nav", lambda: fetch_danjuan_fund_nav_recent(symbol, options))
+
     if source in {"auto", "akshare"} and (market == "CN" or re.fullmatch(r"\d{6}", symbol)):
         add("akshare", lambda: fetch_akshare(symbol, asset_kind, options))
 
-    # 国内行情 HTTP 兜底：AKShare 失败时，直接走东方财富 K 线接口。
-    if source in {"auto", "akshare", "eastmoney"} and (market == "CN" or re.fullmatch(r"\d{6}", symbol)):
+    # 国内行情 HTTP 兜底：AKShare 失败时，直接走东方财富 K 线接口；场外基金不走股票K线。
+    if source in {"auto", "akshare", "eastmoney"} and not is_cn_fund and (market == "CN" or re.fullmatch(r"\d{6}", symbol)):
         add("eastmoney_kline", lambda: fetch_eastmoney_kline(symbol, options))
 
-    if source in {"auto", "yfinance"}:
+    if source in {"auto", "yfinance"} and not is_cn_fund:
         for ys in yahoo_symbol_candidates(symbol, market, asset_kind):
             add(f"yfinance:{ys}", lambda ys=ys: fetch_yfinance(ys, options))
 
-    # Yahoo Chart API 是 yfinance 的轻量备用链路，常用于 yfinance 间歇失败时兜底。
-    if source in {"auto", "yfinance", "yahoo"}:
+    # Yahoo Chart API 是 yfinance 的轻量备用链路，常用于 yfinance 间歇失败时兜底；场外基金不走 Yahoo。
+    if source in {"auto", "yfinance", "yahoo"} and not is_cn_fund:
         for ys in yahoo_symbol_candidates(symbol, market, asset_kind):
             add(f"yahoo_chart:{ys}", lambda ys=ys: fetch_yahoo_chart_api(ys, options))
 
@@ -3370,8 +3913,8 @@ def fetch_market_data(symbol: str, market: str, asset_kind: str, source: str, cf
     if market != "CN" and source in {"auto", "yfinance", "stooq"}:
         add(f"stooq:{symbol}", lambda: fetch_stooq_daily(symbol, options))
 
-    # 用户强制 akshare 但国内链路全挂时，仍尝试 Yahoo 后缀兜底。
-    if source == "akshare":
+    # 用户强制 akshare 但国内股票/ETF链路全挂时，仍尝试 Yahoo 后缀兜底；场外基金不走 Yahoo。
+    if source == "akshare" and not is_cn_fund:
         for ys in yahoo_symbol_candidates(symbol, market, asset_kind):
             add(f"yahoo_chart:{ys}", lambda ys=ys: fetch_yahoo_chart_api(ys, options))
 
@@ -3561,11 +4104,21 @@ def enrich_indicators_with_user_position(indicators: Dict[str, Any], cfg: Dict[s
 
     # 自动触发【初始止损】的唯一量化条件：
     # 有持仓，并且当前持仓盈亏已经跌穿买入前设定的止损距离。
+    # 但核心宽基的 core_satellite 模式不把底仓当作一笔短线交易来硬清仓；
+    # 初始止损只压低交易增强仓，底仓由均线/系统风险逐步降速。
     if current_amount > 0 and stop_pct > 0 and profit_pct <= -stop_pct:
-        indicators["exit_state"] = "hit_stop"
-        indicators["stop_triggered_auto"] = True
+        if core_asset_profile(cfg):
+            if indicators.get("exit_state") == "none":
+                indicators["exit_state"] = "below_50"
+            indicators["stop_triggered_auto"] = True
+            indicators["core_stop_softened"] = True
+        else:
+            indicators["exit_state"] = "hit_stop"
+            indicators["stop_triggered_auto"] = True
+            indicators["core_stop_softened"] = False
     else:
         indicators["stop_triggered_auto"] = False
+        indicators["core_stop_softened"] = False
 
     return indicators
 
@@ -3604,6 +4157,7 @@ def run_connection_tests(cfg: Dict[str, Any], symbol: str = "", market: str = ""
     raw_kind = str(asset_kind or cfg.get("asset_kind") or "stock").lower()
     if raw_market == "AUTO":
         raw_market = "CN" if re.fullmatch(r"\d{6}", raw_symbol) else "US"
+    raw_kind = resolve_asset_kind(raw_symbol, raw_market, raw_kind, str(cfg.get("symbol_name") or ""))
     yahoo_symbol = (yahoo_symbol_candidates(raw_symbol, raw_market, raw_kind) or ["NVDA"])[0]
     danjuan_code = _norm_index_code(raw_symbol, raw_kind, str(cfg.get("symbol_name") or "")) or "SH000300"
 
@@ -3763,12 +4317,25 @@ def run_connection_tests(cfg: Dict[str, Any], symbol: str = "", market: str = ""
 BACKTEST_METRIC_NOTES: Dict[str, str] = {
     "策略总收益": "期末策略权益相对初始资金的收益。",
     "买入持有总收益": "从回测起点全仓买入并持有到最后的收益，用作基准。",
+    "定投策略总收益": "按回测操作周期把100%计划资金均分后定额买入，并持有到期末的收益。",
     "策略年化收益": "把策略总收益折算成年化结果。",
+    "定投策略年化收益": "把定投策略总收益折算成年化结果。",
     "买入持有年化收益": "买入持有基准的年化结果。",
     "策略最大回撤": "策略权益从阶段高点到之后低点的最大跌幅。",
+    "定投策略最大回撤": "定投基准权益从阶段高点到之后低点的最大跌幅。",
     "买入持有最大回撤": "买入持有基准的最大回撤。",
+    "标的核心得分": "按长期资产质量、估值安全边际、风险与回撤、收益质量、产品与交易可用性综合评估这只股票/基金是否适合作为长期核心资产。",
+    "系统策略得分": "按年化超额收益、最大回撤控制、卡玛比率、夏普比率、执行质量综合评估系统策略表现。",
+    "定投策略得分": "按年化超额收益、最大回撤控制、卡玛比率、夏普比率、执行质量综合评估定投基准表现。",
+    "持有策略得分": "按年化超额收益、最大回撤控制、卡玛比率、夏普比率、执行质量综合评估一次性买入持有基准表现。",
+    "卡玛比率": "（策略年化收益 - 无风险收益率）/ 策略最大回撤绝对值，越高表示单位回撤换来的超额收益越高。",
+    "定投策略卡玛比率": "（定投策略年化收益 - 无风险收益率）/ 定投策略最大回撤绝对值，用作定投基准的风险收益比。",
+    "持有策略卡玛比率": "（买入持有年化收益 - 无风险收益率）/ 买入持有最大回撤绝对值，用作买入持有基准的风险收益比。",
+    "无风险收益率": "用于夏普比率和卡玛比率的年化无风险收益率；默认 2%，可在设置页调整。",
     "年化波动": "日收益波动率年化。",
-    "夏普比率": "暂按无风险利率为 0 计算。",
+    "夏普比率": "按日收益序列计算年化超额收益 / 年化波动率，已扣除无风险收益率。",
+    "定投策略夏普比率": "定投基准的年化超额收益 / 年化波动率，已扣除无风险收益率。",
+    "持有策略夏普比率": "买入持有基准的年化超额收益 / 年化波动率，已扣除无风险收益率。",
     "交易次数": "回测期间实际执行的买入和卖出次数。",
     "已实现胜率": "只按卖出时已实现盈亏统计，未平仓浮盈浮亏不计入。",
     "盈亏因子": "已实现盈利总额 / 已实现亏损总额绝对值。",
@@ -3923,6 +4490,221 @@ def backtest_fetch_eastmoney(symbol: str, start: date, end: date, options: Fetch
     raise RuntimeError(last_error or "东方财富历史K线失败")
 
 
+
+
+def _strip_html_text(text: str) -> str:
+    """把天天基金 F10DataApi 返回的 HTML 单元格转成纯文本。"""
+    cleaned = re.sub(r"<[^>]+>", "", str(text or ""))
+    return html_lib.unescape(cleaned).strip()
+
+
+def backtest_fetch_eastmoney_fund_nav(symbol: str, start: date, end: date, options: FetchOptions) -> Tuple[List[Dict[str, Any]], str]:
+    """天天基金历史净值：用于场外基金 / ETF联接 / QDII基金回测。
+
+    这类标的没有股票K线意义上的 open/high/low/volume，回测中用单位净值作为 close，
+    open/high/low 同步设为 close，volume 设为 0。这样能回测趋势/仓位逻辑，但量价辅助会自然弱化。
+
+    v58 修复点：东方财富历史净值接口经常把 pageSize 限制为 20。如果请求 pageSize=200，
+    旧代码会误以为“20 < 200 = 最后一页”，导致只抓第一页。这里统一按 20 条分页，并持续
+    翻页到空页/重复页/超过页数为止；同时增加 TiantianFundApi 的 fundMNHisNetList 兜底。
+    """
+    import requests  # type: ignore
+
+    code = re.sub(r"\D", "", str(symbol or ""))
+    if not re.fullmatch(r"\d{6}", code):
+        raise RuntimeError("天天基金历史净值仅支持 6 位基金代码")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept": "application/json,text/javascript,*/*;q=0.01",
+        "Referer": f"https://fundf10.eastmoney.com/jjjz_{code}.html",
+        "Connection": "keep-alive",
+    }
+
+    def nav_to_records(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        records: List[Dict[str, Any]] = []
+        seen_dates = set()
+        for item in items:
+            d = item.get("FSRQ") or item.get("净值日期") or item.get("date")
+            nav = item.get("DWJZ") or item.get("单位净值") or item.get("LJJZ") or item.get("累计净值") or item.get("close")
+            try:
+                ds = parse_date_safe(d).isoformat()
+                if ds in seen_dates:
+                    continue
+                close = as_float(nav, 0.0)
+                if close <= 0:
+                    continue
+                seen_dates.add(ds)
+                records.append({"date": ds, "open": close, "high": close, "low": close, "close": close, "volume": 0.0})
+            except Exception:
+                continue
+        return normalize_history_records(records)
+
+    def should_continue_by_dates(items: List[Dict[str, Any]], seen_dates: set) -> Tuple[bool, int]:
+        """返回 (是否继续翻页, 新增日期数量)。接口通常按日期倒序返回。"""
+        new_count = 0
+        oldest = None
+        for item in items:
+            d = item.get("FSRQ") or item.get("净值日期") or item.get("date")
+            try:
+                dd = parse_date_safe(d)
+                oldest = dd if oldest is None else min(oldest, dd)
+                if dd.isoformat() not in seen_dates:
+                    new_count += 1
+                    seen_dates.add(dd.isoformat())
+            except Exception:
+                continue
+        # 如果接口没有严格按日期过滤，翻到早于预热起点即可停止；否则继续直到空页/重复页。
+        if oldest is not None and oldest < start:
+            return False, new_count
+        return new_count > 0, new_count
+
+    errors: List[str] = []
+
+    # 1) 东方财富 JSON 接口：分页拉取历史净值。
+    # 注意：该接口常把 pageSize 限制为 20，不能用 len(items) < page_size 判断结束。
+    try:
+        url = "https://api.fund.eastmoney.com/f10/lsjz"
+        all_items: List[Dict[str, Any]] = []
+        page_size = 20
+        page_count = None
+        seen_dates: set = set()
+        for page in range(1, 501):
+            params = {
+                "fundCode": code,
+                "pageIndex": page,
+                "pageSize": page_size,
+                "startDate": start.isoformat(),
+                "endDate": end.isoformat(),
+            }
+            resp = requests.get(url, params=params, headers=headers, timeout=options.timeout, proxies=request_proxies(options))
+            resp.raise_for_status()
+            payload = resp.json()
+            data = payload.get("Data") if isinstance(payload, dict) else None
+            data = data or {}
+            items = data.get("LSJZList") or []
+            if page_count is None:
+                for key in ("PageCount", "Pages", "TotalPage"):
+                    try:
+                        if data.get(key):
+                            page_count = int(data.get(key))
+                            break
+                    except Exception:
+                        pass
+            if not items:
+                break
+            all_items.extend(items)
+            if page_count and page >= page_count:
+                break
+            keep_going, new_count = should_continue_by_dates(items, seen_dates)
+            if not keep_going:
+                break
+        records = nav_to_records(all_items)
+        if records:
+            return records, "eastmoney_fund_nav"
+        errors.append(f"api.fund.eastmoney.com 返回空净值 rows={len(all_items)}")
+    except Exception as exc:
+        errors.append(f"api.fund.eastmoney.com 失败：{str(exc)[:180]}")
+
+    # 2) 老 F10DataApi 接口：返回 JS/HTML，分页兜底。
+    try:
+        url = "https://fundf10.eastmoney.com/F10DataApi.aspx"
+        rows: List[Dict[str, Any]] = []
+        page_count = None
+        per = 20
+        seen_dates: set = set()
+        for page in range(1, 501):
+            params = {
+                "type": "lsjz",
+                "code": code,
+                "page": page,
+                "per": per,
+                "sdate": start.isoformat(),
+                "edate": end.isoformat(),
+            }
+            resp = requests.get(url, params=params, headers=headers, timeout=options.timeout, proxies=request_proxies(options))
+            resp.raise_for_status()
+            text = resp.text or ""
+            if page_count is None:
+                m = re.search(r"pages\s*[:=]\s*(\d+)", text, flags=re.I)
+                if m:
+                    try:
+                        page_count = int(m.group(1))
+                    except Exception:
+                        page_count = None
+            page_items: List[Dict[str, Any]] = []
+            for row_html in re.findall(r"<tr[^>]*>(.*?)</tr>", text, flags=re.I | re.S):
+                cells = re.findall(r"<td[^>]*>(.*?)</td>", row_html, flags=re.I | re.S)
+                if len(cells) < 2:
+                    continue
+                d = _strip_html_text(cells[0])
+                nav = _strip_html_text(cells[1])
+                if re.match(r"\d{4}-\d{2}-\d{2}", d):
+                    page_items.append({"FSRQ": d, "DWJZ": nav})
+            if not page_items:
+                break
+            rows.extend(page_items)
+            if page_count and page >= page_count:
+                break
+            keep_going, new_count = should_continue_by_dates(page_items, seen_dates)
+            if not keep_going:
+                break
+        records = nav_to_records(rows)
+        if records:
+            return records, "eastmoney_fund_nav_f10"
+        errors.append(f"fundf10 F10DataApi 未解析到净值 rows={len(rows)}")
+    except Exception as exc:
+        errors.append(f"fundf10 F10DataApi 失败：{str(exc)[:180]}")
+
+    # 3) TiantianFundApi 文档中的 fundMNHisNetList 路由兜底。
+    # 这是第三方封装服务，优先级低于东方财富原始接口；主要用于排查/兜底场外基金净值分页问题。
+    try:
+        url = "https://tiantian-fund-api.vercel.app/api/action"
+        all_items: List[Dict[str, Any]] = []
+        seen_dates: set = set()
+        page_size = 30
+        for page in range(1, 501):
+            params = {
+                "action_name": "fundMNHisNetList",
+                "FCODE": code,
+                "pageIndex": page,
+                "pagesize": page_size,
+            }
+            resp = requests.get(url, params=params, headers={**headers, "Referer": "https://kouchao.github.io/TiantianFundApi/apis/"}, timeout=options.timeout, proxies=request_proxies(options))
+            resp.raise_for_status()
+            payload = resp.json()
+            items = []
+            if isinstance(payload, dict):
+                items = payload.get("Datas") or payload.get("data") or payload.get("Data") or []
+                if isinstance(items, dict):
+                    items = items.get("Datas") or items.get("LSJZList") or []
+            if not items:
+                break
+            # 文档接口未必支持日期过滤，因此这里手动截取日期范围。
+            filtered: List[Dict[str, Any]] = []
+            for item in items:
+                try:
+                    dd = parse_date_safe(item.get("FSRQ") or item.get("date"))
+                    if dd <= end:
+                        filtered.append(item)
+                except Exception:
+                    continue
+            all_items.extend(filtered)
+            keep_going, new_count = should_continue_by_dates(filtered or items, seen_dates)
+            if not keep_going:
+                break
+        records = [r for r in nav_to_records(all_items) if start <= parse_date_safe(r["date"]) <= end]
+        # 这里不要只返回过滤后的 start/end；回测预热需要 start 之前的数据，所以重新按 fetch_start/end 过滤。
+        records = nav_to_records([item for item in all_items])
+        records = [r for r in records if start <= parse_date_safe(r["date"]) <= end]
+        if records:
+            return records, "tiantian_fund_api"
+        errors.append(f"TiantianFundApi 未返回有效净值 rows={len(all_items)}")
+    except Exception as exc:
+        errors.append(f"TiantianFundApi 失败：{str(exc)[:180]}")
+
+    raise RuntimeError("天天基金历史净值失败：" + "；".join(errors))
+
 def normalize_backtest_source(source: str, market: str) -> str:
     """把前端/设置页的数据源名称转换成回测历史行情源。
 
@@ -3940,33 +4722,47 @@ def normalize_backtest_source(source: str, market: str) -> str:
         return "yahoo"
     if raw in {"eastmoney", "eastmoney_kline", "东方财富"}:
         return "eastmoney"
+    if raw in {"fund", "fund_nav", "eastmoney_fund", "eastmoney_fund_nav", "天天基金"}:
+        return "fund"
     if raw in {"stooq", "stooq_csv"}:
         return "stooq"
     return "auto"
 
 
-def backtest_fetch_records(symbol: str, market: str, source: str, start: date, end: date, cfg: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str, List[str]]:
+def backtest_fetch_records(symbol: str, market: str, source: str, start: date, end: date, cfg: Dict[str, Any], asset_kind: str = "") -> Tuple[List[Dict[str, Any]], str, List[str]]:
     options = fetch_options_from_cfg(cfg)
     errors: List[str] = []
     source = normalize_backtest_source(source, market)
     candidates: List[Callable[[], Tuple[List[Dict[str, Any]], str]]] = []
 
-    # 国内标的优先东方财富K线；海外标的优先 Yahoo Chart；Stooq 作为兜底。
-    if source in {"auto", "eastmoney"} and (market.upper() == "CN" or re.fullmatch(r"\d{6}", symbol or "")):
+    asset_kind = resolve_asset_kind(symbol, market, asset_kind, str(cfg.get("symbol_name") or ""))
+    is_cn_fund = is_cn_open_fund_like(symbol, market, asset_kind, str(cfg.get("symbol_name") or ""))
+
+    # 场外基金 / ETF联接 / QDII基金优先使用基金净值。
+    # 不能直接用股票K线接口，否则会出现 017641.SZ / 007721.SZ 这类无效链路。
+    if source in {"auto", "fund", "eastmoney", "akshare", "danjuan"} and is_cn_fund:
+        candidates.append(lambda: backtest_fetch_danjuan_fund_nav(symbol, start, end, options))
+        candidates.append(lambda: backtest_fetch_eastmoney_fund_nav(symbol, start, end, options))
+
+    # 国内股票/ETF/指数才优先东方财富K线；场外基金不走这条链路。
+    if source in {"auto", "eastmoney"} and not is_cn_fund and (market.upper() == "CN" or re.fullmatch(r"\d{6}", symbol or "")):
         candidates.append(lambda: backtest_fetch_eastmoney(symbol, start, end, options))
-    if source in {"auto", "yahoo"}:
+    if source in {"auto", "yahoo"} and not is_cn_fund:
         candidates.append(lambda: backtest_fetch_yahoo(symbol, market, start, end, options))
-    if source in {"auto", "stooq"}:
+    if source in {"auto", "stooq"} and not is_cn_fund:
         candidates.append(lambda: backtest_fetch_stooq(symbol, market, start, end, options))
 
     if not candidates:
         raise RuntimeError("没有可用的历史行情数据源")
+    min_required = 20 if is_cn_fund else 60
     for fn in candidates:
         try:
             records, label = fn()
-            if len(records) >= 60:
+            if len(records) >= min_required:
+                if is_cn_fund and len(records) < 60:
+                    errors.append(f"{label}: 净值点仅 {len(records)} 条，结果可信度偏低；建议拉长回测周期或提高操作周期")
                 return records, label, errors
-            errors.append(f"{label}: 数据太少 {len(records)} 条")
+            errors.append(f"{label}: 数据太少 {len(records)} 条，至少需要 {min_required} 条")
         except Exception as exc:
             errors.append(str(exc)[:240])
     raise RuntimeError("；".join(errors) or "所有历史行情源失败")
@@ -3995,6 +4791,326 @@ def backtest_cagr(e0: float, e1: float, days: int) -> float:
         return 0.0
     years = days / 365.25
     return (e1 / e0) ** (1.0 / years) - 1.0 if years > 0 else 0.0
+
+
+def backtest_series_returns(values: List[float]) -> List[float]:
+    return [values[i] / values[i - 1] - 1.0 for i in range(1, len(values)) if values[i - 1] > 0]
+
+
+def backtest_daily_risk_free_rate(annual_risk_free_rate: float) -> float:
+    """把年化无风险收益率换算成日化收益率，用于夏普比率的日收益序列。"""
+    rf = clamp(float(annual_risk_free_rate or 0.0), -0.99, 1.0)
+    return (1.0 + rf) ** (1.0 / 252.0) - 1.0
+
+
+def backtest_risk_free_rate(data: Dict[str, Any], cfg: Dict[str, Any]) -> float:
+    """回测风险调整指标使用的年化无风险收益率。
+
+    前端设置项是百分数，例如 2 表示 2%。为了兼容未来接口，也允许
+    /api/backtest 的 payload 直接传 risk_free_rate_pct 覆盖。
+    """
+    raw = data.get("risk_free_rate_pct", cfg.get("backtest_risk_free_rate_pct", DEFAULT_CONFIG.get("backtest_risk_free_rate_pct", 2.0)))
+    return clamp(as_float(raw, 2.0), -20.0, 30.0) / 100.0
+
+
+def backtest_sharpe_ratio(values: List[float], annual_risk_free_rate: float = 0.0) -> float:
+    returns = backtest_series_returns(values)
+    vol = backtest_annual_vol(returns)
+    if not returns or vol <= 0:
+        return 0.0
+    daily_rf = backtest_daily_risk_free_rate(annual_risk_free_rate)
+    excess_daily_mean = sum((r - daily_rf) for r in returns) / len(returns)
+    return (excess_daily_mean * 252.0 / vol)
+
+
+def backtest_calmar_ratio(cagr: float, max_drawdown: float, annual_risk_free_rate: float = 0.0) -> float:
+    dd = abs(float(max_drawdown or 0.0))
+    excess_cagr = float(cagr or 0.0) - float(annual_risk_free_rate or 0.0)
+    if dd <= 1e-9:
+        return 0.0 if excess_cagr <= 0 else 999.0
+    return excess_cagr / dd
+
+
+def _score_component(diff: float, scale: float) -> float:
+    if not math.isfinite(diff) or scale <= 0:
+        return 0.0
+    return math.tanh(diff / scale) * 100.0
+
+
+
+def _score_piecewise(value: float, points: List[Tuple[float, float]]) -> float:
+    """按分段线性规则把原始指标折成 0~100 分。"""
+    try:
+        v = float(value or 0.0)
+    except Exception:
+        return 0.0
+    if not math.isfinite(v) or not points:
+        return 0.0
+    pts = sorted((float(x), float(y)) for x, y in points)
+    if v <= pts[0][0]:
+        return max(0.0, min(100.0, pts[0][1]))
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        if v <= x1:
+            if abs(x1 - x0) <= 1e-12:
+                return max(0.0, min(100.0, y1))
+            t = (v - x0) / (x1 - x0)
+            return max(0.0, min(100.0, y0 + (y1 - y0) * t))
+    return max(0.0, min(100.0, pts[-1][1]))
+
+
+def _strategy_excess_return_score(cagr: float, annual_risk_free_rate: float) -> float:
+    """年化超额收益得分：收益必须先跑赢无风险收益率。"""
+    excess = float(cagr or 0.0) - float(annual_risk_free_rate or 0.0)
+    return _score_piecewise(excess, [
+        (0.00, 0),
+        (0.02, 25),
+        (0.05, 55),
+        (0.08, 78),
+        (0.12, 95),
+        (0.16, 100),
+    ])
+
+
+def _drawdown_control_score(max_drawdown: float) -> float:
+    """最大回撤控制得分：回撤越小越好，但不能单独决定策略高分。"""
+    dd = abs(float(max_drawdown or 0.0))
+    return _score_piecewise(dd, [
+        (0.00, 100),
+        (0.05, 95),
+        (0.10, 85),
+        (0.20, 65),
+        (0.35, 38),
+        (0.50, 15),
+        (0.70, 0),
+    ])
+
+
+def _risk_adjusted_score_component(value: float) -> float:
+    """夏普/卡玛得分：0 以下为 0 分，1 附近良好，2 以上满分。"""
+    try:
+        v = float(value or 0.0)
+    except Exception:
+        return 0.0
+    if not math.isfinite(v) or v <= 0:
+        return 0.0
+    return _score_piecewise(v, [
+        (0.00, 0),
+        (0.50, 35),
+        (1.00, 65),
+        (1.50, 85),
+        (2.00, 100),
+    ])
+
+
+def _system_execution_quality_score(avg_exposure_pct: float, trade_count: int) -> float:
+    """系统策略执行质量：避免低仓位/少交易把回撤压低后被误判为好策略。"""
+    exp_score = _score_piecewise(float(avg_exposure_pct or 0.0), [
+        (0.0, 0),
+        (5.0, 8),
+        (10.0, 20),
+        (25.0, 55),
+        (45.0, 82),
+        (70.0, 100),
+        (95.0, 92),
+        (100.0, 88),
+    ])
+    trade_score = _score_piecewise(float(trade_count or 0), [
+        (0, 0),
+        (1, 35),
+        (2, 55),
+        (4, 78),
+        (8, 100),
+    ])
+    return max(0.0, min(100.0, exp_score * 0.70 + trade_score * 0.30))
+
+
+def _dca_execution_quality_score(buy_count: int) -> float:
+    if buy_count <= 0:
+        return 0.0
+    if buy_count == 1:
+        return 70.0
+    if buy_count <= 3:
+        return 82.0
+    return 95.0
+
+
+def backtest_strategy_score(
+    cagr: float,
+    max_drawdown: float,
+    calmar: float,
+    sharpe: float,
+    annual_risk_free_rate: float,
+    execution_quality: float,
+) -> float:
+    """策略表现百分制评分。
+
+    权重：年化超额收益 30%、最大回撤控制 25%、卡玛 20%、夏普 20%、执行质量 5%。
+    这样不会再只靠低回撤拿高分，也不会重复使用“系统相对定投”的相减评分。
+    """
+    score = (
+        _strategy_excess_return_score(cagr, annual_risk_free_rate) * 0.30
+        + _drawdown_control_score(max_drawdown) * 0.25
+        + _risk_adjusted_score_component(calmar) * 0.20
+        + _risk_adjusted_score_component(sharpe) * 0.20
+        + max(0.0, min(100.0, float(execution_quality or 0.0))) * 0.05
+    )
+    return max(0.0, min(100.0, score))
+
+
+def _latest_raw_valuation(series: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    if not series:
+        return {}
+    try:
+        latest_ds = max(series.keys())
+        return historical_valuation_for_date(series, latest_ds)
+    except Exception:
+        return {}
+
+
+def _as_pct_number(value: Any) -> Optional[float]:
+    try:
+        if value is None or value == "":
+            return None
+        text = str(value).strip().replace("%", "")
+        if not text or text in {"--", "nan", "None"}:
+            return None
+        return float(text)
+    except Exception:
+        return None
+
+
+def _valuation_percentile_score(value: Optional[float], points: List[Tuple[float, float]]) -> float:
+    if value is None:
+        return 50.0
+    return _score_piecewise(float(value), points)
+
+
+def backtest_asset_core_score(
+    symbol: str,
+    market: str,
+    asset_kind: str,
+    symbol_name: str,
+    valuation_series: Dict[str, Dict[str, Any]],
+    hold_cagr: float,
+    hold_mdd: float,
+    hold_sharpe: float,
+    hold_calmar: float,
+    hold_vol: float,
+    annual_risk_free_rate: float,
+    data_source: str,
+) -> float:
+    """标的核心得分：评估这只股票/基金本身是否适合做长期核心资产。"""
+    kind = (asset_kind or "").lower()
+    name = f"{symbol_name or ''} {symbol or ''}".lower()
+    latest_val = _latest_raw_valuation(valuation_series)
+    pe_pct = _as_pct_number(latest_val.get("pe_percentile"))
+    pb_pct = _as_pct_number(latest_val.get("pb_percentile"))
+    roe = _as_pct_number(latest_val.get("roe_pct"))
+
+    is_fund_like = any(x in kind for x in ["fund", "etf", "index", "qdii", "fof"])
+    is_broad_core = is_fund_like and any(x in name for x in [
+        "标普", "sp500", "s&p", "纳指", "nasdaq", "沪深300", "上证50", "中证500", "中证1000", "宽基", "指数"
+    ])
+
+    # 1) 长期资产质量 30 分
+    roe_score = _score_piecewise(roe if roe is not None else 10.0, [(0, 0), (8, 3), (12, 7), (18, 11), (25, 12)])
+    long_logic = 8.0 if is_broad_core else (6.5 if is_fund_like else 4.5)
+    diversification = 5.0 if is_fund_like else 2.0
+    growth_stability = _score_piecewise(hold_cagr - annual_risk_free_rate, [(0, 1), (0.03, 2.5), (0.06, 4), (0.10, 5)])
+    quality_score = min(30.0, roe_score + long_logic + diversification + growth_stability)
+
+    # 2) 估值安全边际 20 分
+    pe_score = _valuation_percentile_score(pe_pct, [(0, 10), (30, 10), (60, 7), (80, 4), (90, 2), (100, 0)])
+    pb_score = _valuation_percentile_score(pb_pct, [(0, 5), (40, 5), (80, 2.5), (100, 0)])
+    if roe is not None and roe >= 18:
+        match_score = _valuation_percentile_score(pe_pct, [(0, 5), (60, 5), (80, 3.5), (90, 2), (100, 1)])
+    elif roe is not None and roe < 8:
+        match_score = _valuation_percentile_score(pe_pct, [(0, 4), (60, 2.5), (80, 1), (100, 0)])
+    else:
+        match_score = _valuation_percentile_score(pe_pct, [(0, 5), (50, 4), (80, 2), (100, 0.5)])
+    valuation_score = min(20.0, pe_score + pb_score + match_score)
+
+    # 3) 风险与回撤 20 分
+    dd_score = _drawdown_control_score(hold_mdd) / 100.0 * 8.0
+    vol_score = _score_piecewise(float(hold_vol or 0.0), [(0.00, 5), (0.12, 5), (0.20, 3.8), (0.35, 2.0), (0.55, 0.5), (0.80, 0)])
+    recovery_score = _risk_adjusted_score_component(hold_calmar) / 100.0 * 4.0
+    extreme_score = 3.0 if is_broad_core else (2.4 if is_fund_like else 1.6)
+    if "qdii" in kind or "qdii" in name:
+        extreme_score -= 0.5
+    risk_score = min(20.0, dd_score + vol_score + recovery_score + max(0.0, extreme_score))
+
+    # 4) 收益质量 15 分
+    excess_score = _strategy_excess_return_score(hold_cagr, annual_risk_free_rate) / 100.0 * 5.0
+    sharpe_score = _risk_adjusted_score_component(hold_sharpe) / 100.0 * 4.0
+    calmar_score = _risk_adjusted_score_component(hold_calmar) / 100.0 * 4.0
+    persistence_score = 2.0 if hold_cagr > annual_risk_free_rate else (1.0 if hold_cagr > 0 else 0.0)
+    return_quality_score = min(15.0, excess_score + sharpe_score + calmar_score + persistence_score)
+
+    # 5) 产品与交易可用性 15 分
+    liquidity_score = 3.5 if is_fund_like else 2.8
+    cost_tracking_score = 3.0 if is_broad_core else (2.4 if is_fund_like else 2.0)
+    data_score = 3.0 if valuation_series else (2.0 if data_source else 1.0)
+    convenience_score = 1.5 if ("qdii" in kind or "qdii" in name) else 2.0
+    clarity_score = 2.0 if is_broad_core else (1.5 if is_fund_like else 1.0)
+    product_score = min(15.0, liquidity_score + cost_tracking_score + data_score + convenience_score + clarity_score)
+
+    total = quality_score + valuation_score + risk_score + return_quality_score + product_score
+    return max(0.0, min(100.0, total))
+
+def backtest_score_100(v: float) -> str:
+    return f"{max(0.0, min(100.0, float(v or 0.0))):.1f} / 100"
+
+
+def simulate_periodic_dca(
+    records: List[Dict[str, Any]],
+    start_index: int,
+    rebalance_days: int,
+    initial_cash: float,
+    fee: float,
+    slip: float,
+) -> Tuple[List[float], int, float]:
+    """无脑定额定投基准。
+
+    口径：按回测的操作周期生成买入日，把 100% 计划资金均分成若干份，
+    在每个定投日买入并持有到期末。
+
+    注意：最后一个可观测日不定投。否则最后一天刚买入就结束，几乎看不到
+    持有收益，会把定投基准算得偏假。比如一段 10 个月的月度回测，定投日
+    应该是第 1~9 个月，每次买入计划资金的 1/9，而不是第 10 个月也买。
+    """
+    if initial_cash <= 0 or start_index < 0 or start_index >= len(records) - 1:
+        return [], 0, 0.0
+
+    step = max(1, int(rebalance_days))
+    # 买入日按“当前可观测日”计算，而不是下一日；但必须排除最后一个记录。
+    buy_indices = set(range(start_index, len(records) - 1, step))
+    buy_count_plan = len(buy_indices)
+    installment = initial_cash / buy_count_plan if buy_count_plan > 0 else 0.0
+
+    cash = float(initial_cash)
+    shares = 0.0
+    invested = 0.0
+    buy_count = 0
+    equity_curve: List[float] = []
+
+    for i in range(start_index, len(records) - 1):
+        rec = records[i]
+        next_rec = records[i + 1]
+        buy_price_raw = float(rec.get("close") or rec.get("open") or 0.0)
+        exec_close = float(next_rec["close"])
+
+        if i in buy_indices and installment > 0:
+            gross = min(installment, max(cash / (1.0 + fee), 0.0))
+            if gross > 0 and buy_price_raw > 0:
+                price = buy_price_raw * (1.0 + slip)
+                shares += gross / price
+                cash -= gross + gross * fee
+                invested += gross
+                buy_count += 1
+
+        equity_curve.append(cash + shares * exec_close)
+
+    return equity_curve, buy_count, invested
 
 
 def backtest_money(v: float) -> str:
@@ -4100,9 +5216,17 @@ def append_valuation_comparison_metrics(
 
 
 def backtest_metrics_rows(metrics: Dict[str, Any]) -> List[Dict[str, Any]]:
+    # 展示顺序按“先三类策略得分、再风险调整、再收益/回撤/交易/估值”排列。
+    # 前端会按同一顺序渲染；导出的核心指标 CSV 也保持这个顺序。
     order = [
-        "策略总收益", "买入持有总收益", "策略年化收益", "买入持有年化收益", "策略最大回撤", "买入持有最大回撤",
-        "年化波动", "夏普比率", "交易次数", "已实现胜率", "盈亏因子", "平均仓位", "换手率", "期末权益",
+        "标的核心得分", "系统策略得分", "定投策略得分", "持有策略得分",
+        "卡玛比率", "定投策略卡玛比率", "持有策略卡玛比率",
+        "夏普比率", "定投策略夏普比率", "持有策略夏普比率",
+        "无风险收益率",
+        "策略总收益", "定投策略总收益", "买入持有总收益",
+        "策略年化收益", "定投策略年化收益", "买入持有年化收益",
+        "策略最大回撤", "定投策略最大回撤", "买入持有最大回撤", "年化波动",
+        "交易次数", "已实现胜率", "盈亏因子", "平均仓位", "换手率", "期末权益",
         "估值序列最新日期", "估值页面最新日期",
         "历史PE百分位", "页面PE百分位", "PE百分位误差",
         "历史PB", "页面PB", "PB误差",
@@ -4147,6 +5271,7 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
         raise RuntimeError("请先填写回测标的代码")
     market = str(data.get("market") or cfg.get("market") or "US").upper()
     asset_kind = str(data.get("asset_kind") or cfg.get("asset_kind") or "stock")
+    asset_kind = resolve_asset_kind(symbol, market, asset_kind, str(data.get("symbol_name") or cfg.get("symbol_name") or ""))
     source = str(data.get("source") or data.get("data_source") or cfg.get("data_source") or "auto")
     start_user = parse_date_safe(data.get("start_date") or "2020-01-01")
     end_user = parse_date_safe(data.get("end_date") or date.today().isoformat())
@@ -4154,8 +5279,13 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
         raise RuntimeError("结束日期必须晚于开始日期")
 
     # 需要提前拉取一段历史数据用于 MA200/ATR 等指标预热。
-    warmup_bars = int(clamp(as_float(data.get("warmup_bars"), 220), 80, 500))
-    fetch_start = start_user - timedelta(days=max(420, int(warmup_bars * 2.2)))
+    # 场外基金/QDII净值可能不是每日都有，且没有真实 OHLCV；若强制 220 根预热，
+    # 一年回测很容易因净值点不足失败。因此基金回测使用更短预热，重点测净值趋势/仓位逻辑。
+    is_cn_fund_for_warmup = market.upper() == "CN" and str(asset_kind or "").lower() in {"fund", "fof", "qdii", "fund_of_funds"}
+    default_warmup = 60 if is_cn_fund_for_warmup else 220
+    min_warmup = 20 if is_cn_fund_for_warmup else 80
+    warmup_bars = int(clamp(as_float(data.get("warmup_bars"), default_warmup), min_warmup, 500))
+    fetch_start = start_user - timedelta(days=max(180 if is_cn_fund_for_warmup else 420, int(warmup_bars * 3.2)))
 
     bt_cfg = ensure_config()
     bt_cfg.update(cfg)
@@ -4163,8 +5293,11 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
         if key in data:
             bt_cfg[key] = data.get(key)
 
-    records, source_label, fetch_errors = backtest_fetch_records(symbol, market, source, fetch_start, end_user, bt_cfg)
+    records, source_label, fetch_errors = backtest_fetch_records(symbol, market, source, fetch_start, end_user, bt_cfg, asset_kind)
     records = [r for r in records if parse_date_safe(r["date"]) <= end_user]
+    if is_cn_fund_for_warmup and len(records) >= 25 and len(records) < warmup_bars + 5:
+        # 对净值频率较低的 QDII/FOF，允许自适应缩短预热；少于25条仍不建议回测。
+        warmup_bars = max(20, min(warmup_bars, len(records) // 2))
     if len(records) < warmup_bars + 5:
         raise RuntimeError(f"历史数据太少：需要至少 {warmup_bars + 5} 条，当前 {len(records)} 条")
 
@@ -4189,7 +5322,10 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
     min_trade_pct = clamp(as_float(data.get("min_trade_pct"), 0.5), 0.0, 20.0) / 100.0
     fee = clamp(as_float(data.get("fee_bps"), 2.0), 0.0, 1000.0) / 10000.0
     slip = clamp(as_float(data.get("slippage_bps"), 3.0), 0.0, 1000.0) / 10000.0
+    is_cn_fund_for_slippage = is_cn_open_fund_like(symbol, market, asset_kind, str(data.get("symbol_name") or cfg.get("symbol_name") or ""))
+    effective_slip = 0.0 if is_cn_fund_for_slippage else slip
     export_files = bool(data.get("export_files"))
+    risk_free_rate = backtest_risk_free_rate(data, cfg)
 
     valuation_mode = str(data.get("valuation_mode") or "none")
     if valuation_mode not in {"none", "fixed", "historical"}:
@@ -4246,6 +5382,11 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
                 "strategy": strategy,
                 "position_mode": position_mode,
                 "risk_per_trade_pct": risk_per_trade_pct,
+                "symbol": symbol,
+                "symbol_name": str(data.get("symbol_name") or cfg.get("symbol_name") or ""),
+                "market": market,
+                "asset_kind": asset_kind,
+                "data_source": source,
             })
             try:
                 day_fundamentals = fundamentals.copy()
@@ -4275,7 +5416,7 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
             trade_value = 0.0
 
         if trade_value > 0:
-            price = exec_open * (1.0 + slip)
+            price = exec_open * (1.0 + effective_slip)
             gross = min(trade_value, max(cash, 0.0))
             if gross > 0:
                 buy_shares = gross / price
@@ -4290,7 +5431,7 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
                     "命中规则": payload_metric_value(payload_result, "命中规则"),
                 })
         elif trade_value < 0 and shares > 0:
-            price = exec_open * (1.0 - slip)
+            price = exec_open * (1.0 - effective_slip)
             gross = min(-trade_value, shares * price)
             sell_shares = gross / price
             pnl = (price - (avg_cost or price)) * sell_shares
@@ -4319,31 +5460,85 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
     if not equity_curve:
         raise RuntimeError("没有生成权益曲线")
 
+    dca_eq, dca_buy_count, dca_invested = simulate_periodic_dca(
+        records, start_index, rebalance_days, initial_cash, fee, effective_slip
+    )
+    for row, dca_value in zip(equity_curve, dca_eq):
+        row["定投策略权益"] = round(dca_value, 2)
+
     eq = [float(x["策略权益"]) for x in equity_curve]
     bench = [float(x["买入持有权益"]) for x in equity_curve]
-    returns = [eq[i] / eq[i - 1] - 1.0 for i in range(1, len(eq)) if eq[i - 1] > 0]
+    dca_bench = dca_eq if dca_eq else [initial_cash for _ in equity_curve]
+    returns = backtest_series_returns(eq)
+    bench_returns = backtest_series_returns(bench)
+    dca_returns = backtest_series_returns(dca_bench)
     total_ret = eq[-1] / initial_cash - 1.0
     bench_ret = bench[-1] / initial_cash - 1.0
+    dca_ret = dca_bench[-1] / initial_cash - 1.0
     days = (parse_date_safe(equity_curve[-1]["日期"]) - parse_date_safe(equity_curve[0]["日期"])).days
     vol = backtest_annual_vol(returns)
+    bench_vol = backtest_annual_vol(bench_returns)
+    dca_vol = backtest_annual_vol(dca_returns)
     c = backtest_cagr(initial_cash, eq[-1], days)
     bc = backtest_cagr(initial_cash, bench[-1], days)
-    sharpe = ((sum(returns) / len(returns)) * 252 / vol) if returns and vol > 0 else 0.0
+    dca_c = backtest_cagr(initial_cash, dca_bench[-1], days)
+    strategy_mdd = backtest_max_drawdown(eq)
+    dca_mdd = backtest_max_drawdown(dca_bench)
+    bench_mdd = backtest_max_drawdown(bench)
+    sharpe = backtest_sharpe_ratio(eq, risk_free_rate)
+    dca_sharpe = backtest_sharpe_ratio(dca_bench, risk_free_rate)
+    hold_sharpe = backtest_sharpe_ratio(bench, risk_free_rate)
+    calmar = backtest_calmar_ratio(c, strategy_mdd, risk_free_rate)
+    dca_calmar = backtest_calmar_ratio(dca_c, dca_mdd, risk_free_rate)
+    hold_calmar = backtest_calmar_ratio(bc, bench_mdd, risk_free_rate)
     wins = [x for x in realized_pnls if x > 0]
     losses = [x for x in realized_pnls if x < 0]
     win_rate = len(wins) / len(realized_pnls) if realized_pnls else 0.0
     profit_factor = (sum(wins) / abs(sum(losses))) if losses else (999.0 if wins else 0.0)
     avg_exp = sum(float(x["仓位比例%"] or 0) for x in equity_curve) / len(equity_curve)
+    strategy_execution_score = _system_execution_quality_score(avg_exp, len(trades))
+    dca_execution_score = _dca_execution_quality_score(dca_buy_count)
+    hold_execution_score = 95.0
+    strategy_score = backtest_strategy_score(c, strategy_mdd, calmar, sharpe, risk_free_rate, strategy_execution_score)
+    dca_score = backtest_strategy_score(dca_c, dca_mdd, dca_calmar, dca_sharpe, risk_free_rate, dca_execution_score)
+    hold_score = backtest_strategy_score(bc, bench_mdd, hold_calmar, hold_sharpe, risk_free_rate, hold_execution_score)
+    asset_score = backtest_asset_core_score(
+        symbol=symbol,
+        market=market,
+        asset_kind=asset_kind,
+        symbol_name=str(cfg.get("symbol_name") or data.get("symbol_name") or ""),
+        valuation_series=valuation_series if valuation_mode == "historical" else {},
+        hold_cagr=bc,
+        hold_mdd=bench_mdd,
+        hold_sharpe=hold_sharpe,
+        hold_calmar=hold_calmar,
+        hold_vol=bench_vol,
+        annual_risk_free_rate=risk_free_rate,
+        data_source=source_label,
+    )
 
     metrics = {
+        "标的核心得分": backtest_score_100(asset_score),
+        "系统策略得分": backtest_score_100(strategy_score),
+        "定投策略得分": backtest_score_100(dca_score),
+        "持有策略得分": backtest_score_100(hold_score),
         "策略总收益": backtest_pct(total_ret * 100),
+        "定投策略总收益": backtest_pct(dca_ret * 100),
         "买入持有总收益": backtest_pct(bench_ret * 100),
         "策略年化收益": backtest_pct(c * 100),
+        "定投策略年化收益": backtest_pct(dca_c * 100),
         "买入持有年化收益": backtest_pct(bc * 100),
-        "策略最大回撤": backtest_pct(backtest_max_drawdown(eq) * 100),
-        "买入持有最大回撤": backtest_pct(backtest_max_drawdown(bench) * 100),
+        "策略最大回撤": backtest_pct(strategy_mdd * 100),
+        "定投策略最大回撤": backtest_pct(dca_mdd * 100),
+        "买入持有最大回撤": backtest_pct(bench_mdd * 100),
+        "卡玛比率": round(calmar, 3),
+        "定投策略卡玛比率": round(dca_calmar, 3),
+        "持有策略卡玛比率": round(hold_calmar, 3),
+        "无风险收益率": backtest_pct(risk_free_rate * 100),
         "年化波动": backtest_pct(vol * 100),
         "夏普比率": round(sharpe, 3),
+        "定投策略夏普比率": round(dca_sharpe, 3),
+        "持有策略夏普比率": round(hold_sharpe, 3),
         "交易次数": len(trades),
         "已实现胜率": backtest_pct(win_rate * 100),
         "盈亏因子": round(profit_factor, 3),
@@ -4383,6 +5578,7 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
             "数据源": source_label,
             "回测周期": f"{equity_curve[0]['日期']} ~ {equity_curve[-1]['日期']}",
             "操作周期": f"每 {rebalance_days} 个交易日检查一次",
+            "定投基准": f"每 {rebalance_days} 个交易日定额买入；默认投入100%计划资金；排除最后一个可观测日；买入 {dca_buy_count} 次",
             "K线数量": len(records),
             "交易次数": len(trades),
             "估值模式": {"none": "不使用估值修正", "fixed": "固定估值假设", "historical": "历史估值序列"}.get(valuation_mode, valuation_mode),
@@ -4413,6 +5609,16 @@ def index():
 
 
 
+@app.post("/api/cache/clear")
+def api_cache_clear():
+    """清空当前进程内的搜索 / 获取信息 / 回测 / 连通性测试缓存。"""
+    before = len(_RUNTIME_CACHE)
+    runtime_cache_clear()
+    return jsonify({
+        "ok": True,
+        "message": f"已清除全部运行缓存：{before} 条",
+        "cleared": before,
+    })
 
 @app.get("/api/index-map")
 def api_index_map_get():
@@ -4441,6 +5647,7 @@ def api_index_map_save():
         return jsonify({"ok": False, "message": "映射表必须是 JSON 对象"}), 400
     try:
         saved = save_index_mapping(mapping, apply=True)
+        runtime_cache_clear()
     except Exception as exc:
         return jsonify({"ok": False, "message": f"映射表保存失败：{exc}"}), 400
     return jsonify({
@@ -4477,6 +5684,7 @@ def api_config():
     mode = str(data.get("position_mode", cfg.get("position_mode", "core_satellite")))
     cfg["position_mode"] = mode if mode in {"core_satellite", "strict_trade"} else "core_satellite"
     cfg["risk_per_trade_pct"] = clamp(as_float(data.get("risk_per_trade_pct"), cfg.get("risk_per_trade_pct", 1.0)), 0.1, 100.0)
+    cfg["backtest_risk_free_rate_pct"] = clamp(as_float(data.get("backtest_risk_free_rate_pct"), cfg.get("backtest_risk_free_rate_pct", 2.0)), -20.0, 30.0)
 
     for key in ["symbol", "symbol_name", "market", "asset_kind", "data_source", "proxy_mode", "proxy_url", "danjuan_cookie", "valuation_method"]:
         if key in data:
@@ -4497,7 +5705,7 @@ def api_config():
         "ok": True,
         "message": "配置已保存",
         "current_pos_text": pct(current_position(cfg)),
-        "strategy_text": f"{strategy_obj['name']}：{strategy_obj['desc']}<br>仓位模式：{mode_text}<br>标的：{symbol_text}<br>数据容错：代理 {cfg.get('proxy_mode')} / 超时 {cfg.get('request_timeout_sec')} 秒 / 重试 {cfg.get('retry_count')} 次<br>估值来源：{valuation_method_text(cfg.get('valuation_method'))}<br>计划资金=100%上限，不按标的类型封顶。",
+        "strategy_text": f"{strategy_obj['name']}：{strategy_obj['desc']}<br>仓位模式：{mode_text}<br>标的：{symbol_text}<br>数据容错：代理 {cfg.get('proxy_mode')} / 超时 {cfg.get('request_timeout_sec')} 秒 / 重试 {cfg.get('retry_count')} 次<br>估值来源：{valuation_method_text(cfg.get('valuation_method'))}<br>回测无风险收益率：{cfg.get('backtest_risk_free_rate_pct', 2.0)}%<br>计划资金=100%上限，不按标的类型封顶。",
         "config": cfg,
     })
 
@@ -4513,6 +5721,16 @@ def api_decision():
 @app.get("/api/search")
 def api_search():
     query = str(request.args.get("q", "")).strip()
+    cache_payload = {
+        "q": query,
+        "local_symbols": len(LOCAL_SYMBOLS),
+        "aliases": len(ALIASES),
+        "index_map_mtime": os.path.getmtime(INDEX_MAP_PATH) if os.path.exists(INDEX_MAP_PATH) else 0,
+    }
+    cached, age = runtime_cache_get("search", cache_payload)
+    if cached is not None:
+        return jsonify(add_cache_meta(cached, True, age))
+
     items = []
     items.extend(local_symbol_search(query))
     # 本地候选优先；在线搜索失败不影响功能。
@@ -4524,7 +5742,17 @@ def api_search():
         items.extend(search_akshare(query))
     except Exception:
         pass
-    return jsonify({"ok": True, "results": dedupe_symbols(items)[:12]})
+    results = dedupe_symbols(items, query)
+
+    # 只有在本地/在线都找不到结果时，才给一个可手动尝试的兜底候选；
+    # 不再让 001422 这种“基金代码 + A股前缀重叠”的代码先显示成股票占位项。
+    if re.fullmatch(r"\d{6}", query) and not any(str(x.get("symbol") or "").upper() == query.upper() for x in results):
+        fallback_kind = guess_cn_asset_kind(query)
+        results.append({"symbol": query.upper(), "name": query.upper(), "market": "CN", "asset_kind": fallback_kind, "source": "akshare"})
+
+    payload = {"ok": True, "results": results[:12]}
+    runtime_cache_set("search", cache_payload, payload)
+    return jsonify(add_cache_meta(payload, False))
 
 
 
@@ -4535,6 +5763,13 @@ def api_connectivity_test():
     for key in ["proxy_mode", "proxy_url", "request_timeout_sec", "retry_count", "danjuan_cookie", "valuation_method", "symbol", "symbol_name", "market", "asset_kind", "data_source"]:
         if key in data:
             cfg[key] = data.get(key)
+    cache_payload = {
+        "data": data,
+        "cfg": {key: cfg.get(key) for key in ["proxy_mode", "proxy_url", "request_timeout_sec", "retry_count", "danjuan_cookie", "valuation_method", "symbol", "symbol_name", "market", "asset_kind", "data_source"]},
+    }
+    cached, age = runtime_cache_get("connectivity", cache_payload)
+    if cached is not None:
+        return jsonify(add_cache_meta(cached, True, age))
     try:
         results = run_connection_tests(
             cfg,
@@ -4542,11 +5777,13 @@ def api_connectivity_test():
             market=str(data.get("market") or cfg.get("market") or ""),
             asset_kind=str(data.get("asset_kind") or cfg.get("asset_kind") or ""),
         )
-        return jsonify({
+        payload = {
             "ok": True,
             "tested_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "results": results,
-        })
+        }
+        runtime_cache_set("connectivity", cache_payload, payload)
+        return jsonify(add_cache_meta(payload, False))
     except Exception as e:
         return jsonify({"ok": False, "message": f"连通性测试失败：{e}"}), 500
 
@@ -4562,22 +5799,37 @@ def api_fetch():
 
     if source == "auto":
         source = "akshare" if market == "CN" or re.fullmatch(r"\d{6}", symbol) else "yfinance"
-    if asset_kind == "auto":
-        asset_kind = "fund" if re.fullmatch(r"\d{6}", symbol) and symbol.startswith(("00", "16", "20", "27", "51", "52", "56", "58")) else "stock"
+    symbol_name = str(data.get("symbol_name") or "")
+    asset_kind = resolve_asset_kind(symbol, market, asset_kind, symbol_name)
 
     try:
         cfg = ensure_config()
         # 前端可能刚改完配置但保存尚未完成，这里同步使用请求中的容错参数和当前涨跌幅。
-        for key in ["proxy_mode", "proxy_url", "request_timeout_sec", "retry_count", "danjuan_cookie", "valuation_method", "current_profit_pct", "current_position_amount", "plan_amount"]:
+        for key in ["proxy_mode", "proxy_url", "request_timeout_sec", "retry_count", "danjuan_cookie", "valuation_method", "current_profit_pct", "current_position_amount", "plan_amount", "symbol_name"]:
             if key in data:
                 cfg[key] = data.get(key)
+        cache_payload = {
+            "symbol": symbol,
+            "market": market,
+            "asset_kind": asset_kind,
+            "source": source,
+            "symbol_name": symbol_name,
+            "request": data,
+            "cfg": {key: cfg.get(key) for key in ["proxy_mode", "proxy_url", "request_timeout_sec", "retry_count", "danjuan_cookie", "valuation_method", "current_profit_pct", "current_position_amount", "plan_amount", "symbol_name"]},
+        }
+        cached, age = runtime_cache_get("fetch", cache_payload)
+        if cached is not None:
+            cached = add_cache_meta(cached, True, age)
+            cached["message"] = f"数据已从缓存读取：{cached.get('source') or source}。参数未变化，未重复拉取。"
+            return jsonify(cached)
+
         records, fundamentals, trace, source_used = fetch_market_data(symbol, market, asset_kind, source, cfg)
         indicators = compute_indicators(records, fundamentals)
         indicators = enrich_indicators_with_user_position(indicators, cfg)
         indicators["source_used"] = source_used
         indicators["fetch_trace"] = trace
         indicators["proxy_mode"] = cfg.get("proxy_mode", "system")
-        return jsonify({
+        payload = {
             "ok": True,
             "symbol": symbol,
             "market": market,
@@ -4586,7 +5838,9 @@ def api_fetch():
             "trace": trace,
             "indicators": indicators,
             "message": f"数据已获取：{source_used} 成功。已自动填入中间表单；你可以手动覆盖。",
-        })
+        }
+        runtime_cache_set("fetch", cache_payload, payload)
+        return jsonify(add_cache_meta(payload, False))
     except Exception as e:
         return jsonify({
             "ok": False,
@@ -4599,8 +5853,25 @@ def api_backtest():
     data = request.get_json(silent=True) or {}
     try:
         cfg = ensure_config()
+        cache_payload = {
+            "data": data,
+            "cfg": {key: cfg.get(key) for key in [
+                "plan_amount", "strategy", "position_mode", "risk_per_trade_pct", "backtest_risk_free_rate_pct",
+                "symbol", "symbol_name", "market", "asset_kind", "data_source",
+                "proxy_mode", "proxy_url", "request_timeout_sec", "retry_count",
+                "danjuan_cookie", "valuation_method"
+            ]},
+        }
+        cached, age = runtime_cache_get("backtest", cache_payload)
+        if cached is not None:
+            cached = add_cache_meta(cached, True, age)
+            if isinstance(cached.get("result"), dict):
+                cached["result"]["cache_hit"] = True
+            return jsonify(cached)
         result = run_backtest_web(data, cfg)
-        return jsonify({"ok": True, "result": result})
+        payload = {"ok": True, "result": result}
+        runtime_cache_set("backtest", cache_payload, payload)
+        return jsonify(add_cache_meta(payload, False))
     except Exception as e:
         return jsonify({"ok": False, "message": f"历史回测失败：{e}"}), 400
 

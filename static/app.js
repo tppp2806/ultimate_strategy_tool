@@ -14,7 +14,9 @@
   let applyingAutoFill = false;
   let fetchInFlight = false;
   let lastBacktestResult = null;
+  let lastCandidateQuery = "";
   const BACKTEST_METRIC_COLUMNS = ["指标", "数值", "备注"];
+  const BACKTEST_METRIC_INLINE_COLUMNS = ["指标", "数值"];
   const VOLUME_SIGNAL_NAMES = ["volume_confirm", "pullback_volume_dry", "upper_shadow", "failed_close", "far_from_ma"];
 
   const strategyInfo = {
@@ -116,11 +118,13 @@
 
   function toConfigPayload() {
     const data = formToObject(configForm);
+    const riskFreeRaw = data.backtest_risk_free_rate_pct;
     return {
       plan_amount: Number(data.plan_amount || 0),
       current_position_amount: Number(data.current_position_amount || 0),
       current_profit_pct: Number(data.current_profit_pct || 0),
       risk_per_trade_pct: Number(data.risk_per_trade_pct || 1),
+      backtest_risk_free_rate_pct: riskFreeRaw === undefined || riskFreeRaw === "" ? 2 : Number(riskFreeRaw),
       strategy: data.strategy || "balanced",
       position_mode: data.position_mode || "core_satellite",
       symbol: data.symbol || "",
@@ -400,7 +404,7 @@
     const data = toConfigPayload();
     const modeText = data.position_mode === "core_satellite" ? "长期底仓 + 交易仓（防守仓位动态计算）" : "纯交易仓";
     const assetText = data.symbol ? `${data.symbol_name || data.symbol} · ${data.symbol} · ${marketNames[data.market] || data.market} · ${data.asset_kind}` : "未选择标的";
-    summary.innerHTML = `${strategyInfo[data.strategy] || strategyInfo.balanced}<br>仓位模式：${modeText}<br>标的：${assetText}<br>数据容错：代理 ${data.proxy_mode || "system"} / 超时 ${data.request_timeout_sec || 12} 秒 / 重试 ${data.retry_count || 0} 次<br>计划资金=100%上限，不按标的类型封顶。`;
+    summary.innerHTML = `${strategyInfo[data.strategy] || strategyInfo.balanced}<br>仓位模式：${modeText}<br>标的：${assetText}<br>数据容错：代理 ${data.proxy_mode || "system"} / 超时 ${data.request_timeout_sec || 12} 秒 / 重试 ${data.retry_count || 0} 次<br>回测无风险收益率：${data.backtest_risk_free_rate_pct ?? 2}%<br>计划资金=100%上限，不按标的类型封顶。`;
 
     const selected = $("#selected-asset");
     if (selected) {
@@ -442,16 +446,19 @@
 
   const saveConfigDebounced = debounce(() => saveConfigNow({quiet: true, recalc: true}), 260);
 
-  function renderCandidates(results) {
+  function renderCandidates(results, query = "") {
     const host = $("#asset-candidates");
     if (!host) return;
     host.innerHTML = "";
-    if (!results || !results.length) {
+    lastCandidateQuery = query || lastCandidateQuery || "";
+    const displayResults = Array.isArray(results) ? [...results].reverse() : [];
+    if (!displayResults.length) {
       host.innerHTML = `<div class="candidate-empty">没有找到候选。可直接输入代码后搜索，或手动填写中间数据。</div>`;
+      setSearchOpen(true);
       return;
     }
     const frag = document.createDocumentFragment();
-    for (const item of results) {
+    for (const item of displayResults) {
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "candidate-item";
@@ -468,6 +475,7 @@
       frag.appendChild(btn);
     }
     host.appendChild(frag);
+    setSearchOpen(true);
   }
 
   function chooseAsset(item) {
@@ -486,11 +494,12 @@
     updateStrategySummary();
   }
 
-  function clearSearchResults() {
+  function clearSearchResults(clearInput = true) {
     const host = $("#asset-candidates");
     const input = $("#asset-search-input");
     if (host) host.innerHTML = "";
-    if (input) input.value = "";
+    if (input && clearInput) input.value = "";
+    lastCandidateQuery = "";
     setSearchOpen(false);
   }
 
@@ -584,16 +593,49 @@
     }
   }
 
+  async function clearRuntimeCache() {
+    const btn = $("#cache-clear-btn");
+    const restore = setBusy(btn, "清除中…");
+    try {
+      const data = await postJSON("/api/cache/clear", {});
+      showToast(data.message || "缓存已清除");
+    } catch (err) {
+      showToast(err.message || "清除缓存失败", true);
+    } finally {
+      restore();
+    }
+  }
+
+
   async function searchAsset() {
     const q = $("#asset-search-input")?.value?.trim();
-    if (!q) return;
+    const host = $("#asset-candidates");
+    if (!q) {
+      // 只有搜索框为空时，点击【搜索】才作为“收起下拉栏”。
+      clearSearchResults(false);
+      return;
+    }
+
+    // 参数相同且已有候选时，不重复搜索；如果下拉栏被收起，则重新展开。
+    // 注意：非空输入再次点击【搜索】不再关闭下拉栏，避免误操作。
+    if (lastCandidateQuery === q && host?.children.length) {
+      setSearchOpen(true);
+      return;
+    }
+
+    if (host) {
+      host.innerHTML = `<div class="candidate-empty">正在搜索“${escapeHTML(q)}”…</div>`;
+    }
+    // 非空搜索期间也保持下拉栏展开；否则按 Enter 时会先折叠，等结果回来再展开，交互很跳。
+    setSearchOpen(true);
     const btn = $("#asset-search-btn");
     const restore = setBusy(btn, "搜索中…");
     try {
       const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
       const data = await res.json();
       if (!res.ok || data.ok === false) throw new Error(data.message || "搜索失败");
-      renderCandidates(data.results || []);
+      renderCandidates(data.results || [], q);
+      if (data.cache?.hit) showToast("搜索结果来自缓存");
     } catch (err) {
       showToast(err.message || "搜索失败", true);
     } finally {
@@ -740,7 +782,7 @@
       const res = await postJSON("/api/fetch", data);
       applyFetchedIndicators(res.indicators);
       if (status) status.textContent = res.message || "数据已更新";
-      showToast("数据已自动填入，可手动覆盖");
+      showToast(res.cache?.hit ? "数据来自缓存，已自动填入" : "数据已自动填入，可手动覆盖");
     } catch (err) {
       if (status) status.textContent = err.message || "自动获取失败，旧 PE/ROE/PB 已清空，可手动填写";
       showToast(err.message || "自动获取失败，旧自动数据已清空", true);
@@ -790,9 +832,32 @@
     const selected = $("#selected-asset");
     if (searchBtn) searchBtn.addEventListener("click", searchAsset);
     if (input) {
+      input.addEventListener("input", () => {
+        const q = input.value.trim();
+        const host = $("#asset-candidates");
+
+        if (!q) {
+          // 只有输入框变为空时才收起；避免用户正在输入时下拉栏闪退。
+          clearSearchResults(false);
+          return;
+        }
+
+        if (q !== lastCandidateQuery) {
+          // 输入内容变化时清掉旧候选，但保持下拉栏展开，提示用户继续搜索。
+          if (host) {
+            host.innerHTML = `<div class="candidate-empty">输入完成后点击搜索，或按 Enter 搜索。</div>`;
+          }
+          setSearchOpen(true);
+          return;
+        }
+
+        // 当前输入与已搜索关键词一致时，保持已有结果展开。
+        if (host?.children.length) setSearchOpen(true);
+      });
       input.addEventListener("keydown", (event) => {
         if (event.key === "Enter") {
           event.preventDefault();
+          event.stopPropagation();
           searchAsset();
         }
       });
@@ -869,6 +934,7 @@
     $$('[data-close-settings]').forEach(btn => btn.addEventListener('click', closeSettingsModal));
     const saveBtn = $('#settings-save-btn');
     const testBtn = $('#connection-test-btn');
+    const cacheClearBtn = $('#cache-clear-btn');
     const mapLoadBtn = $('#index-map-load-btn');
     const mapSaveBtn = $('#index-map-save-btn');
     if (saveBtn) saveBtn.addEventListener('click', async () => {
@@ -876,6 +942,7 @@
       closeSettingsModal();
     });
     if (testBtn) testBtn.addEventListener('click', runConnectionTest);
+    if (cacheClearBtn) cacheClearBtn.addEventListener('click', clearRuntimeCache);
     if (mapLoadBtn) mapLoadBtn.addEventListener('click', loadIndexMap);
     if (mapSaveBtn) mapSaveBtn.addEventListener('click', saveIndexMap);
     document.addEventListener('keydown', (event) => {
@@ -1056,6 +1123,38 @@
     } catch {}
   }
 
+  function backtestMetricCategory(label) {
+    const name = String(label || "");
+    if (!name) return "other";
+    if (name.includes("得分")) return "score";
+    if (name.includes("卡玛") || name.includes("夏普") || name.includes("无风险")) return "risk_adjusted";
+    if (name.includes("收益") || name.includes("年化收益") || name.includes("期末权益")) return "return";
+    if (name.includes("回撤") || name.includes("波动")) return "risk";
+    if (name.includes("交易") || name.includes("胜率") || name.includes("盈亏因子") || name.includes("仓位") || name.includes("换手")) return "trade";
+    if (name.includes("估值") || name.includes("PE") || name.includes("PB") || name.includes("ROE")) return "valuation";
+    return "other";
+  }
+
+  function backtestMetricTone(label, value) {
+    const name = String(label || "");
+    const text = String(value || "");
+    if (!name.includes("得分")) return "";
+    const score = Number((text.match(/-?\d+(?:\.\d+)?/) || [""])[0]);
+    if (!Number.isFinite(score)) return " neutral";
+    if (score >= 75) return " positive";
+    if (score <= 40) return " negative";
+    return " neutral";
+  }
+
+  function backtestTradeTone(row) {
+    const text = `${row?.["方向"] || ""} ${row?.["操作建议"] || ""} ${row?.["命中规则"] || ""}`;
+    if (text.includes("清仓")) return " clear";
+    if (text.includes("卖出") || text.includes("减仓") || text.includes("止盈")) return " sell";
+    if (text.includes("买入") || text.includes("加仓") || text.includes("补足")) return " buy";
+    if (text.includes("等待") || text.includes("观望") || text.includes("不操作")) return " hold";
+    return " neutral";
+  }
+
   function escapeHTML(value) {
     return String(value ?? "").replace(/[&<>'"]/g, ch => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;","\"":"&quot;"}[ch]));
   }
@@ -1084,9 +1183,25 @@
       return;
     }
     const {rows: normalizedRows, columns} = normalizeRowsForColumns(rows, forcedColumns);
+    const isMetricTable = columns.includes("指标") && columns.includes("数值");
+    const isTradeTable = !isMetricTable && (columns.includes("方向") || columns.includes("操作建议") || columns.includes("成交金额"));
     const thead = `<thead><tr>${columns.map(c => `<th>${escapeHTML(c)}</th>`).join("")}</tr></thead>`;
-    const body = normalizedRows.map(row => `<tr>${columns.map(c => `<td>${escapeHTML(row?.[c] ?? "")}</td>`).join("")}</tr>`).join("");
-    host.innerHTML = `<table class="backtest-table">${thead}<tbody>${body}</tbody></table>`;
+    const body = normalizedRows.map(row => {
+      const label = row?.["指标"] ?? "";
+      const value = row?.["数值"] ?? "";
+      let rowAttrs = "";
+      if (isMetricTable) {
+        const category = backtestMetricCategory(label);
+        const tone = backtestMetricTone(label, value);
+        rowAttrs = ` class="metric-row${tone}" data-metric-category="${escapeHTML(category)}"`;
+      } else if (isTradeTable) {
+        const tone = backtestTradeTone(row);
+        rowAttrs = ` class="trade-row${tone}"`;
+      }
+      return `<tr${rowAttrs}>${columns.map(c => `<td data-col="${escapeHTML(c)}">${escapeHTML(row?.[c] ?? "")}</td>`).join("")}</tr>`;
+    }).join("");
+    const tableClass = isMetricTable ? "backtest-table metric-table" : (isTradeTable ? "backtest-table trade-table" : "backtest-table");
+    host.innerHTML = `<table class="${tableClass}">${thead}<tbody>${body}</tbody></table>`;
   }
 
   function openTablePreview(kind) {
@@ -1125,13 +1240,15 @@
     }
     const s = result.summary || {};
     if (summary) {
+      const dcaLine = s.定投基准 ? `定投基准：${escapeHTML(s.定投基准)}<br>` : "";
       summary.innerHTML = `
         <b>${escapeHTML(s.标的 || "--")}</b> · ${escapeHTML(s.市场 || "--")} · ${escapeHTML(s.数据源 || "--")}<br>
         回测周期：${escapeHTML(s.回测周期 || "--")}；操作周期：${escapeHTML(s.操作周期 || "--")}；交易次数：${escapeHTML(s.交易次数 ?? "--")}<br>
+        ${dcaLine}
         <span class="small">${escapeHTML(s.提示 || "")}</span>
       `;
     }
-    renderTable($("#backtest-metrics"), result.metrics || [], "暂无核心指标", BACKTEST_METRIC_COLUMNS);
+    renderTable($("#backtest-metrics"), result.metrics || [], "暂无核心指标", BACKTEST_METRIC_INLINE_COLUMNS);
     renderTable($("#backtest-trades"), result.trades || [], "暂无交易记录");
 
     const exportInfo = $("#backtest-export-info");
@@ -1170,7 +1287,7 @@
       status.className = "pill wait";
     }
     lastBacktestResult = null;
-    renderTable($("#backtest-metrics"), [], "正在计算核心指标…", BACKTEST_METRIC_COLUMNS);
+    renderTable($("#backtest-metrics"), [], "正在计算核心指标…", BACKTEST_METRIC_INLINE_COLUMNS);
     renderTable($("#backtest-trades"), [], "正在生成交易记录…");
     try {
       await saveConfigNow({quiet: true, recalc: false});
@@ -1188,6 +1305,7 @@
         strategy: currentCfg.strategy || "balanced",
         position_mode: currentCfg.position_mode || "core_satellite",
         risk_per_trade_pct: Number(currentCfg.risk_per_trade_pct || 1),
+        risk_free_rate_pct: currentCfg.backtest_risk_free_rate_pct === undefined || currentCfg.backtest_risk_free_rate_pct === "" ? 2 : Number(currentCfg.backtest_risk_free_rate_pct),
         source: currentCfg.data_source || "auto",
         data_source: currentCfg.data_source || "auto",
         valuation_method: currentCfg.valuation_method || "auto",
@@ -1208,7 +1326,7 @@
       }
       const data = await postJSON("/api/backtest", payload);
       renderBacktestResult(data.result || {});
-      showToast("历史回测完成");
+      showToast(data.cache?.hit ? "历史回测结果来自缓存" : "历史回测完成");
     } catch (err) {
       if (status) {
         status.textContent = "失败";
