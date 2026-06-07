@@ -28,7 +28,7 @@ app.secret_key = "local-trend-risk-position-tool"
 
 # 进程内轻量缓存：同一轮本地使用中，参数完全相同的搜索、拉取、回测、连通性测试不重复执行。
 # 不落盘，不保存原始参数；只用参数摘要作为 key，避免把 Cookie/代理等敏感配置写进缓存索引。
-RUNTIME_CACHE_VERSION = 12
+RUNTIME_CACHE_VERSION = 14
 RUNTIME_CACHE_MAX_ITEMS = 160
 RUNTIME_CACHE_TTL_SEC: Dict[str, int] = {
     "search": 6 * 60 * 60,
@@ -864,8 +864,8 @@ def core_allocation_step_limit(cfg: Dict[str, Any], signals: Dict[str, Any], str
     strategy_key = str(cfg.get("strategy", "balanced"))
     if profile:
         # 底仓补足必须明显快于定投，否则上涨年份会被现金拖累。
-        # 防守/均衡/进攻分别约用 8/5/4 个检查周期补到 60%~70% 区间。
-        base_by_strategy = {"defensive": 0.10, "balanced": 0.18, "aggressive": 0.24}
+        # 防守/均衡/进攻分别约用 6/4/3 个检查周期补到 60%~80% 区间。
+        base_by_strategy = {"defensive": 0.13, "balanced": 0.22, "aggressive": 0.30}
     else:
         base_by_strategy = {"defensive": 0.05, "balanced": 0.08, "aggressive": 0.11}
 
@@ -897,7 +897,9 @@ def core_allocation_step_limit(cfg: Dict[str, Any], signals: Dict[str, Any], str
     if signals.get("market_risk"):
         step *= 0.55
     if signals.get("far_from_ma"):
-        step *= 0.70
+        step *= 0.78 if profile else 0.70
+    if signals.get("allocation_soft_pullback"):
+        step *= 0.70 if profile else 0.55
 
     if signals.get("allocation_fill"):
         label = "长期底仓" if profile else "基础配置"
@@ -1292,15 +1294,35 @@ def raw_target_by_signal(cfg: Dict[str, Any], signals: Dict[str, Any], cur: floa
     if exit_state == "below_20":
         matched = "跌破20日线"
         confidence = 66
-        if cur > floor:
-            action = "减仓"
-            target = max(floor, cur * 0.75)
-            reason.append("20日线失守属于短线弱化，先减一部分，等待50日线确认。")
+        if cfg.get("position_mode") == "core_satellite":
+            if cur > floor + 0.01:
+                action = "持有"
+                target = cur
+                matched = "跌破20日线（长期底仓不因短线回落减仓）"
+                reason.append("长期底仓+交易仓模式下，20日线失守只视为短线降温，不直接卖出核心仓；等待50日线/200日线确认。")
+            elif floor > cur + 0.01 and market in {"sideways", "above_200", "strong_bull"} and not signals.get("market_risk"):
+                signals["allocation_fill"] = True
+                signals["allocation_soft_pullback"] = True
+                action = "加仓"
+                target = floor
+                matched = "回落中补足长期底仓"
+                confidence = 62
+                reason.append("价格跌破20日线但中长期趋势尚未破坏，长期底仓仍按降速节奏补足；不把短线回落误判为趋势失败。")
+            else:
+                action = "持有" if cur > 0 else "观望"
+                target = cur
+                matched = "跌破20日线（等待确认）"
+                reason.append("20日线失守属于短线弱化，当前仓位不高，先等待50日线确认。")
         else:
-            action = "持有" if cur > 0 else "观望"
-            target = cur
-            matched = "跌破20日线（当前仓位已低于防守目标）"
-            reason.append("20日线失守，但当前仓位已经低于系统防守仓位，本次不追加卖出，也不因防守仓位差额买入。")
+            if cur > floor:
+                action = "减仓"
+                target = max(floor, cur * 0.75)
+                reason.append("20日线失守属于短线弱化，先减一部分，等待50日线确认。")
+            else:
+                action = "持有" if cur > 0 else "观望"
+                target = cur
+                matched = "跌破20日线（当前仓位已低于防守目标）"
+                reason.append("20日线失守，但当前仓位已经低于系统防守仓位，本次不追加卖出，也不因防守仓位差额买入。")
         return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
 
     # 3. 长期底仓 + 交易仓：基础配置仓补足。
@@ -5373,7 +5395,8 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
 
         target_pos = (pos_value_signal / equity_signal) if equity_signal > 0 else 0.0
         payload_result: Dict[str, Any] = {"headline": last_signal, "metrics": {}}
-        if i >= next_signal_index:
+        is_review_day = i >= next_signal_index
+        if is_review_day:
             decision_cfg = DEFAULT_CONFIG.copy()
             decision_cfg.update({
                 "plan_amount": equity_signal,
@@ -5406,13 +5429,26 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
                 last_target = target_pos
             next_signal_index = i + rebalance_days
         else:
+            # 非检查日不重新计算信号，继续展示上一次目标仓位；是否成交只由操作周期日决定。
+            # 这不是新增一层阈值，而是避免把“上次目标仓位”解释成每日再平衡指令。
             target_pos = last_target
 
         equity_exec = cash + shares * exec_open
         current_value_exec = shares * exec_open
         target_value_exec = target_pos * equity_exec
         trade_value = target_value_exec - current_value_exec
-        if abs(trade_value) / max(equity_exec, 1e-9) < min_trade_pct:
+
+        headline_text = str(payload_result.get("headline") or last_signal or "").strip()
+        current_pos_signal = (pos_value_signal / equity_signal) if equity_signal > 0 else 0.0
+        maintain_signal = headline_text.startswith("维持") or (
+            headline_text in {"持有", "观望", "等待"}
+            and abs(target_pos - current_pos_signal) < min_trade_pct
+        )
+
+        # 只有检查日产生的真实调仓信号才成交；“维持 XX%”只记录目标，不做机械再平衡。
+        if (not is_review_day) or maintain_signal:
+            trade_value = 0.0
+        elif abs(trade_value) / max(equity_exec, 1e-9) < min_trade_pct:
             trade_value = 0.0
 
         if trade_value > 0:
