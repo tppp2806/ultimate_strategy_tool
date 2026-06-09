@@ -461,7 +461,6 @@ def ensure_config() -> Dict[str, Any]:
         merged["valuation_method"] = "system_calc"
     merged["request_timeout_sec"] = clamp(as_float(merged.get("request_timeout_sec"), 12.0), 3.0, 60.0)
     merged["retry_count"] = int(clamp(as_float(merged.get("retry_count"), 2.0), 0.0, 5.0))
-    normalise_advanced_config(merged)
     apply_active_family_params(merged)
 
     save_config(merged)
@@ -494,6 +493,8 @@ def apply_active_family_params(cfg: Dict[str, Any]) -> None:
 
     normalise_strategy_lab_config(cfg)
 
+    _flatten_active_style_params(cfg)
+
     cleaned_params: Dict[str, Dict[str, Any]] = {}
     for key, value in all_params.items():
         if key not in STRATEGY_FAMILIES or not isinstance(value, dict):
@@ -503,6 +504,31 @@ def apply_active_family_params(cfg: Dict[str, Any]) -> None:
 
     cleaned_params[family_key] = {"strategy_mix": cfg.get("strategy_mix", {})}
     cfg["strategy_family_params"] = cleaned_params
+
+
+def _flatten_active_style_params(cfg: Dict[str, Any]) -> None:
+    """把当前激活风格的执行层参数展平到 cfg 顶层，供 advanced_pct / advanced_bool 读取。"""
+    strategy_key = str(cfg.get("strategy", "balanced"))
+    mix = cfg.get("strategy_mix") if isinstance(cfg.get("strategy_mix"), dict) else {}
+    entry = mix.get(strategy_key) if isinstance(mix.get(strategy_key), dict) else {}
+
+    _ADVANCED_FLAT_KEYS = [
+        ("trade_step_limit_enabled", True),
+        ("core_step_pct", 22.0),
+        ("buy_step_limit_pct", 28.0),
+        ("sell_step_limit_pct", 45.0),
+        ("core_min_position_pct", 5.0),
+        ("core_max_position_pct", 92.0),
+        ("strict_min_position_pct", 0.0),
+        ("strict_max_position_pct", 60.0),
+    ]
+    for key, default in _ADVANCED_FLAT_KEYS:
+        if key == "trade_step_limit_enabled":
+            cfg[key] = advanced_bool(entry, key, default)
+        else:
+            cfg[key] = clamp(as_float(entry.get(key), default), 0.0, 100.0)
+    cfg["core_min_position_pct"] = min(float(cfg["core_min_position_pct"]), float(cfg["core_max_position_pct"]))
+    cfg["strict_min_position_pct"] = min(float(cfg["strict_min_position_pct"]), float(cfg["strict_max_position_pct"]))
 
 
 def advanced_pct(cfg: Dict[str, Any], key: str, default: float, min_value: float = 0.0, max_value: float = 100.0) -> float:
@@ -516,17 +542,6 @@ def advanced_bool(cfg: Dict[str, Any], key: str, default: bool = True) -> bool:
         return value.lower() not in {"0", "false", "off", "no", ""}
     return bool(value)
 
-
-def normalise_advanced_config(cfg: Dict[str, Any]) -> None:
-    """把高级参数统一清洗到 cfg，避免旧配置/空值导致策略异常。"""
-    cfg["trade_step_limit_enabled"] = advanced_bool(cfg, "trade_step_limit_enabled", True)
-    for key, default in ADVANCED_PARAM_DEFAULTS.items():
-        if key == "trade_step_limit_enabled":
-            continue
-        cfg[key] = clamp(as_float(cfg.get(key), default), 0.0, 100.0)
-    # 避免最小仓位高于最大仓位。
-    cfg["core_min_position_pct"] = min(float(cfg["core_min_position_pct"]), float(cfg["core_max_position_pct"]))
-    cfg["strict_min_position_pct"] = min(float(cfg["strict_min_position_pct"]), float(cfg["strict_max_position_pct"]))
 
 
 
@@ -832,10 +847,10 @@ def core_allocation_step_limit(cfg: Dict[str, Any], signals: Dict[str, Any], str
         return 1.0, notes
 
     if profile:
-        default_key = f"core_step_{strategy_key}_pct"
-        default_pct = ADVANCED_PARAM_DEFAULTS.get(default_key, ADVANCED_PARAM_DEFAULTS["core_step_balanced_pct"])
+        default_key = "core_step_pct"
+        default_pct = ADVANCED_PARAM_DEFAULTS.get("core_step_pct", 22.0)
     else:
-        default_key = f"buy_step_{strategy_key}_pct"
+        default_key = "buy_step_limit_pct"
         default_pct = {"defensive": 5.0, "balanced": 8.0, "aggressive": 11.0}.get(strategy_key, 8.0)
 
     step = advanced_pct(cfg, default_key, float(default_pct))
@@ -4603,7 +4618,6 @@ BACKTEST_METRIC_NOTES: Dict[str, str] = {
     "换手率": "累计成交金额 / 初始资金。",
     "期末权益": "回测结束时策略账户权益。",
 
-    "策略准入结论": "用于判断这套策略是否值得进模拟盘：同时输给定投和持有且没有明显降低回撤时，应先暂停实盘，只做研究。",
     "相对定投收益差": "策略总收益 - 定投策略总收益。为负表示策略输给定投。",
     "相对持有收益差": "策略总收益 - 买入持有总收益。为负表示策略输给长期持有。",
     "相对定投回撤改善": "定投最大回撤绝对值 - 策略最大回撤绝对值。为正表示策略比定投更抗跌。",
@@ -6065,24 +6079,7 @@ def build_backtest_diagnosis_metrics(
     exposure_ratio = clamp(float(avg_exp_pct or 0.0) / 100.0, 0.0, 2.0)
     estimated_cash_drag = max(float(bench_ret or 0.0), 0.0) * max(0.0, 1.0 - exposure_ratio)
 
-    if ret_gap_dca < 0 and ret_gap_hold < 0:
-        if dd_improve_hold <= 0.03 and dd_improve_dca <= 0.03:
-            verdict = "不建议进模拟盘：收益同时差于定投/持有，且回撤改善不足。"
-        else:
-            verdict = "只适合风控研究：收益落后，但有一定回撤改善。"
-    elif ret_gap_dca >= 0 and ret_gap_hold < 0:
-        verdict = "可继续研究：优于定投但弱于持有，重点看回撤是否明显下降。"
-    elif ret_gap_hold >= 0:
-        verdict = "可进入模拟盘观察：收益不弱于持有，继续检查交易次数和样本外表现。"
-    else:
-        verdict = "中性：需要更多区间和标的验证。"
 
-    if trade_count > 80 and ret_gap_hold < 0:
-        verdict += " 交易次数偏多，优先降低信号敏感度。"
-    if exposure_ratio < 0.55 and bench_ret > 0 and ret_gap_hold < 0:
-        verdict += " 平均仓位偏低，主要风险可能是现金拖累。"
-
-    metrics["策略准入结论"] = verdict
     metrics["相对定投收益差"] = backtest_pct(ret_gap_dca * 100)
     metrics["相对持有收益差"] = backtest_pct(ret_gap_hold * 100)
     metrics["相对定投回撤改善"] = backtest_pct(dd_improve_dca * 100)
@@ -6110,7 +6107,7 @@ def backtest_metrics_rows(metrics: Dict[str, Any]) -> List[Dict[str, Any]]:
         "历史ROE", "页面ROE", "ROE误差",
         # 诊断项放在后面，避免一进回测结果就被“结论/拖累”抢占主指标位置。
         "相对定投收益差", "相对持有收益差", "相对定投回撤改善", "相对持有回撤改善",
-        "估算交易成本拖累", "估算现金拖累", "策略准入结论",
+        "估算交易成本拖累", "估算现金拖累",
     ]
     keys = [k for k in order if k in metrics] + [k for k in metrics.keys() if k not in order]
     return [{"指标": k, "数值": metrics.get(k, "--"), "备注": BACKTEST_METRIC_NOTES.get(k, "")} for k in keys]
@@ -6630,13 +6627,6 @@ def api_config():
         cfg["valuation_method"] = "system_calc"
     cfg["request_timeout_sec"] = clamp(as_float(data.get("request_timeout_sec"), cfg.get("request_timeout_sec", 12.0)), 3.0, 60.0)
     cfg["retry_count"] = int(clamp(as_float(data.get("retry_count"), cfg.get("retry_count", 2)), 0.0, 5.0))
-    for key in ADVANCED_PARAM_KEYS:
-        if key in data:
-            if key == "trade_step_limit_enabled":
-                cfg[key] = advanced_bool(data, key, True)
-            else:
-                cfg[key] = as_float(data.get(key), ADVANCED_PARAM_DEFAULTS.get(key, 0.0))
-    normalise_advanced_config(cfg)
     apply_active_family_params(cfg)
 
     save_config(cfg)

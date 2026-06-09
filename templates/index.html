@@ -126,86 +126,6 @@
                 <input type="number" step="0.1" min="-20" max="30" name="backtest_risk_free_rate_pct" value="{{ cfg.backtest_risk_free_rate_pct }}">
               </label>
 
-              <details class="advanced-params wide">
-                <summary>参数设置（高级，可折叠）</summary>
-                <p class="small">这里控制目标仓位和执行节奏。想测试“直接打到目标仓位”，可以关闭【启用单次操作上限】，或把对应单次上限调到 100%。</p>
-
-                <div class="settings-subtitle">执行层</div>
-                <div class="settings-grid nested">
-                  <label class="field checkbox-field" data-tip="关闭后，检查日会直接调到策略目标仓位；仍保留操作周期、最小执行变化、手续费和滑点。">
-                    <input type="checkbox" name="trade_step_limit_enabled" {% if cfg.trade_step_limit_enabled %}checked{% endif %}>
-                    <span>启用单次操作上限</span>
-                  </label>
-                </div>
-
-                <div class="settings-subtitle">定投增强补足上限（定投增强策略）</div>
-                <div class="settings-grid nested three-cols">
-                  <label class="field" data-tip="防守档每个检查日最多补多少定投增强仓位。">
-                    <span>防守补仓上限 %</span>
-                    <input type="number" step="0.1" min="0" max="100" name="core_step_defensive_pct" value="{{ cfg.core_step_defensive_pct }}">
-                  </label>
-                  <label class="field" data-tip="均衡档每个检查日最多补多少定投增强仓位。">
-                    <span>均衡补仓上限 %</span>
-                    <input type="number" step="0.1" min="0" max="100" name="core_step_balanced_pct" value="{{ cfg.core_step_balanced_pct }}">
-                  </label>
-                  <label class="field" data-tip="进攻档每个检查日最多补多少定投增强仓位。">
-                    <span>进攻补仓上限 %</span>
-                    <input type="number" step="0.1" min="0" max="100" name="core_step_aggressive_pct" value="{{ cfg.core_step_aggressive_pct }}">
-                  </label>
-                </div>
-
-                <div class="settings-subtitle">纯交易仓买入上限</div>
-                <div class="settings-grid nested three-cols">
-                  <label class="field" data-tip="纯交易仓/普通买入信号的防守档单次买入上限。">
-                    <span>防守买入上限 %</span>
-                    <input type="number" step="0.1" min="0" max="100" name="buy_step_defensive_pct" value="{{ cfg.buy_step_defensive_pct }}">
-                  </label>
-                  <label class="field" data-tip="纯交易仓/普通买入信号的均衡档单次买入上限。">
-                    <span>均衡买入上限 %</span>
-                    <input type="number" step="0.1" min="0" max="100" name="buy_step_balanced_pct" value="{{ cfg.buy_step_balanced_pct }}">
-                  </label>
-                  <label class="field" data-tip="纯交易仓/普通买入信号的进攻档单次买入上限。">
-                    <span>进攻买入上限 %</span>
-                    <input type="number" step="0.1" min="0" max="100" name="buy_step_aggressive_pct" value="{{ cfg.buy_step_aggressive_pct }}">
-                  </label>
-                </div>
-
-                <div class="settings-subtitle">卖出上限</div>
-                <div class="settings-grid nested three-cols">
-                  <label class="field" data-tip="防守档基础单次卖出上限；严重破位时仍会按风险倍数放大。">
-                    <span>防守卖出上限 %</span>
-                    <input type="number" step="0.1" min="0" max="100" name="sell_step_defensive_pct" value="{{ cfg.sell_step_defensive_pct }}">
-                  </label>
-                  <label class="field" data-tip="均衡档基础单次卖出上限；严重破位时仍会按风险倍数放大。">
-                    <span>均衡卖出上限 %</span>
-                    <input type="number" step="0.1" min="0" max="100" name="sell_step_balanced_pct" value="{{ cfg.sell_step_balanced_pct }}">
-                  </label>
-                  <label class="field" data-tip="进攻档基础单次卖出上限；严重破位时仍会按风险倍数放大。">
-                    <span>进攻卖出上限 %</span>
-                    <input type="number" step="0.1" min="0" max="100" name="sell_step_aggressive_pct" value="{{ cfg.sell_step_aggressive_pct }}">
-                  </label>
-                </div>
-
-                <div class="settings-subtitle">目标仓位边界</div>
-                <div class="settings-grid nested four-cols">
-                  <label class="field" data-tip="定投增强策略的最低目标仓位。">
-                    <span>增强最低仓位 %</span>
-                    <input type="number" step="0.1" min="0" max="100" name="core_min_position_pct" value="{{ cfg.core_min_position_pct }}">
-                  </label>
-                  <label class="field" data-tip="定投增强策略的最高目标仓位。想更激进可调高到 95~100。">
-                    <span>增强最高仓位 %</span>
-                    <input type="number" step="0.1" min="0" max="100" name="core_max_position_pct" value="{{ cfg.core_max_position_pct }}">
-                  </label>
-                  <label class="field" data-tip="纯交易仓模式的最低目标仓位。">
-                    <span>交易最低仓位 %</span>
-                    <input type="number" step="0.1" min="0" max="100" name="strict_min_position_pct" value="{{ cfg.strict_min_position_pct }}">
-                  </label>
-                  <label class="field" data-tip="纯交易仓模式的最高目标仓位。">
-                    <span>交易最高仓位 %</span>
-                    <input type="number" step="0.1" min="0" max="100" name="strict_max_position_pct" value="{{ cfg.strict_max_position_pct }}">
-                  </label>
-                </div>
-              </details>
 
               <label class="field wide" data-tip="可选。蛋卷接口有时需要 Cookie；建议从 Apifox/浏览器复制 Cookie，失效后重新粘贴。">
                 <span>蛋卷 Cookie（可选）</span>
@@ -721,6 +641,70 @@
 
 .inline-check { display: inline-flex; align-items: center; gap: 6px; color: #3f3025; font-weight: 800; }
 
+
+
+/* v82：统一所有滚动条/滑动条视觉，避免不同区域出现不同宽度和颜色。 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #bda98f #f7efe5;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: #f7efe5;
+  border-radius: 999px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #c3ad91;
+  border: 2px solid #f7efe5;
+  border-radius: 999px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: #ad9374;
+}
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+input[type="range"] {
+  width: 100%;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  accent-color: var(--accent);
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 8px;
+  border-radius: 999px;
+  background: #eadbc8;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  margin-top: -5px;
+  border: 2px solid #fffaf2;
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow: 0 2px 8px rgba(82, 62, 38, .18);
+}
+input[type="range"]::-moz-range-track {
+  height: 8px;
+  border-radius: 999px;
+  background: #eadbc8;
+}
+input[type="range"]::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border: 2px solid #fffaf2;
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow: 0 2px 8px rgba(82, 62, 38, .18);
+}
+
 </style>
 
 <script>
@@ -1162,25 +1146,72 @@
         <input type="${inputType}" name="${escapeHtml(name)}" value="${escapeHtml(defaultValue)}"${step ? ` step="${escapeHtml(step)}"` : ""}${min}${max}>
       </label>`;
   }
+  function captureStrategyFieldValues(names = new Set()) {
+    const preserved = {};
+    names.forEach(name => {
+      const items = $$(`#signal-form [name="${cssEscape(name)}"]`).filter(el => el.dataset.autoHidden !== "1");
+      if (!items.length) return;
+      const type = items[0].type;
+      if (type === "radio") {
+        const checked = items.find(el => el.checked);
+        if (checked) preserved[name] = checked.value;
+        return;
+      }
+      if (type === "checkbox") {
+        const checkedValues = items.filter(el => el.checked).map(el => el.value);
+        if (checkedValues.length) preserved[name] = checkedValues;
+        return;
+      }
+      if (!isBlank(items[0].value)) preserved[name] = items[0].value;
+    });
+    return preserved;
+  }
+
+  function hasExplicitValue(value) {
+    return Array.isArray(value) ? value.length > 0 : !isBlank(value);
+  }
+
   function applyStrategyFieldValues(schema = [], preserved = {}) {
+    let changed = false;
     for (const section of schema || []) {
       for (const field of section.fields || []) {
         const name = String(field.name || "");
         if (!name) continue;
         const explicit = preserved[name];
+        const hasExplicit = hasExplicitValue(explicit);
         const autoValue = lastIndicators && Object.prototype.hasOwnProperty.call(lastIndicators, name) ? lastIndicators[name] : undefined;
-        const value = !isBlank(explicit) ? explicit : (!isBlank(autoValue) ? autoValue : field.default);
-        if (isBlank(value)) continue;
+        const value = hasExplicit ? explicit : (!isBlank(autoValue) ? autoValue : field.default);
+        if (!hasExplicit && isBlank(value)) continue;
         const items = $$(`#signal-form [name="${cssEscape(name)}"]`).filter(el => el.dataset.autoHidden !== "1");
         if (!items.length) continue;
-        if (items[0].type === "radio" || items[0].type === "checkbox") {
-          // 保持策略信号初始未选择；自动/默认值只通过隐藏字段参与计算，不点亮可视选项。
+        if (items[0].type === "radio") {
+          if (!hasExplicit) {
+            // 保持策略信号初始未选择；自动/默认值只通过隐藏字段参与计算，不点亮可视选项。
+            continue;
+          }
+          items.forEach(el => {
+            const shouldCheck = String(el.value) === String(value);
+            if (el.checked !== shouldCheck) changed = true;
+            el.checked = shouldCheck;
+          });
           continue;
-        } else {
-          items[0].value = String(value);
         }
+        if (items[0].type === "checkbox") {
+          if (!hasExplicit) continue;
+          const values = new Set((Array.isArray(value) ? value : [value]).map(item => String(item)));
+          items.forEach(el => {
+            const shouldCheck = values.has(String(el.value));
+            if (el.checked !== shouldCheck) changed = true;
+            el.checked = shouldCheck;
+          });
+          continue;
+        }
+        const nextValue = isBlank(value) ? "" : String(value);
+        if (items[0].value !== nextValue) changed = true;
+        items[0].value = nextValue;
       }
     }
+    return changed;
   }
   function renderStrategySpecificInputs(familyKey = "") {
     const host = $("#strategy-specific-inputs");
@@ -1191,11 +1222,11 @@
     const family = families[key] || {};
     const schema = Array.isArray(family.input_schema) ? family.input_schema : [];
     const names = fieldNamesFromSchema(schema);
-    const preserved = {};
+    const preserved = captureStrategyFieldValues(names);
     names.forEach(name => {
       const hidden = $(`#signal-form input[type="hidden"][data-auto-hidden="1"][name="${cssEscape(name)}"]`);
       if (hidden) {
-        preserved[name] = hidden.value;
+        if (!hasExplicitValue(preserved[name])) preserved[name] = hidden.value;
         hidden.remove();
       }
     });
@@ -1222,8 +1253,8 @@
           <div class="data-grid strategy-dynamic-grid">${fields}</div>
         </section>`;
     }).join("");
-    applyStrategyFieldValues(schema, preserved);
-    notifyFormChanged();
+    const changed = applyStrategyFieldValues(schema, preserved);
+    if (changed) notifyFormChanged();
   }
   window.__renderStrategySpecificInputs = renderStrategySpecificInputs;
 
@@ -1268,13 +1299,12 @@
       if (event.target.closest("#open-auto-data-modal-btn")) openModal();
       if (event.target.closest("[data-close-auto-data]")) closeModal();
       if (event.target.closest("#strategy-family-tabs")) {
+        if (event.target.closest("[data-open-family-settings]")) return;
         const clickedKey = strategyFamilyKeyFromTarget(event.target);
         if (clickedKey) {
           setActiveStrategyFamilyKey(clickedKey);
           renderStrategySpecificInputs(clickedKey);
           [40, 120, 300, 600].forEach(delay => setTimeout(() => renderStrategySpecificInputs(clickedKey), delay));
-        } else {
-          [0, 80, 240].forEach(delay => setTimeout(() => renderStrategySpecificInputs(resolveActiveStrategyFamily()), delay));
         }
       }
     });

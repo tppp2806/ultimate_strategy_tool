@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..base import _as_float, _as_optional_pct_value, clamp, pct2
+from ..base import _as_float, _as_optional_pct_value, clamp, get_strategy, pct2
 
 
 @dataclass
@@ -228,30 +228,40 @@ def _quality_factor(signals: Dict[str, Any]) -> Tuple[float, List[str]]:
     return clamp(score, -1.0, 1.0), [f"质量因子：ROE {roe:.1f}% -> {score:+.2f}。"]
 
 
+def _style_pct(style: Dict[str, Any], key: str, default: float = 100.0) -> float:
+    try:
+        return clamp(float(style.get(key, default)), 0.0, 300.0) / 100.0
+    except (TypeError, ValueError):
+        return default / 100.0
+
+
 def build_mini_factor_result(cfg: Dict[str, Any], signals: Dict[str, Any]) -> MiniFactorResult:
     """构建小因子目标仓位。
 
     设计原则：
     - 不是把几十个技术指标堆成黑箱，而是只保留低频基金可解释的 6 类因子；
     - 每类因子输出 -1~+1 的标准分，再映射为仓位修正；
+    - 每类因子权重由 mini_factor_timing.py 的 STYLE_PARAM_SCHEMA 暴露给前端编辑；
     - 单个因子不能主宰全部仓位，最后仍交给总体策略/参数风格做边界约束。
     """
+    style = get_strategy(cfg)
     result = MiniFactorResult(base=0.50)
     factor_defs = [
-        ("趋势", _trend_factor, 0.20, 0.20),
-        ("估值", _valuation_factor, 0.15, 0.15),
-        ("回撤", _drawdown_factor, 0.10, 0.15),
-        ("波动", _volatility_factor, 0.10, 0.05),
-        ("量能", _volume_factor, 0.05, 0.05),
-        ("质量", _quality_factor, 0.05, 0.10),
+        ("趋势", _trend_factor, 0.20, 0.20, "trend_factor_weight_pct"),
+        ("估值", _valuation_factor, 0.15, 0.15, "valuation_factor_weight_pct"),
+        ("回撤", _drawdown_factor, 0.10, 0.15, "drawdown_factor_weight_pct"),
+        ("波动", _volatility_factor, 0.10, 0.05, "volatility_factor_weight_pct"),
+        ("量能", _volume_factor, 0.05, 0.05, "volume_factor_weight_pct"),
+        ("质量", _quality_factor, 0.05, 0.10, "quality_factor_weight_pct"),
     ]
 
-    for name, fn, max_down, max_up in factor_defs:
+    for name, fn, max_down, max_up, weight_key in factor_defs:
         score, notes = fn(signals)
-        adj = _score_to_adj(score, max_down=max_down, max_up=max_up)
-        result.scores[name] = score
+        weight = _style_pct(style, weight_key, 100.0)
+        adj = _score_to_adj(score, max_down=max_down * weight, max_up=max_up * weight)
+        result.scores[name] = score * weight
         result.adjustments[name] = adj
         result.notes.extend(notes)
-        result.notes.append(f"{name}因子仓位修正：{score:+.2f} -> {pct2(adj)}。")
+        result.notes.append(f"{name}因子仓位修正：{score:+.2f} × {weight:.2f} -> {pct2(adj)}。")
 
     return result

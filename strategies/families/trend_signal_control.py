@@ -23,6 +23,142 @@ FAMILY_META: Dict[str, Any] = {
 }
 
 
+# -----------------------------------------------------------------------------
+# 策略参数微调
+# -----------------------------------------------------------------------------
+# 这些字段由 registry 暴露给前端；前端只根据 schema 渲染，不再硬编码参数项。
+# 数值单位：字段名以 _pct 结尾的参数在 UI 中显示为百分数，策略里按需 /100 使用。
+STYLE_PARAM_PRESETS: Dict[str, Dict[str, Any]] = {
+    "defensive": {
+        "buy_step": 0.16,
+        "sell_step": 0.60,
+        "risk_multiplier": 0.75,
+        "entry_bonus_pct": 70.0,
+        "risk_penalty_pct": 122.0,
+        "valuation_sensitivity_pct": 112.0,
+        "quality_weight_pct": 78.0,
+        "bear_cap_pct": 22.0,
+        "below200_cap_pct": 38.0,
+        "high_valuation_cap_sideways_pct": 62.0,
+        "high_valuation_cap_trend_pct": 76.0,
+        "extreme_valuation_cap_sideways_pct": 52.0,
+        "extreme_valuation_cap_trend_pct": 68.0,
+        "core_base": {"bear": 0.08, "below_200": 0.18, "sideways": 0.38, "above_200": 0.58, "strong_bull": 0.72},
+        "trade_step_limit_enabled": True,
+        "core_step_pct": 13.0,
+        "buy_step_limit_pct": 18.0,
+        "sell_step_limit_pct": 55.0,
+        "core_min_position_pct": 5.0,
+        "core_max_position_pct": 92.0,
+        "strict_min_position_pct": 0.0,
+        "strict_max_position_pct": 60.0,
+    },
+    "balanced": {
+        "buy_step": 0.26,
+        "sell_step": 0.48,
+        "risk_multiplier": 1.00,
+        "entry_bonus_pct": 100.0,
+        "risk_penalty_pct": 100.0,
+        "valuation_sensitivity_pct": 100.0,
+        "quality_weight_pct": 100.0,
+        "bear_cap_pct": 24.0,
+        "below200_cap_pct": 42.0,
+        "high_valuation_cap_sideways_pct": 68.0,
+        "high_valuation_cap_trend_pct": 80.0,
+        "extreme_valuation_cap_sideways_pct": 58.0,
+        "extreme_valuation_cap_trend_pct": 72.0,
+        "core_base": {"bear": 0.12, "below_200": 0.26, "sideways": 0.52, "above_200": 0.72, "strong_bull": 0.84},
+        "trade_step_limit_enabled": True,
+        "core_step_pct": 22.0,
+        "buy_step_limit_pct": 28.0,
+        "sell_step_limit_pct": 45.0,
+        "core_min_position_pct": 5.0,
+        "core_max_position_pct": 92.0,
+        "strict_min_position_pct": 0.0,
+        "strict_max_position_pct": 60.0,
+    },
+    "aggressive": {
+        "buy_step": 0.36,
+        "sell_step": 0.38,
+        "risk_multiplier": 1.20,
+        "entry_bonus_pct": 128.0,
+        "risk_penalty_pct": 86.0,
+        "valuation_sensitivity_pct": 88.0,
+        "quality_weight_pct": 120.0,
+        "bear_cap_pct": 30.0,
+        "below200_cap_pct": 50.0,
+        "high_valuation_cap_sideways_pct": 74.0,
+        "high_valuation_cap_trend_pct": 86.0,
+        "extreme_valuation_cap_sideways_pct": 64.0,
+        "extreme_valuation_cap_trend_pct": 78.0,
+        "core_base": {"bear": 0.18, "below_200": 0.34, "sideways": 0.62, "above_200": 0.82, "strong_bull": 0.92},
+        "trade_step_limit_enabled": True,
+        "core_step_pct": 30.0,
+        "buy_step_limit_pct": 38.0,
+        "sell_step_limit_pct": 35.0,
+        "core_min_position_pct": 5.0,
+        "core_max_position_pct": 92.0,
+        "strict_min_position_pct": 0.0,
+        "strict_max_position_pct": 60.0,
+    },
+}
+
+STYLE_PARAM_SCHEMA: List[Dict[str, Any]] = [
+    {
+        "title": "执行速度",
+        "desc": "控制本策略从当前仓位靠近目标仓位的速度。",
+        "fields": [
+            {"name": "buy_step_pct", "label": "买入节奏%", "type": "number", "default": 26.0, "min": 0, "max": 100, "step": 0.1, "tip": "买入/加仓时的单次执行速度。越高越快接近目标仓位。"},
+            {"name": "sell_step_pct", "label": "卖出节奏%", "type": "number", "default": 48.0, "min": 0, "max": 100, "step": 0.1, "tip": "减仓/止盈时的单次执行速度。越高卖出越快。"},
+            {"name": "risk_multiplier", "label": "风险倍率", "type": "number", "default": 1.0, "min": 0.1, "max": 5, "step": 0.05, "tip": "风险预算倍率。1=默认，低于1更保守，高于1更激进。"},
+        ],
+    },
+    {
+        "title": "趋势信号权重",
+        "desc": "趋势信号策略专属：控制入场信号、风险信号、估值和质量对目标仓位的影响强度。",
+        "fields": [
+            {"name": "entry_bonus_pct", "label": "入场信号强度%", "type": "number", "default": 100.0, "min": 0, "max": 200, "step": 1, "tip": "突破、回踩不破、强趋势延续等入场信号的加仓幅度倍率。"},
+            {"name": "risk_penalty_pct", "label": "风险信号惩罚%", "type": "number", "default": 100.0, "min": 0, "max": 200, "step": 1, "tip": "破位、冲高回落、大盘同步走弱等风险信号的减仓幅度倍率。"},
+            {"name": "valuation_sensitivity_pct", "label": "估值敏感度%", "type": "number", "default": 100.0, "min": 0, "max": 200, "step": 1, "tip": "PE/PB 百分位对目标仓位的影响倍率。"},
+            {"name": "quality_weight_pct", "label": "盈利质量权重%", "type": "number", "default": 100.0, "min": 0, "max": 200, "step": 1, "tip": "ROE 对目标仓位的影响倍率；高估时仍会自动衰减。"},
+        ],
+    },
+    {
+        "title": "仓位上限",
+        "desc": "趋势策略的硬风控上限。用于限制熊市、200日线下和高估环境的最高目标仓位。",
+        "fields": [
+            {"name": "bear_cap_pct", "label": "熊市上限%", "type": "number", "default": 24.0, "min": 0, "max": 100, "step": 0.5, "tip": "大趋势进入熊市/大空头时的最高仓位。"},
+            {"name": "below200_cap_pct", "label": "200日线下上限%", "type": "number", "default": 42.0, "min": 0, "max": 100, "step": 0.5, "tip": "未站上200日线时的最高仓位。"},
+            {"name": "high_valuation_cap_sideways_pct", "label": "高估震荡上限%", "type": "number", "default": 68.0, "min": 0, "max": 100, "step": 0.5, "tip": "PE≥90 且非明确多头时的最高仓位。"},
+            {"name": "high_valuation_cap_trend_pct", "label": "高估多头上限%", "type": "number", "default": 80.0, "min": 0, "max": 100, "step": 0.5, "tip": "PE≥90 且趋势仍强时的最高仓位。"},
+            {"name": "extreme_valuation_cap_sideways_pct", "label": "极高估震荡上限%", "type": "number", "default": 58.0, "min": 0, "max": 100, "step": 0.5, "tip": "PE≥95 且非明确多头时的最高仓位。"},
+            {"name": "extreme_valuation_cap_trend_pct", "label": "极高估多头上限%", "type": "number", "default": 72.0, "min": 0, "max": 100, "step": 0.5, "tip": "PE≥95 且趋势仍强时的最高仓位。"},
+        ],
+    },
+    {
+        "title": "执行层控制",
+        "desc": "控制目标仓位和执行节奏。想直接打到目标仓位，可以关闭【启用单次操作上限】，或把对应单次上限调到 100%。",
+        "fields": [
+            {"name": "trade_step_limit_enabled", "label": "启用单次操作上限", "type": "checkbox", "default": True, "tip": "关闭后，检查日会直接调到策略目标仓位；仍保留操作周期、最小执行变化、手续费和滑点。"},
+            {"name": "core_step_pct", "label": "补仓上限%", "type": "number", "default": 22.0, "min": 0, "max": 100, "step": 0.1, "tip": "定投增强策略每个检查日最多补多少定投增强仓位。"},
+            {"name": "buy_step_limit_pct", "label": "买入上限%", "type": "number", "default": 28.0, "min": 0, "max": 100, "step": 0.1, "tip": "纯交易仓/普通买入信号的单次买入上限。"},
+            {"name": "sell_step_limit_pct", "label": "卖出上限%", "type": "number", "default": 45.0, "min": 0, "max": 100, "step": 0.1, "tip": "基础单次卖出上限；严重破位时仍会按风险倍数放大。"},
+        ],
+    },
+    {
+        "title": "目标仓位边界",
+        "desc": "控制策略目标仓位的最低和最高边界。",
+        "fields": [
+            {"name": "core_min_position_pct", "label": "增强最低仓位%", "type": "number", "default": 5.0, "min": 0, "max": 100, "step": 0.1, "tip": "定投增强策略的最低目标仓位。"},
+            {"name": "core_max_position_pct", "label": "增强最高仓位%", "type": "number", "default": 92.0, "min": 0, "max": 100, "step": 0.1, "tip": "定投增强策略的最高目标仓位。想更激进可调高到 95~100。"},
+            {"name": "strict_min_position_pct", "label": "交易最低仓位%", "type": "number", "default": 0.0, "min": 0, "max": 100, "step": 0.1, "tip": "纯交易仓模式的最低目标仓位。"},
+            {"name": "strict_max_position_pct", "label": "交易最高仓位%", "type": "number", "default": 60.0, "min": 0, "max": 100, "step": 0.1, "tip": "纯交易仓模式的最高目标仓位。"},
+        ],
+    },
+    {"type": "core_base_table", "name": "core_base_pct", "title": "趋势基础目标仓位表", "desc": "每个趋势状态下的基础目标仓位；后续再叠加估值、质量、信号和风控修正。"},
+]
+
+
 INPUT_SCHEMA = [
     {
         "title": "② 策略信号 / 趋势环境",
@@ -125,6 +261,20 @@ INPUT_SCHEMA = [
 ]
 
 
+def _pct_param(strategy: Dict[str, Any], key: str, default: float) -> float:
+    try:
+        return clamp(float(strategy.get(key, default)), 0.0, 500.0) / 100.0
+    except (TypeError, ValueError):
+        return default / 100.0
+
+
+def _cap_param(strategy: Dict[str, Any], key: str, default: float) -> float:
+    try:
+        return clamp(float(strategy.get(key, default)), 0.0, 100.0) / 100.0
+    except (TypeError, ValueError):
+        return default / 100.0
+
+
 def target_weight(cfg: Dict[str, Any], signals: Dict[str, Any]) -> Tuple[float, List[str]]:
     """趋势信号风控策略的目标仓位生成器。
 
@@ -135,6 +285,11 @@ def target_weight(cfg: Dict[str, Any], signals: Dict[str, Any]) -> Tuple[float, 
     exit_state = str(signals.get("exit_state", "none"))
     entry = str(signals.get("entry_state", "none"))
     notes: List[str] = []
+
+    valuation_mult = _pct_param(strategy, "valuation_sensitivity_pct", 100.0)
+    quality_mult = _pct_param(strategy, "quality_weight_pct", 100.0)
+    risk_mult = _pct_param(strategy, "risk_penalty_pct", 100.0)
+    entry_mult = _pct_param(strategy, "entry_bonus_pct", 100.0)
 
     base_table = strategy.get("core_base") or STRATEGY_PRESETS["balanced"]["core_base"]
     base = float(base_table.get(market, 0.50))
@@ -168,7 +323,7 @@ def target_weight(cfg: Dict[str, Any], signals: Dict[str, Any]) -> Tuple[float, 
         else:
             adj = -0.07 - (pe - 85.0) / 15.0 * 0.13
             notes.append("估值压力较高，追涨和一次性加仓都需要克制。")
-        target += adj
+        target += adj * valuation_mult
 
     if pb is not None:
         if pb <= 40:
@@ -178,7 +333,7 @@ def target_weight(cfg: Dict[str, Any], signals: Dict[str, Any]) -> Tuple[float, 
         else:
             adj = -0.04 - (pb - 85.0) / 15.0 * 0.05
             notes.append("PB 也显示偏贵，进一步压低交易仓进攻性。")
-        target += adj
+        target += adj * valuation_mult
 
     if roe is not None:
         if roe >= 12:
@@ -189,36 +344,36 @@ def target_weight(cfg: Dict[str, Any], signals: Dict[str, Any]) -> Tuple[float, 
         else:
             adj = -min((12.0 - roe) / 12.0 * 0.07, 0.07)
             notes.append("盈利质量偏弱，不适合提高进攻性。")
-        target += adj
+        target += adj * quality_mult
 
     if signals.get("market_risk"):
-        target -= 0.12
+        target -= 0.12 * risk_mult
         notes.append("大盘或同类资产同步走弱，单一标的信号需要降权。")
     if signals.get("far_from_ma"):
-        target -= 0.04
+        target -= 0.04 * risk_mult
         notes.append("价格远离均线，追高风险上升。")
     if signals.get("upper_shadow") or signals.get("failed_close"):
-        target -= 0.05
+        target -= 0.05 * risk_mult
         notes.append("冲高回落或收盘未确认，说明上方承接还不够稳定。")
 
     if exit_state == "below_20":
-        target -= 0.06
+        target -= 0.06 * risk_mult
         notes.append("短线趋势弱化，先降低交易仓而不是直接处理核心仓。")
     elif exit_state == "failed_breakout":
-        target -= 0.10
+        target -= 0.10 * risk_mult
         notes.append("突破失败，说明入场理由减弱，需要先控风险。")
     elif exit_state == "below_50":
-        target -= 0.18
+        target -= 0.18 * risk_mult
         notes.append("中期趋势转弱，仓位应进入防守状态。")
     elif exit_state == "below_200":
-        target -= 0.10
+        target -= 0.10 * risk_mult
         notes.append("长期趋势失守，优先保留防守仓位。")
     elif exit_state == "hit_stop":
-        target -= 0.10
+        target -= 0.10 * risk_mult
         notes.append("初始止损触发，交易增强仓的理由已经失效。")
 
     if entry in {"pullback_hold", "breakout", "continuation_high"} and exit_state == "none":
-        bonus = {"pullback_hold": 0.04, "breakout": 0.03, "continuation_high": 0.02}.get(entry, 0.0)
+        bonus = {"pullback_hold": 0.04, "breakout": 0.03, "continuation_high": 0.02}.get(entry, 0.0) * entry_mult
         target += bonus
         if entry == "pullback_hold":
             notes.append("回踩不破比直接追高更稳，属于较好的趋势内加仓条件。")
@@ -232,13 +387,13 @@ def target_weight(cfg: Dict[str, Any], signals: Dict[str, Any]) -> Tuple[float, 
 
     cap = high
     if pe is not None and pe >= 95:
-        cap = min(cap, 0.58 if market in {"sideways", "below_200", "bear"} else 0.72)
+        cap = min(cap, _cap_param(strategy, "extreme_valuation_cap_sideways_pct", 58.0) if market in {"sideways", "below_200", "bear"} else _cap_param(strategy, "extreme_valuation_cap_trend_pct", 72.0))
     elif pe is not None and pe >= 90:
-        cap = min(cap, 0.68 if market in {"sideways", "below_200", "bear"} else 0.80)
+        cap = min(cap, _cap_param(strategy, "high_valuation_cap_sideways_pct", 68.0) if market in {"sideways", "below_200", "bear"} else _cap_param(strategy, "high_valuation_cap_trend_pct", 80.0))
     if market == "bear":
-        cap = min(cap, 0.24)
+        cap = min(cap, _cap_param(strategy, "bear_cap_pct", 24.0))
     elif market == "below_200":
-        cap = min(cap, 0.42)
+        cap = min(cap, _cap_param(strategy, "below200_cap_pct", 42.0))
 
     target = clamp(max(target, floor), low, cap)
     if market in {"strong_bull", "above_200"} and exit_state == "none":

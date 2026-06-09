@@ -1,9 +1,0 @@
-前端检查项目：
-1. node --check static/app.js：通过
-2. Jinja 模板离线渲染：通过
-3. 关键 DOM 节点存在性检查：通过
-4. 重复 id 检查：通过，未发现重复 id
-5. 顶部总体策略下拉栏 CSS：已使用 top-strategy-select-card 布局，不再使用横向卡片挤压布局
-6. 策略输入区：由各策略模块 INPUT_SCHEMA 动态渲染，不再给所有策略套同一套趋势信号按钮
-
-说明：当前沙盒缺少 Flask 依赖，未启动完整本地服务；请在本机执行 pip install -r requirements.txt 后用 python app.py 启动。

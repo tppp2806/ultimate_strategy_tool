@@ -61,8 +61,58 @@
     return strategyFamilyInfo[key] ? key : (strategyFamilyKeys[0] || key);
   }
 
-  function defaultCoreBasePct(styleKey) {
-    const info = strategyInfo[styleKey] || {};
+  function fallbackStyleParamSchema() {
+    return [
+      {
+        title: "执行速度",
+        desc: "兼容旧策略文件的默认参数。新策略应在 Python 中声明 STYLE_PARAM_SCHEMA。",
+        fields: [
+          {name: "buy_step_pct", label: "买入节奏%", type: "number", default: 28, min: 0, max: 100, step: 0.1, tip: "买入/加仓时的单次执行速度。"},
+          {name: "sell_step_pct", label: "卖出节奏%", type: "number", default: 45, min: 0, max: 100, step: 0.1, tip: "减仓/止盈时的单次执行速度。"},
+          {name: "risk_multiplier", label: "风险倍率", type: "number", default: 1, min: 0.1, max: 5, step: 0.05, tip: "风险预算倍率。"}
+        ]
+      },
+      {type: "core_base_table", name: "core_base_pct", title: "目标仓位表", desc: "不同趋势状态下的基础目标仓位。"}
+    ];
+  }
+
+  function styleParamSchema(familyKey) {
+    const family = strategyFamilyInfo[familyKey] || {};
+    return Array.isArray(family.style_param_schema) && family.style_param_schema.length
+      ? family.style_param_schema
+      : fallbackStyleParamSchema();
+  }
+
+  function iterStyleParamFields(familyKey) {
+    const fields = [];
+    for (const group of styleParamSchema(familyKey)) {
+      if (!group || typeof group !== "object") continue;
+      if (group.type === "core_base_table") {
+        fields.push(Object.assign({name: "core_base_pct", type: "core_base_table"}, group));
+        continue;
+      }
+      if (!Array.isArray(group.fields)) continue;
+      for (const field of group.fields) {
+        if (field && typeof field === "object" && field.name) fields.push(field);
+      }
+    }
+    return fields;
+  }
+
+  function familyStylePreset(familyKey, styleKey) {
+    const family = strategyFamilyInfo[familyKey] || {};
+    const familyPresets = family.style_param_presets && typeof family.style_param_presets === "object" ? family.style_param_presets : {};
+    const familyPreset = familyPresets[styleKey] && typeof familyPresets[styleKey] === "object" ? familyPresets[styleKey] : {};
+    const globalPreset = strategyInfo[styleKey] || {};
+    return Object.assign({}, globalPreset, familyPreset, {
+      name: globalPreset.name || familyPreset.name || styleKey,
+      desc: globalPreset.desc || familyPreset.desc || "",
+      research_note: globalPreset.research_note || familyPreset.research_note || globalPreset.desc || ""
+    });
+  }
+
+  function defaultCoreBasePct(styleKey, familyKey = activeFamilyKeyFromForm()) {
+    const info = familyStylePreset(familyKey, styleKey);
     const coreBase = info.core_base || {};
     const out = {};
     for (const state of Object.keys(strategyMarketStates)) {
@@ -71,20 +121,51 @@
     return out;
   }
 
-  function defaultStyleEntry(styleKey, selectedStyle) {
-    const info = strategyInfo[styleKey] || {};
+  function fieldDefaultValue(field, preset, fallback = 0) {
+    const name = field?.name || "";
+    if (Object.prototype.hasOwnProperty.call(preset, name)) return preset[name];
+    if (name === "buy_step_pct") return numberOr(preset.buy_step, 0.28) * 100;
+    if (name === "sell_step_pct") return numberOr(preset.sell_step, 0.45) * 100;
+    if (name === "risk_multiplier") return numberOr(preset.risk_multiplier, 1);
+    return field?.default ?? fallback;
+  }
+
+  function clampNumber(value, min, max) {
+    const n = numberOr(value, numberOr(min, 0));
+    const low = numberOr(min, 0);
+    const high = numberOr(max, 100);
+    return Math.max(Math.min(n, Math.max(low, high)), Math.min(low, high));
+  }
+
+  function normaliseParamValue(value, field, fallback) {
+    const type = field?.type || "number";
+    if (type === "checkbox") return Boolean(value);
+    if (type === "select" || type === "choice") {
+      const raw = value === undefined || value === null || value === "" ? String(fallback ?? "") : String(value);
+      const allowed = Array.isArray(field.options) ? field.options.map(item => String(Array.isArray(item) ? item[0] : item)) : [];
+      return !allowed.length || allowed.includes(raw) ? raw : String(fallback ?? "");
+    }
+    return clampNumber(value === undefined || value === null || value === "" ? fallback : value, field?.min ?? 0, field?.max ?? 100);
+  }
+
+  function defaultStyleEntry(styleKey, selectedStyle, familyKey = activeFamilyKeyFromForm()) {
+    const info = familyStylePreset(familyKey, styleKey);
     const selected = styleKey === selectedStyle;
-    return {
+    const entry = {
       enabled: selected,
       weight_pct: selected ? 100 : 0,
-      buy_step_pct: numberOr(info.buy_step, 0.28) * 100,
-      sell_step_pct: numberOr(info.sell_step, 0.45) * 100,
-      risk_multiplier: numberOr(info.risk_multiplier, 1),
-      core_base_pct: defaultCoreBasePct(styleKey)
+      core_base_pct: defaultCoreBasePct(styleKey, familyKey)
     };
+    for (const field of iterStyleParamFields(familyKey)) {
+      if (!field.name || field.name === "core_base_pct") continue;
+      const fallback = fieldDefaultValue(field, info, 0);
+      entry[field.name] = normaliseParamValue(fallback, field, fallback);
+    }
+    return entry;
   }
 
   function normaliseFamilyParams(rawFamilyParams, cfg = {}) {
+    const familyKey = cfg.strategy_family || activeFamilyKeyFromForm();
     const raw = rawFamilyParams && typeof rawFamilyParams === "object" ? rawFamilyParams : {};
     // 参数风格是全局选择，不再跟随总体策略分别持久化。
     // 旧配置里 raw.strategy 会被忽略，只保留该总体策略下各风格的微调参数。
@@ -94,7 +175,8 @@
       : (cfg.strategy_mix && typeof cfg.strategy_mix === "object" ? cfg.strategy_mix : {});
     const mix = {};
     for (const styleKey of strategyKeys) {
-      const defaults = defaultStyleEntry(styleKey, selectedStyle);
+      const defaults = defaultStyleEntry(styleKey, selectedStyle, familyKey);
+      const preset = familyStylePreset(familyKey, styleKey);
       const entry = rawMix[styleKey] && typeof rawMix[styleKey] === "object" ? rawMix[styleKey] : {};
       const rawCore = entry.core_base_pct && typeof entry.core_base_pct === "object" ? entry.core_base_pct : {};
       const coreBasePct = {};
@@ -102,17 +184,21 @@
         coreBasePct[state] = numberOr(rawCore[state], defaults.core_base_pct[state]);
       }
       const selected = styleKey === selectedStyle;
-      mix[styleKey] = {
+      const item = {
         enabled: selected,
         weight_pct: selected ? 100 : 0,
-        buy_step_pct: numberOr(entry.buy_step_pct, defaults.buy_step_pct),
-        sell_step_pct: numberOr(entry.sell_step_pct, defaults.sell_step_pct),
-        risk_multiplier: numberOr(entry.risk_multiplier, defaults.risk_multiplier),
         core_base_pct: coreBasePct
       };
+      for (const field of iterStyleParamFields(familyKey)) {
+        if (!field.name || field.name === "core_base_pct") continue;
+        const fallback = defaults[field.name] ?? fieldDefaultValue(field, preset, 0);
+        item[field.name] = normaliseParamValue(entry[field.name], field, fallback);
+      }
+      mix[styleKey] = item;
     }
     return {strategy_mix: mix};
   }
+
 
   function normaliseAllFamilyParams(rawAll, cfg = {}) {
     const out = {};
@@ -153,7 +239,7 @@
     for (const familyKey of strategyFamilyKeys) {
       const params = getFamilyParams(familyKey);
       for (const key of strategyKeys) {
-        if (!params.strategy_mix[key]) params.strategy_mix[key] = defaultStyleEntry(key, normalized);
+        if (!params.strategy_mix[key]) params.strategy_mix[key] = defaultStyleEntry(key, normalized, familyKey);
         params.strategy_mix[key].enabled = key === normalized;
         params.strategy_mix[key].weight_pct = key === normalized ? 100 : 0;
       }
@@ -200,7 +286,7 @@
     const params = getFamilyParams(familyKey);
     const selectedStyle = strategyKeys.includes(data?.strategy) ? data.strategy : activeStyleKeyFromForm();
     for (const key of strategyKeys) {
-      if (!params.strategy_mix[key]) params.strategy_mix[key] = defaultStyleEntry(key, selectedStyle);
+      if (!params.strategy_mix[key]) params.strategy_mix[key] = defaultStyleEntry(key, selectedStyle, familyKey);
       params.strategy_mix[key].enabled = key === selectedStyle;
       params.strategy_mix[key].weight_pct = key === selectedStyle ? 100 : 0;
     }
@@ -475,15 +561,6 @@
     auto: "自动"
   };
 
-  const ADVANCED_CONFIG_KEYS = [
-    "trade_step_limit_enabled",
-    "buy_step_defensive_pct", "buy_step_balanced_pct", "buy_step_aggressive_pct",
-    "sell_step_defensive_pct", "sell_step_balanced_pct", "sell_step_aggressive_pct",
-    "core_step_defensive_pct", "core_step_balanced_pct", "core_step_aggressive_pct",
-    "core_min_position_pct", "core_max_position_pct",
-    "strict_min_position_pct", "strict_max_position_pct"
-  ];
-
   function debounce(fn, wait = 220) {
     let timer = null;
     return (...args) => {
@@ -599,14 +676,6 @@
       retry_count: Number(data.retry_count || 2),
       danjuan_cookie: data.danjuan_cookie || ""
     };
-    for (const key of ADVANCED_CONFIG_KEYS) {
-      if (key === "trade_step_limit_enabled") {
-        payload[key] = Boolean(data[key]);
-      } else {
-        const raw = data[key];
-        payload[key] = raw === undefined || raw === "" ? undefined : Number(raw);
-      }
-    }
     return payload;
   }
 
@@ -792,8 +861,8 @@
 
     // 这里只编辑一个风格的参数；当前执行风格由左侧【参数风格】选择。
     const styleKey = editStyle;
-    const styleInfo = strategyInfo[styleKey] || {};
-    const entry = params.strategy_mix[styleKey] || defaultStyleEntry(styleKey, activeStyleKeyFromForm());
+    const styleInfo = familyStylePreset(familyKey, styleKey);
+    const entry = params.strategy_mix[styleKey] || defaultStyleEntry(styleKey, activeStyleKeyFromForm(), familyKey);
     const section = document.createElement("section");
     section.className = "family-param-card is-active";
     section.dataset.familyKey = familyKey;
@@ -808,57 +877,97 @@
     appendTextEl(head, "span", "family-param-badge", styleKey === activeStyleKeyFromForm() ? "当前执行" : "备用配置");
     section.appendChild(head);
 
-    const grid = document.createElement("div");
-    grid.className = "family-param-grid";
-    const fields = [
-      ["buy_step_pct", "买入节奏%", "买入/加仓时的单次执行速度。越高越快接近目标仓位。", 0, 100, 0.1],
-      ["sell_step_pct", "卖出节奏%", "减仓/止盈时的单次执行速度。越高卖出越快。", 0, 100, 0.1],
-      ["risk_multiplier", "风险倍率", "风险预算倍率。1=默认，低于1更保守，高于1更激进。", 0.1, 5, 0.05],
-    ];
-    for (const [field, labelText, tip, min, max, step] of fields) {
+    const renderValueField = (grid, field) => {
+      const name = field.name;
+      const fallback = fieldDefaultValue(field, styleInfo, 0);
       const label = document.createElement("label");
-      label.className = "mini-field";
-      label.dataset.tip = tip;
-      appendTextEl(label, "span", "", labelText);
-      const input = document.createElement("input");
-      input.type = "number";
-      input.step = String(step);
-      input.min = String(min);
-      input.max = String(max);
-      input.value = entry[field] ?? defaultStyleEntry(styleKey, activeStyleKeyFromForm())[field];
+      label.className = field.type === "checkbox" ? "mini-field mini-field-check" : "mini-field";
+      label.dataset.tip = field.tip || field.desc || "";
+      appendTextEl(label, "span", "", field.label || name);
+
+      let input;
+      if (field.type === "select" || field.type === "choice") {
+        input = document.createElement("select");
+        const options = Array.isArray(field.options) ? field.options : [];
+        for (const item of options) {
+          const value = Array.isArray(item) ? item[0] : item;
+          const text = Array.isArray(item) ? (item[1] || item[0]) : item;
+          const option = document.createElement("option");
+          option.value = String(value);
+          option.textContent = String(text);
+          input.appendChild(option);
+        }
+        input.value = normaliseParamValue(entry[name], field, fallback);
+      } else {
+        input = document.createElement("input");
+        input.type = field.type === "checkbox" ? "checkbox" : "number";
+        if (input.type === "checkbox") {
+          input.checked = Boolean(entry[name] ?? fallback);
+        } else {
+          input.step = String(field.step ?? 0.1);
+          input.min = String(field.min ?? 0);
+          input.max = String(field.max ?? 100);
+          input.value = normaliseParamValue(entry[name], field, fallback);
+        }
+      }
       input.dataset.familyParam = familyKey;
       input.dataset.styleKey = styleKey;
-      input.dataset.field = field;
+      input.dataset.field = name;
       label.appendChild(input);
       grid.appendChild(label);
-    }
-    section.appendChild(grid);
+    };
 
-    const details = document.createElement("details");
-    details.className = "family-core-tune";
-    appendTextEl(details, "summary", "", "目标仓位表");
-    const coreGrid = document.createElement("div");
-    coreGrid.className = "family-core-grid";
-    for (const [state, stateName] of Object.entries(strategyMarketStates)) {
-      const label = document.createElement("label");
-      label.className = "mini-field";
-      label.dataset.tip = `${stateName}状态下，该参数风格的基础目标仓位。`;
-      appendTextEl(label, "span", "", `${stateName}%`);
-      const input = document.createElement("input");
-      input.type = "number";
-      input.step = "0.1";
-      input.min = "0";
-      input.max = "100";
-      input.value = entry.core_base_pct?.[state] ?? defaultCoreBasePct(styleKey)[state];
-      input.dataset.familyParam = familyKey;
-      input.dataset.styleKey = styleKey;
-      input.dataset.field = "core_base_pct";
-      input.dataset.state = state;
-      label.appendChild(input);
-      coreGrid.appendChild(label);
+    for (const group of styleParamSchema(familyKey)) {
+      if (!group || typeof group !== "object") continue;
+
+      if (group.type === "core_base_table") {
+        const details = document.createElement("details");
+        details.className = "family-core-tune";
+        appendTextEl(details, "summary", "", group.title || "目标仓位表");
+        if (group.desc) appendTextEl(details, "p", "family-param-help", group.desc);
+        const coreGrid = document.createElement("div");
+        coreGrid.className = "family-core-grid";
+        for (const [state, stateName] of Object.entries(strategyMarketStates)) {
+          const label = document.createElement("label");
+          label.className = "mini-field";
+          label.dataset.tip = `${stateName}状态下，该参数风格的基础目标仓位。`;
+          appendTextEl(label, "span", "", `${stateName}%`);
+          const input = document.createElement("input");
+          input.type = "number";
+          input.step = "0.1";
+          input.min = "0";
+          input.max = "100";
+          input.value = entry.core_base_pct?.[state] ?? defaultCoreBasePct(styleKey, familyKey)[state];
+          input.dataset.familyParam = familyKey;
+          input.dataset.styleKey = styleKey;
+          input.dataset.field = "core_base_pct";
+          input.dataset.state = state;
+          label.appendChild(input);
+          coreGrid.appendChild(label);
+        }
+        details.appendChild(coreGrid);
+        section.appendChild(details);
+        continue;
+      }
+
+      const fields = Array.isArray(group.fields) ? group.fields.filter(field => field && field.name) : [];
+      if (!fields.length) continue;
+      const groupBox = document.createElement("div");
+      groupBox.className = "family-param-subgroup";
+      if (group.title || group.desc) {
+        const groupHead = document.createElement("div");
+        groupHead.className = "family-param-group-title";
+        if (group.title) appendTextEl(groupHead, "strong", "", group.title);
+        if (group.desc) appendTextEl(groupHead, "em", "", group.desc);
+        groupBox.appendChild(groupHead);
+      }
+      const grid = document.createElement("div");
+      grid.className = "family-param-grid";
+      for (const field of fields) renderValueField(grid, field);
+      groupBox.appendChild(grid);
+      section.appendChild(groupBox);
     }
-    details.appendChild(coreGrid);
-    section.appendChild(details);
+
     list.appendChild(section);
     body.appendChild(list);
   }
@@ -879,14 +988,17 @@
     const field = target.dataset.field;
     if (!styleKey || !field) return false;
     const params = getFamilyParams(familyKey);
-    if (!params.strategy_mix[styleKey]) params.strategy_mix[styleKey] = defaultStyleEntry(styleKey, activeStyleKeyFromForm());
-    const num = numberOr(target.value, 0);
+    if (!params.strategy_mix[styleKey]) params.strategy_mix[styleKey] = defaultStyleEntry(styleKey, activeStyleKeyFromForm(), familyKey);
+    const fieldSpec = iterStyleParamFields(familyKey).find(item => item.name === field) || {name: field, type: target.type === "checkbox" ? "checkbox" : "number", min: target.min, max: target.max};
     if (field === "core_base_pct") {
       const state = target.dataset.state;
+      const num = clampNumber(target.value, 0, 100);
       if (!params.strategy_mix[styleKey].core_base_pct) params.strategy_mix[styleKey].core_base_pct = {};
       params.strategy_mix[styleKey].core_base_pct[state] = num;
     } else {
-      params.strategy_mix[styleKey][field] = num;
+      const fallback = fieldDefaultValue(fieldSpec, familyStylePreset(familyKey, styleKey), 0);
+      const raw = target.type === "checkbox" ? target.checked : target.value;
+      params.strategy_mix[styleKey][field] = normaliseParamValue(raw, fieldSpec, fallback);
     }
     updateStrategySummary();
     return true;
@@ -1163,7 +1275,7 @@
     const assetText = data.symbol ? `${data.symbol_name || data.symbol} · ${data.symbol} · ${marketNames[data.market] || data.market} · ${data.asset_kind}` : "未选择标的";
     const stepText = data.trade_step_limit_enabled === false
       ? "关闭（检查日直接调到目标仓位）"
-      : `开启（长期均衡补仓上限 ${data.core_step_balanced_pct ?? 22}%）`;
+      : `开启（补仓上限 ${data.core_step_pct ?? 22}%）`;
     summary.innerHTML = `${strategyFamilyText(data.strategy_family)}<br>${strategySummaryText(data)}<br>仓位模式：${modeText}<br>标的：${assetText}<br>数据容错：代理 ${data.proxy_mode || "system"} / 超时 ${data.request_timeout_sec || 12} 秒 / 重试 ${data.retry_count || 0} 次<br>回测无风险收益率：${data.backtest_risk_free_rate_pct ?? 2}%<br>单次操作上限：${stepText}<br>计划资金=100%上限，不按标的类型封顶。`;
     updateStrategyLabState(data);
 
@@ -1801,6 +1913,7 @@
       if (openBtn) {
         event.preventDefault();
         event.stopPropagation();
+        if (typeof event.stopImmediatePropagation === "function") event.stopImmediatePropagation();
         openFamilySettings(openBtn.dataset.openFamilySettings);
         return;
       }

@@ -54,11 +54,17 @@ _REGISTERED_MODULES = tuple(_iter_family_modules())
 
 def _family_meta_with_schema(module: ModuleType) -> Dict[str, Any]:
     meta = dict(getattr(module, "FAMILY_META", {}) or {})
+
     input_schema = getattr(module, "INPUT_SCHEMA", None)
-    if isinstance(input_schema, list):
-        meta["input_schema"] = input_schema
-    else:
-        meta["input_schema"] = []
+    meta["input_schema"] = input_schema if isinstance(input_schema, list) else []
+
+    # 每个总体策略可以在自己的 Python 文件中声明可编辑参数。
+    # 前端只负责根据 schema 渲染，不再硬编码“均衡微调”里有哪些字段。
+    style_param_schema = getattr(module, "STYLE_PARAM_SCHEMA", None)
+    meta["style_param_schema"] = style_param_schema if isinstance(style_param_schema, list) else []
+
+    style_param_presets = getattr(module, "STYLE_PARAM_PRESETS", None)
+    meta["style_param_presets"] = style_param_presets if isinstance(style_param_presets, dict) else {}
     return meta
 
 

@@ -71,19 +71,13 @@ STRATEGY_MARKET_STATES: Dict[str, str] = {
 }
 
 
-# 设置页【参数设置】使用。数值单位均为百分数，保存后在后端转成 0~1 使用。
-# 这些参数只负责“执行层/目标仓位层”的速度和边界，不改变估值/趋势信号本身。
+# 执行层参数默认值。由策略风格的 strategy_mix 提供，
+# 在 apply_active_family_params 中展平到 cfg 顶层供 advanced_pct / advanced_bool 读取。
 ADVANCED_PARAM_DEFAULTS: Dict[str, Any] = {
     "trade_step_limit_enabled": True,
-    "buy_step_defensive_pct": 18.0,
-    "buy_step_balanced_pct": 28.0,
-    "buy_step_aggressive_pct": 38.0,
-    "sell_step_defensive_pct": 55.0,
-    "sell_step_balanced_pct": 45.0,
-    "sell_step_aggressive_pct": 35.0,
-    "core_step_defensive_pct": 13.0,
-    "core_step_balanced_pct": 22.0,
-    "core_step_aggressive_pct": 30.0,
+    "core_step_pct": 22.0,
+    "buy_step_limit_pct": 28.0,
+    "sell_step_limit_pct": 45.0,
     "core_min_position_pct": 5.0,
     "core_max_position_pct": 92.0,
     "strict_min_position_pct": 0.0,
@@ -147,27 +141,129 @@ def _read_pct_value(value: Any, default_pct: float) -> float:
     return clamp(raw, 0.0, 100.0)
 
 
+
+def _active_family_meta(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """读取当前总体策略在 registry 中暴露的参数 schema。"""
+    cfg = cfg or {}
+    try:
+        from .registry import DEFAULT_STRATEGY_FAMILY, STRATEGY_FAMILIES, normalise_strategy_family_key
+
+        family_key = normalise_strategy_family_key(cfg.get("strategy_family", DEFAULT_STRATEGY_FAMILY))
+        meta = STRATEGY_FAMILIES.get(family_key, {})
+        return meta if isinstance(meta, dict) else {}
+    except Exception:
+        return {}
+
+
+def _fallback_style_param_schema() -> List[Dict[str, Any]]:
+    """旧策略文件未声明 STYLE_PARAM_SCHEMA 时的兼容 schema。"""
+    return [
+        {
+            "title": "执行速度",
+            "desc": "通用仓位执行层参数。建议新策略在自己的 Python 文件中显式声明 STYLE_PARAM_SCHEMA。",
+            "fields": [
+                {"name": "buy_step_pct", "label": "买入节奏%", "type": "number", "default": 28.0, "min": 0, "max": 100, "step": 0.1},
+                {"name": "sell_step_pct", "label": "卖出节奏%", "type": "number", "default": 45.0, "min": 0, "max": 100, "step": 0.1},
+                {"name": "risk_multiplier", "label": "风险倍率", "type": "number", "default": 1.0, "min": 0.1, "max": 5, "step": 0.05},
+            ],
+        },
+        {"type": "core_base_table", "name": "core_base_pct", "title": "目标仓位表", "desc": "不同趋势状态下的基础目标仓位。"},
+    ]
+
+
+def _style_param_schema(cfg: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    meta = _active_family_meta(cfg)
+    schema = meta.get("style_param_schema")
+    return schema if isinstance(schema, list) and schema else _fallback_style_param_schema()
+
+
+def _iter_style_param_fields(schema: Optional[List[Dict[str, Any]]] = None):
+    for group in schema or _fallback_style_param_schema():
+        if not isinstance(group, dict):
+            continue
+        if group.get("type") == "core_base_table":
+            yield {"name": group.get("name") or "core_base_pct", "type": "core_base_table", **group}
+            continue
+        fields = group.get("fields")
+        if not isinstance(fields, list):
+            continue
+        for field in fields:
+            if isinstance(field, dict) and field.get("name"):
+                yield field
+
+
+def _family_style_preset(cfg: Optional[Dict[str, Any]], key: str) -> Dict[str, Any]:
+    """当前总体策略 + 参数风格对应的默认值。"""
+    meta = _active_family_meta(cfg)
+    family_presets = meta.get("style_param_presets")
+    raw = family_presets.get(key) if isinstance(family_presets, dict) else None
+    preset = dict(raw) if isinstance(raw, dict) else dict(STRATEGY_PRESETS[key])
+
+    # 与全局参数风格元信息合并：名称/说明保持一致，具体数值允许总体策略覆盖。
+    global_preset = STRATEGY_PRESETS[key]
+    for info_key in ("name", "desc", "research_note"):
+        preset.setdefault(info_key, global_preset.get(info_key))
+    preset.setdefault("buy_step", global_preset.get("buy_step", 0.28))
+    preset.setdefault("sell_step", global_preset.get("sell_step", 0.45))
+    preset.setdefault("risk_multiplier", global_preset.get("risk_multiplier", 1.0))
+    preset.setdefault("core_base", global_preset.get("core_base", STRATEGY_PRESETS["balanced"]["core_base"]))
+    return preset
+
+
+def _field_default_value(field: Dict[str, Any], preset: Dict[str, Any], fallback: Any = 0.0) -> Any:
+    name = str(field.get("name") or "")
+    if name in preset:
+        return preset.get(name)
+    if name == "buy_step_pct":
+        return float(preset.get("buy_step", 0.28)) * 100.0
+    if name == "sell_step_pct":
+        return float(preset.get("sell_step", 0.45)) * 100.0
+    if name == "risk_multiplier":
+        return preset.get("risk_multiplier", 1.0)
+    return field.get("default", fallback)
+
+
+def _normalise_style_field_value(value: Any, field: Dict[str, Any], default: Any) -> Any:
+    field_type = str(field.get("type") or "number")
+    if field_type == "checkbox":
+        return _as_bool(value, bool(default))
+    if field_type in {"select", "choice"}:
+        raw = str(value if value is not None and value != "" else default)
+        options = field.get("options") if isinstance(field.get("options"), list) else []
+        allowed = {str(item[0]) for item in options if isinstance(item, (list, tuple)) and item}
+        return raw if not allowed or raw in allowed else str(default)
+
+    # 默认按数字字段处理。百分数/倍率都保留前端显示单位，真正计算时再除以 100。
+    min_value = _as_float(field.get("min"), 0.0)
+    max_value = _as_float(field.get("max"), 100.0)
+    if max_value < min_value:
+        min_value, max_value = max_value, min_value
+    return clamp(_as_float(value, _as_float(default, 0.0)), min_value, max_value)
+
+
 def _strategy_default_entry(key: str, cfg: Optional[Dict[str, Any]] = None, selected_key: str = "balanced") -> Dict[str, Any]:
     cfg = cfg or {}
-    preset = STRATEGY_PRESETS[key]
+    preset = _family_style_preset(cfg, key)
     core_base = preset.get("core_base") or STRATEGY_PRESETS["balanced"]["core_base"]
-    return {
+    entry: Dict[str, Any] = {
         "enabled": key == selected_key,
         "weight_pct": 100.0 if key == selected_key else 0.0,
-        "buy_step_pct": _read_pct_value(cfg.get(f"buy_step_{key}_pct"), float(preset.get("buy_step", 0.28)) * 100.0),
-        "sell_step_pct": _read_pct_value(cfg.get(f"sell_step_{key}_pct"), float(preset.get("sell_step", 0.45)) * 100.0),
-        "risk_multiplier": clamp(_as_float(preset.get("risk_multiplier"), 1.0), 0.1, 5.0),
         "core_base_pct": {state: round(float(core_base.get(state, 0.5)) * 100.0, 4) for state in STRATEGY_MARKET_STATES},
     }
+    for field in _iter_style_param_fields(_style_param_schema(cfg)):
+        name = str(field.get("name") or "")
+        if not name or name == "core_base_pct":
+            continue
+        default = _field_default_value(field, preset, 0.0)
+        entry[name] = _normalise_style_field_value(default, field, default)
+    return entry
 
 
 def normalise_strategy_lab_config(cfg: Dict[str, Any]) -> None:
     """清洗【策略实验台】配置。
 
-    前端保存的是便于阅读/编辑的百分数；后端统一在这里归一化，避免：
-    - 权重为空或总和为0；
-    - 新增策略后旧 config 缺少字段；
-    - 前端误填 nan/负数/超大数导致回测异常。
+    可编辑参数由当前总体策略 Python 文件中的 STYLE_PARAM_SCHEMA / STYLE_PARAM_PRESETS 声明；
+    前端只渲染 schema，后端只按 schema 清洗和执行，避免把某套策略参数写死在 app.js 里。
     """
     selected_key = normalise_strategy_key(cfg.get("strategy", "balanced"))
     cfg["strategy"] = selected_key
@@ -176,29 +272,34 @@ def normalise_strategy_lab_config(cfg: Dict[str, Any]) -> None:
     # 防守/均衡/进攻只是当前总体策略下的执行性格，不再做组合风格。
     cfg["strategy_mode"] = "single"
 
+    schema = _style_param_schema(cfg)
     raw_mix = cfg.get("strategy_mix") if isinstance(cfg.get("strategy_mix"), dict) else {}
     raw_mix_has_entries = bool(raw_mix)
     normalized: Dict[str, Dict[str, Any]] = {}
 
     for key in STRATEGY_PRESETS:
-        # 旧配置完全没有 strategy_mix 时，默认启用当前单选策略；
-        # 已经存在实验台配置时，缺失的新策略默认关闭，避免被悄悄混入组合。
         default_entry = _strategy_default_entry(key, cfg, selected_key if not raw_mix_has_entries else "")
         raw_entry = raw_mix.get(key) if isinstance(raw_mix.get(key), dict) else {}
         raw_core = raw_entry.get("core_base_pct") or raw_entry.get("core_base") or {}
         default_core = default_entry["core_base_pct"]
 
-        normalized[key] = {
+        item: Dict[str, Any] = {
             "enabled": _as_bool(raw_entry.get("enabled"), default_entry["enabled"]),
             "weight_pct": _read_pct_value(raw_entry.get("weight_pct", raw_entry.get("weight")), default_entry["weight_pct"]),
-            "buy_step_pct": _read_pct_value(raw_entry.get("buy_step_pct"), default_entry["buy_step_pct"]),
-            "sell_step_pct": _read_pct_value(raw_entry.get("sell_step_pct"), default_entry["sell_step_pct"]),
-            "risk_multiplier": clamp(_as_float(raw_entry.get("risk_multiplier"), default_entry["risk_multiplier"]), 0.1, 5.0),
             "core_base_pct": {
                 state: _read_pct_value(raw_core.get(state), default_core[state]) if isinstance(raw_core, dict) else default_core[state]
                 for state in STRATEGY_MARKET_STATES
             },
         }
+
+        for field in _iter_style_param_fields(schema):
+            name = str(field.get("name") or "")
+            if not name or name == "core_base_pct":
+                continue
+            default = default_entry.get(name, _field_default_value(field, _family_style_preset(cfg, key), 0.0))
+            item[name] = _normalise_style_field_value(raw_entry.get(name), field, default)
+
+        normalized[key] = item
 
     # 单风格：只有当前选中的参数风格参与执行；其他风格只保留调参值，便于切换后使用。
     for key, item in normalized.items():
@@ -208,13 +309,21 @@ def normalise_strategy_lab_config(cfg: Dict[str, Any]) -> None:
     cfg["strategy_mix"] = normalized
 
 
-def _entry_to_strategy(key: str, entry: Dict[str, Any]) -> Dict[str, Any]:
-    preset = dict(STRATEGY_PRESETS[key])
+def _entry_to_strategy(key: str, entry: Dict[str, Any], cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    preset = _family_style_preset(cfg, key)
     preset["key"] = key
-    preset["buy_step"] = float(entry.get("buy_step_pct", 0.0)) / 100.0
-    preset["sell_step"] = float(entry.get("sell_step_pct", 0.0)) / 100.0
+    preset["buy_step"] = float(entry.get("buy_step_pct", float(preset.get("buy_step", 0.28)) * 100.0)) / 100.0
+    preset["sell_step"] = float(entry.get("sell_step_pct", float(preset.get("sell_step", 0.45)) * 100.0)) / 100.0
     preset["risk_multiplier"] = clamp(_as_float(entry.get("risk_multiplier"), preset.get("risk_multiplier", 1.0)), 0.1, 5.0)
     preset["core_base"] = {state: float(entry.get("core_base_pct", {}).get(state, 0.0)) / 100.0 for state in STRATEGY_MARKET_STATES}
+
+    # 把策略 Python 声明的自定义字段原样带给 target_weight；百分数字段仍是 0~100，策略内部按需除以 100。
+    for field in _iter_style_param_fields(_style_param_schema(cfg)):
+        name = str(field.get("name") or "")
+        if not name or name in {"core_base_pct", "buy_step_pct", "sell_step_pct", "risk_multiplier"}:
+            continue
+        if name in entry:
+            preset[name] = entry[name]
     return preset
 
 
@@ -230,26 +339,21 @@ def get_strategy_mix_entries(cfg: Dict[str, Any]) -> List[Tuple[str, Dict[str, A
         weight = clamp(_as_float(raw_entry.get("weight_pct"), 0.0), 0.0, 100.0)
         if weight <= 0:
             continue
-        entries.append((key, _entry_to_strategy(key, raw_entry), weight))
+        entries.append((key, _entry_to_strategy(key, raw_entry, cfg), weight))
         total += weight
     if total <= 0:
         key = normalise_strategy_key(cfg.get("strategy"))
         raw_entry = mix.get(key) or _strategy_default_entry(key, cfg, key)
-        return [(key, _entry_to_strategy(key, raw_entry), 1.0)]
+        return [(key, _entry_to_strategy(key, raw_entry, cfg), 1.0)]
     return [(key, strategy, weight / total) for key, strategy, weight in entries]
 
 
 def get_strategy(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """返回当前实际执行的参数风格。
-
-    系统固定使用单风格：防守/均衡/进攻只表示执行性格。
-    真正的总体策略切换由 cfg["strategy_family"] 分发到不同 families/*.py。
-    """
+    """返回当前实际执行的参数风格。"""
     normalise_strategy_lab_config(cfg)
     key = normalise_strategy_key(cfg.get("strategy", "balanced"))
     entry = cfg.get("strategy_mix", {}).get(key) or _strategy_default_entry(key, cfg, key)
-    return _entry_to_strategy(key, entry)
-
+    return _entry_to_strategy(key, entry, cfg)
 
 def style_mix_summary(cfg: Dict[str, Any]) -> str:
     strategy = get_strategy(cfg)
