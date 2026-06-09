@@ -304,18 +304,12 @@
         </div>
         <div class="auto-actions">
           <button id="fetch-data-btn" class="btn mini" type="button">拉取所选标的数据</button>
-          <span id="fetch-status" class="small">自动数据失败时，仍可手动填写。</span>
+          <button id="open-auto-data-modal-btn" class="btn mini light" type="button">查看全部自动数据</button>
         </div>
+        <span id="fetch-status" class="small" hidden aria-hidden="true"></span>
         <div id="auto-data-list" class="auto-data-list" hidden aria-hidden="true"></div>
 
         <div class="strategy-summary auto-data-summary">
-          <div class="auto-data-summary-head">
-            <div>
-              自动数据会在拉取后动态写入；外部只展示关键项，全部字段点右侧按钮用只读表格预览。
-              需要手动覆盖时，优先修改外部关键项；场外基金使用单位净值/累计净值计算技术指标，不能代表真实分时量价。
-            </div>
-            <button id="open-auto-data-modal-btn" class="btn mini light" type="button">查看全部自动数据</button>
-          </div>
           <div id="auto-data-key-metrics" class="auto-data-key-metrics">
             <div class="empty compact-empty">拉取标的数据后显示关键自动数据。</div>
           </div>
@@ -645,10 +639,13 @@
 /* 自动数据区域：只保留一套外部表单。原 app.js 会把全部自动数据渲染到 #auto-data-list，
    这里隐藏它，避免和新的“关键摘要 + 全量弹窗表单”重复显示。 */
 #auto-data-list { display: none !important; }
-.auto-data-summary { margin-top: 10px; margin-bottom: 10px; }
-.auto-data-summary-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
-.auto-data-summary-head > div { min-width: 0; line-height: 1.55; }
-.auto-data-key-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
+#fetch-status { display: none !important; }
+.auto-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+.auto-actions #fetch-data-btn { flex: 0 0 auto; }
+.auto-actions #open-auto-data-modal-btn { flex: 0 0 auto; margin-left: auto; }
+.auto-data-summary { margin-top: 0; margin-bottom: 10px; }
+.auto-data-summary-head { display: none !important; }
+.auto-data-key-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 0; }
 .auto-data-key-item { border: 1px solid var(--line); border-radius: 12px; background: rgba(255,255,255,.58); padding: 9px 10px; min-width: 0; }
 .auto-data-key-item span { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .auto-data-key-item strong { display: block; color: #3d3026; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -776,7 +773,7 @@
 #auto-data-modal [data-auto-field-wrap][hidden],
 #auto-data-modal .auto-data-section[hidden] { display: none !important; }
 @media (max-width: 1100px) { .auto-data-key-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-@media (max-width: 700px) { .auto-data-summary-head, #auto-data-modal .auto-data-modal-tools { flex-direction: column; align-items: stretch; } .auto-data-key-metrics { grid-template-columns: 1fr; } #auto-data-modal { padding: 8px; } #auto-data-modal .auto-data-dialog { width: calc(100vw - 16px); max-height: calc(100dvh - 16px); } #auto-data-modal .auto-data-table { min-width: 760px; } }
+@media (max-width: 700px) { .auto-actions, #auto-data-modal .auto-data-modal-tools { flex-direction: column; align-items: stretch; } .auto-data-key-metrics { grid-template-columns: 1fr; } #auto-data-modal { padding: 8px; } #auto-data-modal .auto-data-dialog { width: calc(100vw - 16px); max-height: calc(100dvh - 16px); } #auto-data-modal .auto-data-table { min-width: 760px; } }
 
 </style>
 

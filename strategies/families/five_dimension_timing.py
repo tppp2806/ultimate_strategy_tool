@@ -9,7 +9,6 @@ from ..base import (
     core_asset_profile,
     get_strategy,
     lower_floor,
-    pct2,
 )
 
 FAMILY_KEY = "five_dimension_timing"
@@ -48,6 +47,7 @@ INPUT_SCHEMA = [
     },
 ]
 
+
 def _vote_score(value: float, bearish: float, neutral: float, bullish: float) -> int:
     """把连续值转成 -1/0/+1 投票。value 越小越便宜/越好时使用。"""
     if value <= bullish:
@@ -62,20 +62,29 @@ def _vote_score(value: float, bearish: float, neutral: float, bullish: float) ->
 def _manual_vote(signals: Dict[str, Any], key: str, auto_value: int, notes: List[str], label: str) -> int:
     raw = str(signals.get(key, "auto") or "auto").strip().lower()
     if raw in {"-1", "0", "1"}:
-        value = int(raw)
-        notes.append(f"{label}：使用手动投票 -> {value:+d}票。")
-        return value
+        return int(raw)
     return auto_value
 
 
-def target_weight(cfg: Dict[str, Any], signals: Dict[str, Any]) -> Tuple[float, List[str]]:
-    """五维择时策略：估值+资金+技术+情绪+基本面投票交叉验证。
+def _vote_reason(votes: Dict[str, int]) -> str:
+    """右侧解释只给理由，不展示票数/百分比/目标仓位。"""
+    positive = [name for name, value in votes.items() if value > 0 and name != "风控"]
+    negative = [name for name, value in votes.items() if value < 0 and name != "风控"]
+    neutral = [name for name, value in votes.items() if value == 0 and name != "风控"]
+    parts: List[str] = []
+    if positive:
+        parts.append("正向支持来自" + "、".join(positive))
+    if negative:
+        parts.append("主要拖累来自" + "、".join(negative))
+    if neutral and not negative:
+        parts.append("其余维度暂未形成明确反向压力")
+    if votes.get("风控", 0) < 0:
+        parts.append("额外风控负票要求降低进攻性")
+    return "；".join(parts) if parts else "多维信号暂时没有形成明确方向"
 
-    当前表单还没有独立的“资金/情绪”数据源，所以这里先用已有信号近似：
-    - 资金：量能确认、缩量回踩、市场同步风险；
-    - 情绪：远离均线、长上影、突破失败、收盘未确认；
-    后续接入真实拥挤度/资金流/情绪指标时，只需要替换这两个维度的打分函数。
-    """
+
+def target_weight(cfg: Dict[str, Any], signals: Dict[str, Any]) -> Tuple[float, List[str]]:
+    """五维择时策略：估值+资金+技术+情绪+基本面投票交叉验证。"""
     style = get_strategy(cfg)
     notes: List[str] = []
     market = str(signals.get("market_state", "sideways"))
@@ -88,30 +97,21 @@ def target_weight(cfg: Dict[str, Any], signals: Dict[str, Any]) -> Tuple[float, 
 
     votes: Dict[str, int] = {}
 
-    # 1) 估值：越便宜越多票；极贵直接负票。
     if pe is not None:
         votes["估值"] = _vote_score(pe, bearish=85.0, neutral=55.0, bullish=35.0)
-        notes.append(f"估值维度：PE百分位 {pe:.1f}% -> {votes['估值']:+d}票。")
     elif pb is not None:
         votes["估值"] = _vote_score(pb, bearish=85.0, neutral=55.0, bullish=35.0)
-        notes.append(f"估值维度：PB百分位 {pb:.1f}% -> {votes['估值']:+d}票。")
     else:
         votes["估值"] = 0
-        notes.append("估值维度：缺少PE/PB，按中性0票处理。")
-
     votes["估值"] = _manual_vote(signals, "five_valuation_vote", votes["估值"], notes, "估值维度")
 
-    # 2) 资金：自动模式下用量价确认近似，也允许五维策略专属手动投票覆盖。
     funds = 0
     if signals.get("volume_confirm") or signals.get("pullback_volume_dry"):
         funds += 1
     if signals.get("market_risk"):
         funds -= 1
-    votes["资金"] = int(clamp(funds, -1, 1))
-    notes.append(f"资金维度：自动量能/市场风险合成 -> {votes['资金']:+d}票。")
-    votes["资金"] = _manual_vote(signals, "five_fund_vote", votes["资金"], notes, "资金维度")
+    votes["资金"] = _manual_vote(signals, "five_fund_vote", int(clamp(funds, -1, 1)), notes, "资金维度")
 
-    # 3) 技术：自动模式下用趋势结构近似，但五维策略不再要求你点“买点/破位”。
     tech = 0
     if market in {"above_200", "strong_bull"}:
         tech += 1
@@ -121,11 +121,8 @@ def target_weight(cfg: Dict[str, Any], signals: Dict[str, Any]) -> Tuple[float, 
         tech += 1
     if exit_state in {"below_50", "below_200", "hit_stop", "failed_breakout"}:
         tech -= 1
-    votes["技术"] = int(clamp(tech, -1, 1))
-    notes.append(f"技术维度：自动趋势结构合成 -> {votes['技术']:+d}票。")
-    votes["技术"] = _manual_vote(signals, "five_tech_vote", votes["技术"], notes, "技术维度")
+    votes["技术"] = _manual_vote(signals, "five_tech_vote", int(clamp(tech, -1, 1)), notes, "技术维度")
 
-    # 4) 情绪：自动模式下用追高和冲高回落近似，允许手动覆盖。
     sentiment = 0
     if signals.get("far_from_ma"):
         sentiment -= 1
@@ -133,26 +130,18 @@ def target_weight(cfg: Dict[str, Any], signals: Dict[str, Any]) -> Tuple[float, 
         sentiment -= 1
     if market == "bear":
         sentiment -= 1
-    votes["情绪"] = int(clamp(sentiment, -1, 1))
-    notes.append(f"情绪维度：自动过热/冲高回落合成 -> {votes['情绪']:+d}票。")
-    votes["情绪"] = _manual_vote(signals, "five_sentiment_vote", votes["情绪"], notes, "情绪维度")
+    votes["情绪"] = _manual_vote(signals, "five_sentiment_vote", int(clamp(sentiment, -1, 1)), notes, "情绪维度")
 
-    # 5) 基本面：自动模式下用ROE近似，允许手动覆盖。
     if roe is None:
         votes["基本面"] = 0
-        notes.append("基本面维度：缺少ROE，按中性0票处理。")
     elif roe >= 16:
         votes["基本面"] = 1
-        notes.append(f"基本面维度：ROE {roe:.1f}% 较强 -> +1票。")
     elif roe < 8:
         votes["基本面"] = -1
-        notes.append(f"基本面维度：ROE {roe:.1f}% 偏弱 -> -1票。")
     else:
         votes["基本面"] = 0
-        notes.append(f"基本面维度：ROE {roe:.1f}% 中性 -> 0票。")
     votes["基本面"] = _manual_vote(signals, "five_fundamental_vote", votes["基本面"], notes, "基本面维度")
 
-    # 风控负票只会扣分，不会增加分数。
     risk_vote = _manual_vote(signals, "five_risk_vote", 0, notes, "风控负票")
     if risk_vote < 0:
         votes["风控"] = -1
@@ -161,7 +150,6 @@ def target_weight(cfg: Dict[str, Any], signals: Dict[str, Any]) -> Tuple[float, 
     positive = sum(1 for v in votes.values() if v > 0)
     negative = sum(1 for v in votes.values() if v < 0)
 
-    # 五维策略强调“交叉验证”：多维同向才明显增仓，分歧大则中低仓。
     if vote_sum >= 3 and positive >= 3:
         target = 0.78
         regime = "强多维共振"
@@ -178,10 +166,9 @@ def target_weight(cfg: Dict[str, Any], signals: Dict[str, Any]) -> Tuple[float, 
         target = 0.48
         regime = "维度分歧/中性"
 
-    signals["strategy_match_label"] = f"五维择时：{regime}（{vote_sum:+d}票）"
+    signals["strategy_match_label"] = f"五维择时：{regime}"
     signals["strategy_confidence"] = int(clamp(58 + abs(vote_sum) * 6, 55, 88))
 
-    # 参数风格只负责执行性格：进攻风格允许更高目标，防守风格压低目标。
     risk_mult = clamp(float(style.get("risk_multiplier", 1.0)), 0.1, 5.0)
     target = 0.50 + (target - 0.50) * clamp(risk_mult, 0.65, 1.35)
 
@@ -195,8 +182,5 @@ def target_weight(cfg: Dict[str, Any], signals: Dict[str, Any]) -> Tuple[float, 
         high = min(high, 0.68)
 
     target = clamp(max(target, floor), low, high)
-    notes.append(f"五维投票结果：{votes}，合计 {vote_sum:+d}，状态={regime}。")
-    notes.append(f"参数风格={style.get('name', '风格')}，最终目标仓位限制在 {pct2(target)}。")
+    notes.append(f"五维择时：{regime}，{_vote_reason(votes)}。")
     return target, notes
-
-

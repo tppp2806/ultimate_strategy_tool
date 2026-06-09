@@ -1732,17 +1732,46 @@ def amount_payload(cfg: Dict[str, Any], result: Decision) -> Dict[str, Any]:
     }
 
 
+DATA_DISPLAY_REASON_PATTERNS = (
+    r"->",
+    r"\{.*\}",
+    r"基础仓位.*\d",
+    r"目标仓位[:：].*\d",
+    r"最终.*目标.*\d",
+    r"最终.*仓位.*\d",
+    r"仓位修正.*\d",
+    r"合计修正.*\d",
+    r"原始目标.*\d",
+    r"风格调整.*\d",
+    r"风险倍率.*\d",
+    r"允许区间",
+    r"投票结果",
+    r"合计 [+-]?\d",
+)
+
+
+def _is_data_display_reason(text: str) -> bool:
+    """右侧解释区只放理由，不放计算过程、票数、百分比等数据展示。"""
+    compact = str(text or "")
+    return any(re.search(pattern, compact) for pattern in DATA_DISPLAY_REASON_PATTERNS)
+
+
 def join_reason_text(items: List[Any]) -> str:
-    """把多条解释合并成一句，避免出现“。；”这种重复标点。"""
+    """把多条解释合并成一句；过滤掉数据展示型明细，只保留理由说明。"""
     cleaned: List[str] = []
+    seen = set()
     for item in items:
         text = str(item).strip()
         text = re.sub(r"[。；;\s]+$", "", text)
-        if text:
-            cleaned.append(text)
+        if not text or _is_data_display_reason(text):
+            continue
+        if text in seen:
+            continue
+        seen.add(text)
+        cleaned.append(text)
     if not cleaned:
         return "当前信号不足，按规则维持原仓位。"
-    return "；".join(cleaned) + "。"
+    return "；".join(cleaned[:5]) + "。"
 
 
 def decision_to_payload(cfg: Dict[str, Any], result: Decision) -> Dict[str, Any]:

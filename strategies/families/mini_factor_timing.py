@@ -9,7 +9,6 @@ from ..base import (
     core_asset_profile,
     get_strategy,
     lower_floor,
-    pct2,
 )
 from ..factors import build_mini_factor_result
 
@@ -39,6 +38,32 @@ INPUT_SCHEMA = [
     },
 ]
 
+
+def _factor_reason(scores: Dict[str, float]) -> str:
+    """右侧解释只输出理由，不展示分数/仓位修正/百分比。"""
+    positive = []
+    negative = []
+    neutral = []
+    for name in ("趋势", "估值", "回撤", "波动", "量能", "质量"):
+        score = float(scores.get(name, 0.0) or 0.0)
+        if score >= 0.35:
+            positive.append(name)
+        elif score <= -0.35:
+            negative.append(name)
+        else:
+            neutral.append(name)
+    parts: List[str] = []
+    if positive:
+        parts.append("正向支持来自" + "、".join(positive))
+    if negative:
+        parts.append("主要压制来自" + "、".join(negative))
+    if not positive and not negative:
+        parts.append("各类因子暂未形成明确方向")
+    elif neutral:
+        parts.append("其余因子影响相对中性")
+    return "；".join(parts)
+
+
 def _manual_bias(signals: Dict[str, Any], key: str) -> int:
     raw = str(signals.get(key, "auto") or "auto").strip().lower()
     if raw in {"-1", "0", "1"}:
@@ -47,13 +72,7 @@ def _manual_bias(signals: Dict[str, Any], key: str) -> int:
 
 
 def target_weight(cfg: Dict[str, Any], signals: Dict[str, Any]) -> Tuple[float, List[str]]:
-    """小因子择时策略：轻量、可解释、低频优先。
-
-    这不是 Alpha158/360 的替代品，而是接 Qlib 前的验证层：
-    - 先确认“因子择时”这个方向是否比纯趋势信号更适合你的基金；
-    - 如果小因子策略都无法改善回测，再接上百个因子只会提高过拟合风险；
-    - 如果它明显改善，再逐步扩展 Alpha158/360 才有意义。
-    """
+    """小因子择时策略：轻量、可解释、低频优先。"""
     style = get_strategy(cfg)
     notes: List[str] = []
     market = str(signals.get("market_state", "sideways"))
@@ -69,19 +88,14 @@ def target_weight(cfg: Dict[str, Any], signals: Dict[str, Any]) -> Tuple[float, 
     risk_bias = _manual_bias(signals, "mini_risk_bias")
     if trend_bias:
         manual_adjust += trend_bias * 0.08
-        notes.append(f"手动趋势/动量修正：{trend_bias:+d} -> {pct2(trend_bias * 0.08)}。")
     if structure_bias:
         manual_adjust += structure_bias * 0.06
-        notes.append(f"手动结构/回撤修正：{structure_bias:+d} -> {pct2(structure_bias * 0.06)}。")
     if volume_bias:
         manual_adjust += volume_bias * 0.04
-        notes.append(f"手动量能/波动修正：{volume_bias:+d} -> {pct2(volume_bias * 0.04)}。")
     if risk_bias < 0:
         manual_adjust -= 0.10
-        notes.append("手动风险上限修正：-1 -> -10.00%。")
     if manual_adjust:
         raw_target = clamp(raw_target + manual_adjust, 0.0, 1.0)
-        notes.append(f"手动因子修正合计：{pct2(manual_adjust)}，修正后原始目标 {pct2(raw_target)}。")
 
     factor_score_sum = sum(float(v or 0.0) for v in factor_result.scores.values()) + manual_adjust * 10.0
     if raw_target >= 0.68:
@@ -96,16 +110,13 @@ def target_weight(cfg: Dict[str, Any], signals: Dict[str, Any]) -> Tuple[float, 
         regime = "因子分歧/中性"
     signals["strategy_match_label"] = f"小因子择时：{regime}"
     signals["strategy_confidence"] = int(clamp(58 + abs(factor_score_sum) * 4.0, 55, 86))
-    notes.append(f"小因子基础仓位：{pct2(factor_result.base)}。")
-    notes.extend(factor_result.notes)
-    notes.append(f"六类因子合计修正：{pct2(factor_result.total_adjustment)}，原始目标仓位 {pct2(raw_target)}。")
 
-    # 参数风格只改变“偏离50%中轴的力度”，不改因子本身的方向。
+    manual_text = "；手动修正进一步压低进攻性" if manual_adjust < 0 else ("；手动修正提高进攻性" if manual_adjust > 0 else "")
+    notes.append(f"小因子择时：{regime}，{_factor_reason(factor_result.scores)}{manual_text}。")
+
     risk_mult = clamp(float(style.get("risk_multiplier", 1.0)), 0.1, 5.0)
     target = 0.50 + (raw_target - 0.50) * clamp(risk_mult, 0.65, 1.35)
-    notes.append(f"参数风格={style.get('name', '风格')}，风险倍率 {risk_mult:.2f}，风格调整后目标 {pct2(target)}。")
 
-    # 仍然尊重系统防守仓位和仓位模式边界。因子策略不允许在熊市/200日线下无脑满仓。
     floor = lower_floor(cfg, signals)
     low, high = core_asset_floor_bounds(core_asset_profile(cfg), cfg)
     if market == "bear":
@@ -118,6 +129,4 @@ def target_weight(cfg: Dict[str, Any], signals: Dict[str, Any]) -> Tuple[float, 
         high = min(high, 0.66 if market in {"sideways", "below_200", "bear"} else 0.78)
 
     target = clamp(max(target, floor), low, high)
-    notes.append(f"风控边界：系统防守仓位 {pct2(floor)}，允许区间 {pct2(low)}~{pct2(high)}。")
-    notes.append(f"小因子择时策略最终目标仓位：{pct2(target)}。")
     return target, notes
