@@ -444,7 +444,7 @@ def ensure_config() -> Dict[str, Any]:
 
     merged["plan_amount"] = max(as_float(merged.get("plan_amount"), DEFAULT_CONFIG["plan_amount"]), 0.0)
     merged["current_position_amount"] = max(as_float(merged.get("current_position_amount"), 0.0), 0.0)
-    # 兼容旧版：不再用“持仓成本/买入价”，改为直接填写当前涨跌幅/持仓盈亏率。
+    # 兼容旧版：不再用"持仓成本/买入价"，改为直接填写当前涨跌幅/持仓盈亏率。
     merged.pop("cost_basis_price", None)
     merged.pop("core_floor_pct", None)
     merged.pop("asset_type", None)
@@ -457,7 +457,7 @@ def ensure_config() -> Dict[str, Any]:
     if merged.get("proxy_mode") not in {"system", "custom", "none"}:
         merged["proxy_mode"] = "system"
     if merged.get("valuation_method") not in {"system_calc", "danjuan"}:
-        # 兼容旧配置：旧版的 auto 统一迁移到“乐咕乐股/系统自算”。
+        # 兼容旧配置：旧版的 auto 统一迁移到"乐咕乐股/系统自算"。
         merged["valuation_method"] = "system_calc"
     merged["request_timeout_sec"] = clamp(as_float(merged.get("request_timeout_sec"), 12.0), 3.0, 60.0)
     merged["retry_count"] = int(clamp(as_float(merged.get("retry_count"), 2.0), 0.0, 5.0))
@@ -483,10 +483,42 @@ def ensure_config() -> Dict[str, Any]:
     return merged
 
 
+def _balanced_only_strategy_mix(mix: Any) -> Dict[str, Any]:
+    """保存层只保留 balanced 作为唯一基准；非均衡有效值运行时由 deviation 计算。"""
+    if not isinstance(mix, dict):
+        return {}
+    balanced = mix.get("balanced") if isinstance(mix.get("balanced"), dict) else None
+    if not balanced:
+        return {}
+    item = copy.deepcopy(balanced)
+    item["enabled"] = True
+    item["weight_pct"] = 100.0
+    return {"balanced": item}
+
+
+def _compact_config_for_save(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """避免把 defensive/aggressive 的运行时默认值写入 config.json。"""
+    out = copy.deepcopy(cfg)
+    out["strategy_mode"] = "single"
+    out["strategy_mix"] = _balanced_only_strategy_mix(out.get("strategy_mix"))
+
+    family_params = out.get("strategy_family_params") if isinstance(out.get("strategy_family_params"), dict) else {}
+    compact_family_params: Dict[str, Dict[str, Any]] = {}
+    for family_key, value in family_params.items():
+        if family_key not in STRATEGY_FAMILIES or not isinstance(value, dict):
+            continue
+        compact_family_params[family_key] = {"strategy_mix": _balanced_only_strategy_mix(value.get("strategy_mix"))}
+    active_family = str(out.get("strategy_family") or DEFAULT_STRATEGY_FAMILY)
+    if active_family in STRATEGY_FAMILIES and out.get("strategy_mix"):
+        compact_family_params[active_family] = {"strategy_mix": out["strategy_mix"]}
+    out["strategy_family_params"] = compact_family_params
+    return out
+
+
 def save_config(cfg: Dict[str, Any]) -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+        json.dump(_compact_config_for_save(cfg), f, ensure_ascii=False, indent=2)
 
 
 def apply_active_family_params(cfg: Dict[str, Any]) -> None:
@@ -523,52 +555,61 @@ def apply_active_family_params(cfg: Dict[str, Any]) -> None:
 
 
 def _flatten_active_style_params(cfg: Dict[str, Any]) -> None:
-    """把当前激活风格的执行层参数展平到 cfg 顶层，供 advanced_pct / advanced_bool 读取。
+    """把当前激活风格的运行参数展平到 cfg 顶层。
 
-    每个风格有自己的预设值（buy_step_pct/sell_step_pct 等），
-    偏离度（deviation）在此基础上叠加修正。
+    关键规则：偏离度只是一层运行时/展示层计算。
+    配置文件只保存 balanced 这个基准；防守/进攻有效值始终由
+    【均衡基准参数 + 当前风格 deviation】临时得到。
     """
     strategy_key = str(cfg.get("strategy", "balanced"))
     mix = cfg.get("strategy_mix") if isinstance(cfg.get("strategy_mix"), dict) else {}
-    entry = mix.get(strategy_key) if isinstance(mix.get(strategy_key), dict) else {}
+    balanced = mix.get("balanced") if isinstance(mix.get("balanced"), dict) else {}
 
-    deviation = cfg.get("deviation") or {}
+    deviation = cfg.get("deviation") if isinstance(cfg.get("deviation"), dict) else {}
     style_dev = deviation.get(strategy_key) if isinstance(deviation.get(strategy_key), dict) else {}
     amp_dev = clamp(as_float(style_dev.get("amplitude"), 0.0), 0.0, 100.0)
     thr_dev = clamp(as_float(style_dev.get("threshold"), 0.0), 0.0, 100.0)
     is_agg = strategy_key == "aggressive"
 
     def _deviate(base: float, dev_pct: float) -> float:
-        """进攻向100%推，防守向0%推。"""
-        if dev_pct <= 0:
-            return base
+        """进攻向100%推，防守向0%压；均衡或0偏离时原样返回。"""
+        base = clamp(float(base), 0.0, 100.0)
+        if strategy_key == "balanced" or dev_pct <= 0:
+            return round(base, 1)
         if is_agg:
             return round(base + (100.0 - base) * dev_pct / 100.0, 1)
         return round(base * (1.0 - dev_pct / 100.0), 1)
 
-    # 执行速度：从当前风格预设读取，叠加幅度偏离
-    cfg["buy_step_pct"] = clamp(_deviate(float(entry.get("buy_step_pct", 26.0)), amp_dev), 0.0, 100.0)
-    cfg["sell_step_pct"] = clamp(_deviate(float(entry.get("sell_step_pct", 48.0)), amp_dev), 0.0, 100.0)
-    cfg["global_risk_multiplier"] = clamp(float(entry.get("risk_multiplier", 1.0)), 0.1, 5.0)
+    def _base_pct(key: str, default: float) -> float:
+        # 优先使用全局/左侧保存的均衡基准；缺失时回退到均衡 strategy_mix，再回退默认值。
+        if key in cfg and cfg.get(key) not in (None, ""):
+            return as_float(cfg.get(key), default)
+        return as_float(balanced.get(key), default)
 
-    cfg["trade_step_limit_enabled"] = advanced_bool(entry, "trade_step_limit_enabled", True)
+    # 操作幅度：从均衡基准读取，只把 deviation 作为运行时计算层。
+    base_buy = _base_pct("global_buy_step_pct", as_float(balanced.get("buy_step_pct"), 26.0))
+    base_sell = _base_pct("global_sell_step_pct", as_float(balanced.get("sell_step_pct"), 48.0))
+    cfg["buy_step_pct"] = clamp(_deviate(base_buy, amp_dev), 0.0, 100.0)
+    cfg["sell_step_pct"] = clamp(_deviate(base_sell, amp_dev), 0.0, 100.0)
+    cfg["global_risk_multiplier"] = clamp(_base_pct("global_risk_multiplier", as_float(balanced.get("risk_multiplier"), 1.0)), 0.1, 5.0)
 
-    # 执行层控制 + 仓位边界：从 entry 读取，叠加阈值偏离
+    cfg["trade_step_limit_enabled"] = advanced_bool(balanced, "trade_step_limit_enabled", True)
+
+    # 执行层控制 + 仓位边界：也统一从均衡基准出发。
     for key, default in [
         ("core_step_pct", 22.0),
         ("buy_step_limit_pct", 28.0),
         ("sell_step_limit_pct", 45.0),
     ]:
-        cfg[key] = clamp(_deviate(float(entry.get(key, default)), thr_dev), 0.0, 100.0)
+        cfg[key] = clamp(_deviate(_base_pct(key, default), thr_dev), 0.0, 100.0)
 
     for key, default in [
         ("core_min_position_pct", 5.0), ("core_max_position_pct", 92.0),
         ("strict_min_position_pct", 0.0), ("strict_max_position_pct", 60.0),
     ]:
-        cfg[key] = clamp(_deviate(float(entry.get(key, default)), thr_dev), 0.0, 100.0)
+        cfg[key] = clamp(_deviate(_base_pct(key, default), thr_dev), 0.0, 100.0)
     cfg["core_min_position_pct"] = min(float(cfg["core_min_position_pct"]), float(cfg["core_max_position_pct"]))
     cfg["strict_min_position_pct"] = min(float(cfg["strict_min_position_pct"]), float(cfg["strict_max_position_pct"]))
-
 
 def advanced_pct(cfg: Dict[str, Any], key: str, default: float, min_value: float = 0.0, max_value: float = 100.0) -> float:
     """读取设置页百分数字段，并转换为 0~1。"""
@@ -631,7 +672,7 @@ def parse_signals(form: Dict[str, Any]) -> Dict[str, Any]:
         "roe_pct": roe_pct,
     }
 
-    # 给“小因子择时策略”保留自动行情因子。手动表单没有这些字段时为 None；
+    # 给"小因子择时策略"保留自动行情因子。手动表单没有这些字段时为 None；
     # 自动拉取/回测时 compute_indicators 会填充，策略文件可直接读取。
     optional_numeric_keys = (
         "close", "ma20", "ma50", "ma200", "atr14", "atr_pct",
@@ -646,7 +687,7 @@ def parse_signals(form: Dict[str, Any]) -> Dict[str, Any]:
         raw = form.get(key)
         signals[key] = as_float(raw, None) if raw not in (None, "") else None
 
-    # 总体策略专属输入：不再使用“自动”可视选项。
+    # 总体策略专属输入：不再使用"自动"可视选项。
     # 未选择时按 0 = 无影响信号处理；自动行情因子仍通过 hidden 字段进入策略。
     for key in (
         "five_valuation_vote", "five_fund_vote", "five_tech_vote",
@@ -655,6 +696,12 @@ def parse_signals(form: Dict[str, Any]) -> Dict[str, Any]:
     ):
         raw = str(form.get(key, "0") or "0").strip()
         signals[key] = raw if raw in {"-1", "0", "1"} else "0"
+
+    # 策略 INPUT_SCHEMA 中的其他字段（如 ma_position）透传到 signals
+    for key, value in form.items():
+        if key not in signals:
+            signals[key] = value
+
     return signals
 
 
@@ -828,11 +875,11 @@ def risk_position_cap(cfg: Dict[str, Any], signals: Dict[str, Any], strategy: Di
 
 
 def buy_step_sensitivity(signals: Dict[str, Any]) -> Tuple[float, List[str]]:
-    """对“本次新增仓位上限”做连续修正。
+    """对"本次新增仓位上限"做连续修正。
 
     v29 测试发现：当风险仓位上限成为主限制时，PE/ROE 如果只修正 raw target，
     最终加仓幅度可能完全相同。这里把估值/质量也作用到本次买入上限，
-    让“高估限制加仓”真正体现在最终建议里。
+    让"高估限制加仓"真正体现在最终建议里。
     """
     notes: List[str] = []
     mult = 1.0
@@ -932,7 +979,7 @@ def core_allocation_step_limit(cfg: Dict[str, Any], signals: Dict[str, Any], str
 
 
 def signal_quality_score(signals: Dict[str, Any], action: str) -> Tuple[int, List[str]]:
-    """信号质量分：近似“胜率/确定性”，不是历史胜率。
+    """信号质量分：近似"胜率/确定性"，不是历史胜率。
 
     核心思想：趋势与主信号权重大，量价/估值/ROE只做修正。
     这样避免把一堆同源指标重复加分，导致系统过度乐观。
@@ -1007,7 +1054,7 @@ def signal_quality_score(signals: Dict[str, Any], action: str) -> Tuple[int, Lis
     sell_actions = {"减仓", "大减仓", "止盈", "清仓"}
     if action in buy_actions:
         if signals.get("allocation_fill"):
-            # 基础配置仓补足不是短线买点，不按“没有入场信号”重罚；
+            # 基础配置仓补足不是短线买点，不按"没有入场信号"重罚；
             # 但它也不能被当成高质量交易机会，只给中等信号质量。
             entry_score = 52
             score = market_score * 0.62 + entry_score * 0.26 + 50 * 0.12 + volume_adj * 0.5 + valuation_adj
@@ -1043,7 +1090,7 @@ def expected_reward_r(signals: Dict[str, Any], action: str) -> Tuple[float, str,
     """预期赔率R：没有输入目标价时，只能做规则估算。
 
     它不是预测涨幅，而是根据入场类型、趋势、估值、量价风险估算
-    “这笔新增交易是否值得做”。低于1R时不应主动开新仓。
+    "这笔新增交易是否值得做"。低于1R时不应主动开新仓。
     """
     notes: List[str] = []
     buy_actions = {"试仓", "买入", "加仓", "重仓"}
@@ -1257,7 +1304,7 @@ def buy_opportunity_multiplier(signal_quality: int, expected_r: float, frequency
 
 
 def active_strategy_family_key(cfg: Dict[str, Any]) -> str:
-    """当前总体策略 key。用于把“总体策略方法论”和“参数风格”彻底分开。"""
+    """当前总体策略 key。用于把"总体策略方法论"和"参数风格"彻底分开。"""
     try:
         return normalise_strategy_family_key(cfg.get("strategy_family"))
     except Exception:
@@ -1299,7 +1346,7 @@ def raw_target_by_signal(cfg: Dict[str, Any], signals: Dict[str, Any], cur: floa
     # 定投增强策略永远使用总体策略目标模型；非信号驱动类总体策略在纯交易仓模式下也必须使用自己的目标模型。
     use_target_model = is_core_mode or not signal_driven
 
-    # 先生成“总体策略目标仓位”，再由执行层决定是否交易。
+    # 先生成"总体策略目标仓位"，再由执行层决定是否交易。
     core_target = floor
     core_notes: List[str] = []
     if use_target_model:
@@ -1548,13 +1595,13 @@ def compute_decision(cfg: Dict[str, Any], form: Dict[str, Any]) -> Decision:
     strategy = get_strategy(cfg)
     signals = parse_signals(form)
 
-    # 手动修改“当前涨跌幅 / 持仓盈亏 %”后，即使没有重新拉取数据，
+    # 手动修改"当前涨跌幅 / 持仓盈亏 %"后，即使没有重新拉取数据，
     # 后端也要按同一规则自动触发初始止损，避免 UI 状态和计算结果脱节。
     profit_pct = as_float(cfg.get("current_profit_pct"), 0.0)
     stop_pct = signals.get("stop_loss_pct", 0.0) * 100
     if cur > 0 and stop_pct > 0 and profit_pct <= -stop_pct:
         if core_asset_profile(cfg):
-            # 【定投增强策略】不能套用短线“初始止损=硬退出”。
+            # 【定投增强策略】不能套用短线"初始止损=硬退出"。
             # 否则会出现刚补到 50%~60%，小幅回撤后又砍到 18% 的反复打脸，
             # 解除单次操作上限后这种来回会更剧烈。这里把它降级为软风控：
             # - 若已经跌破 200 日线，保留原 below_200 防守；
@@ -1606,7 +1653,7 @@ def compute_decision(cfg: Dict[str, Any], form: Dict[str, Any]) -> Decision:
     q_adj_raw, q_notes = quality_bonus(signals, action)
     floor = lower_floor(cfg, signals)
 
-    # v20：估值/ROE只作为“仓位刹车”和“信号确认”，不能在无破位、无止盈、无买点时单独把仓位打到0。
+    # v20：估值/ROE只作为"仓位刹车"和"信号确认"，不能在无破位、无止盈、无买点时单独把仓位打到0。
     # - 买入/加仓/重仓：估值与质量修正会真实影响目标仓位。
     # - 减仓/止盈：只允许高估负向强化卖出，且不跌破系统防守仓位。
     # - 观望/持有：只保留文字提示，不改变当前仓位。
@@ -1659,7 +1706,7 @@ def compute_decision(cfg: Dict[str, Any], form: Dict[str, Any]) -> Decision:
             buy_mult, buy_mult_notes = buy_step_sensitivity(signals)
             opp_mult, opp_notes, reject_for_odds = buy_opportunity_multiplier(signal_quality, expected_r, frequency_mult)
             if is_allocation_fill:
-                # 底仓补足不是赔率型短线交易。它的核心目标是“比无脑定投更早建立长期暴露”，
+                # 底仓补足不是赔率型短线交易。它的核心目标是"比无脑定投更早建立长期暴露"，
                 # 因此不再被信号质量/赔率/频率二次打折；估值、趋势、风险降速已在
                 # core_allocation_step_limit 中完成。
                 buy_step_limit = base_buy_step_limit
@@ -1704,7 +1751,7 @@ def compute_decision(cfg: Dict[str, Any], form: Dict[str, Any]) -> Decision:
     elif action == "清仓":
         target = floor
 
-    # 卖出/清仓类信号绝不能因为“系统防守仓位”高于当前仓位而反向买入。
+    # 卖出/清仓类信号绝不能因为"系统防守仓位"高于当前仓位而反向买入。
     # 系统防守仓位是风险状态下最多保留到哪里，不是无买点时的补仓信号。
     sell_like_actions = {"减仓", "大减仓", "止盈", "清仓"}
     if action in sell_like_actions and target > cur + 1e-9:
@@ -1717,19 +1764,19 @@ def compute_decision(cfg: Dict[str, Any], form: Dict[str, Any]) -> Decision:
     # 计划资金就是100%上限，不再根据标的类型设置上限。
     target = clamp(target, 0.0, 0.9999)
 
-    # 防守性目标低于当前仓位时，动作不能仍显示“观望/持有”。
-    # 例如未站上200日线且当前仓位过高，规则会把目标降到防守仓位，动作应明确为“减仓”。
+    # 防守性目标低于当前仓位时，动作不能仍显示"观望/持有"。
+    # 例如未站上200日线且当前仓位过高，规则会把目标降到防守仓位，动作应明确为"减仓"。
     if target < cur - 0.005 and action in {"观望", "持有"}:
         action = "清仓" if target <= 0.005 else "减仓"
         reasons.append("目标仓位已经低于当前仓位，按防守规则降低仓位。")
 
-    # 目标仓位已经降到接近0时，内部动作也要同步为“清仓”，避免动作和大号结果不一致。
+    # 目标仓位已经降到接近0时，内部动作也要同步为"清仓"，避免动作和大号结果不一致。
     if target <= 0.005 and cur > 0.005 and action in {"减仓", "大减仓"}:
         action = "清仓"
 
     if action not in {"清仓", "大减仓"} and abs(target - cur) < 0.005:
         # 调整幅度低于执行阈值时，必须同步把目标仓位归回当前仓位，
-        # 避免界面显示“持有”，但建议金额仍出现小额买入/卖出。
+        # 避免界面显示"持有"，但建议金额仍出现小额买入/卖出。
         target = cur
         if action in {"试仓", "买入", "加仓", "重仓"}:
             action = "持有" if cur > 0 else "观望"
@@ -1835,8 +1882,8 @@ def decision_to_payload(cfg: Dict[str, Any], result: Decision) -> Dict[str, Any]
 
     reason_text = join_reason_text(result.reason)
 
-    # 顶部【实时计算结果】显示“动作 + 本次仓位变化”，而不是只显示买入/卖出。
-    # 例如当前 10%、目标 22%，显示“加仓 +12%”；当前 50%、目标 20%，显示“减仓 -30%”。
+    # 顶部【实时计算结果】显示"动作 + 本次仓位变化"，而不是只显示买入/卖出。
+    # 例如当前 10%、目标 22%，显示"加仓 +12%"；当前 50%、目标 20%，显示"减仓 -30%"。
     if delta > 0.005:
         action_label = "加仓" if cur_pos > 0.005 else "买入"
         action_delta_text = f"+{pct(delta)}"
@@ -2088,11 +2135,11 @@ def search_akshare(query: str) -> List[Dict[str, str]]:
 
 
 def is_placeholder_symbol_candidate(item: Dict[str, str]) -> bool:
-    """判断搜索结果是不是“只按代码猜出来”的占位候选。
+    """判断搜索结果是不是"只按代码猜出来"的占位候选。
 
     例如直接输入 001422 时，本地兜底旧逻辑会先造出
     {symbol: 001422, name: 001422, asset_kind: stock}，但在线基金列表随后能返回
-    “景顺长城安享回报混合A”。这种占位项不应该显示在真正命名结果前面，
+    "景顺长城安享回报混合A"。这种占位项不应该显示在真正命名结果前面，
     否则用户会误点成股票。
     """
     symbol = str(item.get("symbol") or "").strip().upper()
@@ -2810,7 +2857,7 @@ def _as_date_string(value: Any) -> Optional[str]:
 def _rolling_percentiles_by_date(items: List[Tuple[str, Optional[float]]], years: int = 10, min_count: int = 30) -> Dict[str, Optional[float]]:
     """只使用当日及以前数据计算百分位，避免回测未来函数。
 
-    近似蛋卷常见的“近10年百分位”：若10年窗口数据不足 min_count，则退化为当日前扩展窗口。
+    近似蛋卷常见的"近10年百分位"：若10年窗口数据不足 min_count，则退化为当日前扩展窗口。
     """
     parsed: List[Tuple[date, str, float]] = []
     for ds, val in items:
@@ -2929,7 +2976,7 @@ def recompute_history_percentiles(series: Dict[str, Dict[str, Any]]) -> Dict[str
 
     用途：蛋卷 pe_history/pb_history 可能是图表采样点，而 detail 接口会更快给出
     最新交易日数据。把 detail 最新点补进序列后，必须重新计算百分位，避免
-    “估值序列最新日期”落后于页面最新日期。
+    "估值序列最新日期"落后于页面最新日期。
     """
     if not series:
         return series
@@ -3003,7 +3050,7 @@ def merge_danjuan_detail_current_into_history_series(
 def _validate_history_percentile_series(series: Dict[str, Dict[str, Any]], label: str, min_rows: int = 30) -> Dict[str, Dict[str, Any]]:
     """系统自算 PE 百分位必须拿到真正的历史序列。
 
-    只返回 1 行的“当前估值”不能用于系统自算百分位；这种情况应当明确失败，
+    只返回 1 行的"当前估值"不能用于系统自算百分位；这种情况应当明确失败，
     避免日志显示成功但 PE 百分位仍为空。
     """
     rows = len(series or {})
@@ -3080,7 +3127,7 @@ def _legulegu_slugs_for_index(code: str, name: str, digits: str) -> List[str]:
 
     AKShare 1.15.52 之后已移除 funddb 相关接口，当前版本不再有
     index_value_hist_funddb。这里直接访问乐咕公开页面并自行解析历史 PE，
-    作为“系统自算”而非蛋卷估值。
+    作为"系统自算"而非蛋卷估值。
     """
     slugs: List[str] = []
     if code in LEGULEGU_INDEX_PAGE_MAP:
@@ -3307,7 +3354,7 @@ def fetch_akshare_index_valuation_series(symbol: str, asset_kind: str, options: 
     diagnostics.append(f"映射结果 code={code}, name={name}, digits={digits}")
     diagnostics.append(f"akshare版本={getattr(ak, '__version__', 'unknown')}")
 
-    # 系统自算只接受“历史估值”接口，不接受只返回当前 1 行的估值接口。
+    # 系统自算只接受"历史估值"接口，不接受只返回当前 1 行的估值接口。
     # 有些 AKShare 版本/源会把 index_value_hist_funddb 返回成 1 行，必须判为失败。
     symbols_to_try: List[str] = []
     for sym in (name, f"{name}指数", code, digits):
@@ -3442,7 +3489,7 @@ def latest_valuation_from_history_series(series: Dict[str, Dict[str, Any]], sour
 
     系统自算 PE 百分位必须基于真实历史序列。
     如果历史点数不足或没有算出 pe_percentile，就明确失败，
-    不再把“当前 1 行估值”误报为系统自算成功。
+    不再把"当前 1 行估值"误报为系统自算成功。
     """
     series = _validate_history_percentile_series(series, source_label)
     rows = len(series)
@@ -3852,7 +3899,7 @@ def _danjuan_ts_to_date(value: Any) -> Optional[str]:
     """蛋卷接口 ts 是按北京时间交易日给的 00:00:00。
 
     之前用 UTC 解析会把 2026-06-05 00:00:00+08:00 显示成
-    2026-06-04，导致“估值序列最新日期”比页面 date 慢一天。
+    2026-06-04，导致"估值序列最新日期"比页面 date 慢一天。
     这里固定按 UTC+8 转日期，和蛋卷页面的 date 字段对齐。
     """
     if value is None or value == "":
@@ -4390,9 +4437,9 @@ def compute_indicators(records: List[Dict[str, float]], fundamentals: Dict[str, 
 def enrich_indicators_with_user_position(indicators: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
     """根据用户填写的当前涨跌幅/持仓盈亏率，自动推断盈利阶段和初始止损。
 
-    用户直接填“当前涨跌幅 %”，脚本不再要求买入价/成本价。
+    用户直接填"当前涨跌幅 %"，脚本不再要求买入价/成本价。
     - 盈利 R 倍数 = 当前涨跌幅 / 止损距离。
-    - 初始止损只在“有持仓 + 当前涨跌幅 <= -止损距离”时自动触发。
+    - 初始止损只在"有持仓 + 当前涨跌幅 <= -止损距离"时自动触发。
 
     注意：风险仓位上限低于当前仓位，不等于触发初始止损；
     触发初始止损只代表价格已经跌到买入前设定的止损线。
@@ -5375,7 +5422,7 @@ def backtest_fetch_eastmoney_fund_nav(symbol: str, start: date, end: date, optio
     open/high/low 同步设为 close，volume 设为 0。这样能回测趋势/仓位逻辑，但量价辅助会自然弱化。
 
     v58 修复点：东方财富历史净值接口经常把 pageSize 限制为 20。如果请求 pageSize=200，
-    旧代码会误以为“20 < 200 = 最后一页”，导致只抓第一页。这里统一按 20 条分页，并持续
+    旧代码会误以为"20 < 200 = 最后一页"，导致只抓第一页。这里统一按 20 条分页，并持续
     翻页到空页/重复页/超过页数为止；同时增加 TiantianFundApi 的 fundMNHisNetList 兜底。
     """
     import requests  # type: ignore
@@ -5815,7 +5862,7 @@ def backtest_strategy_score(
     """策略表现百分制评分。
 
     权重：年化超额收益 30%、最大回撤控制 25%、卡玛 20%、夏普 20%、执行质量 5%。
-    这样不会再只靠低回撤拿高分，也不会重复使用“系统相对定投”的相减评分。
+    这样不会再只靠低回撤拿高分，也不会重复使用"系统相对定投"的相减评分。
     """
     score = (
         _strategy_excess_return_score(cagr, annual_risk_free_rate) * 0.30
@@ -5952,7 +5999,7 @@ def simulate_periodic_dca(
         return [], 0, 0.0
 
     step = max(1, int(rebalance_days))
-    # 买入日按“当前可观测日”计算，而不是下一日；但必须排除最后一个记录。
+    # 买入日按"当前可观测日"计算，而不是下一日；但必须排除最后一个记录。
     buy_indices = set(range(start_index, len(records) - 1, step))
     buy_count_plan = len(buy_indices)
     installment = initial_cash / buy_count_plan if buy_count_plan > 0 else 0.0
@@ -6128,7 +6175,7 @@ def build_backtest_diagnosis_metrics(
 
 
 def backtest_metrics_rows(metrics: Dict[str, Any]) -> List[Dict[str, Any]]:
-    # 展示顺序按“主指标优先、诊断项靠后”排列。
+    # 展示顺序按"主指标优先、诊断项靠后"排列。
     # 前端会按同一顺序渲染；导出的核心指标 CSV 也保持这个顺序。
     order = [
         "标的核心得分", "系统策略得分", "定投策略得分", "持有策略得分",
@@ -6144,7 +6191,7 @@ def backtest_metrics_rows(metrics: Dict[str, Any]) -> List[Dict[str, Any]]:
         "历史PB", "页面PB", "PB误差",
         "历史PB百分位", "页面PB百分位", "PB百分位误差",
         "历史ROE", "页面ROE", "ROE误差",
-        # 诊断项放在后面，避免一进回测结果就被“结论/拖累”抢占主指标位置。
+        # 诊断项放在后面，避免一进回测结果就被"结论/拖累"抢占主指标位置。
         "相对定投收益差", "相对持有收益差", "相对定投回撤改善", "相对持有回撤改善",
         "估算交易成本拖累", "估算现金拖累",
     ]
@@ -6330,7 +6377,7 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
             next_signal_index = i + rebalance_days
         else:
             # 非检查日不重新计算信号，继续展示上一次目标仓位；是否成交只由操作周期日决定。
-            # 这不是新增一层阈值，而是避免把“上次目标仓位”解释成每日再平衡指令。
+            # 这不是新增一层阈值，而是避免把"上次目标仓位"解释成每日再平衡指令。
             target_pos = last_target
 
         equity_exec = cash + shares * exec_open
@@ -6345,7 +6392,7 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
             and abs(target_pos - current_pos_signal) < min_trade_pct
         )
 
-        # 只有检查日产生的真实调仓信号才成交；“维持 XX%”只记录目标，不做机械再平衡。
+        # 只有检查日产生的真实调仓信号才成交；"维持 XX%"只记录目标，不做机械再平衡。
         if (not is_review_day) or maintain_signal:
             trade_value = 0.0
         elif abs(trade_value) / max(equity_exec, 1e-9) < min_trade_pct:
@@ -6642,7 +6689,7 @@ def api_config():
     cfg["strategy_mode"] = "single"
     if "strategy_family_params" in data and isinstance(data.get("strategy_family_params"), dict):
         cfg["strategy_family_params"] = data.get("strategy_family_params") or {}
-    # 全局偏离度（全策略家族共享）
+    # 全局偏离度：防守/进攻只保存偏离值，有效参数运行时由均衡基准计算。
     if "deviation" in data and isinstance(data.get("deviation"), dict):
         cfg["deviation"] = data.get("deviation") or {}
     if "strategy_mix" in data and isinstance(data.get("strategy_mix"), dict):
@@ -6659,13 +6706,29 @@ def api_config():
     cfg["risk_per_trade_pct"] = clamp(as_float(data.get("risk_per_trade_pct"), cfg.get("risk_per_trade_pct", 1.0)), 0.1, 100.0)
     cfg["backtest_risk_free_rate_pct"] = clamp(as_float(data.get("backtest_risk_free_rate_pct"), cfg.get("backtest_risk_free_rate_pct", 2.0)), -20.0, 30.0)
 
+    # 均衡基准运行参数：偏离度只基于这些值临时计算；保存层只保留 balanced。
+    for key, default, low, high in [
+        ("global_buy_step_pct", 26.0, 0.0, 100.0),
+        ("global_sell_step_pct", 48.0, 0.0, 100.0),
+        ("global_risk_multiplier", 1.0, 0.1, 5.0),
+        ("core_step_pct", 22.0, 0.0, 100.0),
+        ("buy_step_limit_pct", 28.0, 0.0, 100.0),
+        ("sell_step_limit_pct", 45.0, 0.0, 100.0),
+        ("core_min_position_pct", 5.0, 0.0, 100.0),
+        ("core_max_position_pct", 92.0, 0.0, 100.0),
+        ("strict_min_position_pct", 0.0, 0.0, 100.0),
+        ("strict_max_position_pct", 60.0, 0.0, 100.0),
+    ]:
+        if key in data:
+            cfg[key] = clamp(as_float(data.get(key), cfg.get(key, default)), low, high)
+
     for key in ["symbol", "symbol_name", "market", "asset_kind", "data_source", "proxy_mode", "proxy_url", "danjuan_cookie", "valuation_method"]:
         if key in data:
             cfg[key] = str(data.get(key) or "")
     if cfg.get("proxy_mode") not in {"system", "custom", "none"}:
         cfg["proxy_mode"] = "system"
     if cfg.get("valuation_method") not in {"system_calc", "danjuan"}:
-        # 兼容旧配置：前端已移除 auto，旧 auto 统一迁移为“乐咕乐股”。
+        # 兼容旧配置：前端已移除 auto，旧 auto 统一迁移为"乐咕乐股"。
         cfg["valuation_method"] = "system_calc"
     cfg["request_timeout_sec"] = clamp(as_float(data.get("request_timeout_sec"), cfg.get("request_timeout_sec", 12.0)), 3.0, 60.0)
     cfg["retry_count"] = int(clamp(as_float(data.get("retry_count"), cfg.get("retry_count", 2)), 0.0, 5.0))
@@ -6719,7 +6782,7 @@ def api_search():
     results = dedupe_symbols(items, query)
 
     # 只有在本地/在线都找不到结果时，才给一个可手动尝试的兜底候选；
-    # 不再让 001422 这种“基金代码 + A股前缀重叠”的代码先显示成股票占位项。
+    # 不再让 001422 这种"基金代码 + A股前缀重叠"的代码先显示成股票占位项。
     if re.fullmatch(r"\d{6}", query) and not any(str(x.get("symbol") or "").upper() == query.upper() for x in results):
         fallback_kind = guess_cn_asset_kind(query)
         results.append({"symbol": query.upper(), "name": query.upper(), "market": "CN", "asset_kind": fallback_kind, "source": "akshare"})
@@ -6831,7 +6894,8 @@ def api_backtest():
             "version": 19,
             "data": data,
             "cfg": {key: cfg.get(key) for key in [
-                "plan_amount", "strategy_family", "strategy", "strategy_mix", "strategy_family_params", "position_mode", "risk_per_trade_pct", "backtest_risk_free_rate_pct",
+                "plan_amount", "strategy_family", "strategy", "strategy_mix", "strategy_family_params", "deviation", "position_mode", "risk_per_trade_pct", "backtest_risk_free_rate_pct",
+                "global_buy_step_pct", "global_sell_step_pct", "global_risk_multiplier",
                 "symbol", "symbol_name", "market", "asset_kind", "data_source",
                 "proxy_mode", "proxy_url", "request_timeout_sec", "retry_count",
                 "danjuan_cookie", "valuation_method",

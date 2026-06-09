@@ -50,6 +50,19 @@
     globalDeviation[sk] = {amplitude: numberOr(d.amplitude, 0), threshold: numberOr(d.threshold, 0)};
   }
 
+  const globalConfigState = {
+    global_buy_step_pct: numberOr(initialConfig.global_buy_step_pct, 26),
+    global_sell_step_pct: numberOr(initialConfig.global_sell_step_pct, 48),
+    global_risk_multiplier: numberOr(initialConfig.global_risk_multiplier, 1.0),
+    core_step_pct: numberOr(initialConfig.core_step_pct, 22),
+    buy_step_limit_pct: numberOr(initialConfig.buy_step_limit_pct, 28),
+    sell_step_limit_pct: numberOr(initialConfig.sell_step_limit_pct, 45),
+    core_min_position_pct: numberOr(initialConfig.core_min_position_pct, 5),
+    core_max_position_pct: numberOr(initialConfig.core_max_position_pct, 92),
+    strict_min_position_pct: numberOr(initialConfig.strict_min_position_pct, 0),
+    strict_max_position_pct: numberOr(initialConfig.strict_max_position_pct, 60),
+  };
+
   function defaultStyleKey() {
     return strategyKeys.includes("balanced") ? "balanced" : (strategyKeys[0] || "balanced");
   }
@@ -254,11 +267,20 @@
     return normalized;
   }
 
+  function balancedOnlyMix(familyKey) {
+    const params = getFamilyParams(familyKey);
+    if (!params.strategy_mix.balanced) params.strategy_mix.balanced = defaultStyleEntry("balanced", "balanced", familyKey);
+    const balanced = Object.assign({}, params.strategy_mix.balanced);
+    // 均衡是唯一可保存基准；当前执行风格由 cfg.strategy 保存，不靠 mix.enabled 表达。
+    balanced.enabled = true;
+    balanced.weight_pct = 100;
+    return {balanced};
+  }
+
   function serialiseFamilyParams() {
     const out = {};
     for (const familyKey of strategyFamilyKeys) {
-      const params = getFamilyParams(familyKey);
-      out[familyKey] = {strategy_mix: params.strategy_mix || {}};
+      out[familyKey] = {strategy_mix: balancedOnlyMix(familyKey)};
     }
     return out;
   }
@@ -319,90 +341,174 @@
     globalDeviation[styleKey].threshold = threshold;
   }
 
-  // 全局执行速度默认值
-  const GLOBAL_STYLE_DEFAULTS = {buy_step_pct: 26, sell_step_pct: 48, risk_multiplier: 1.0};
+  function deviationGroupForField(fieldName) {
+    const name = String(fieldName || "").toLowerCase();
+    if (!name || name === "risk_multiplier" || name === "global_risk_multiplier") return null;
+    if (AMPLITUDE_FIELDS.includes(fieldName)) return "amplitude";
+    if (THRESHOLD_FIELDS.includes(fieldName)) return "threshold";
+    if (!name.endsWith("_pct")) return null;
+    if (
+      name.includes("cap") || name.includes("limit") || name.includes("threshold") ||
+      name.includes("above") || name.includes("below") || name.includes("stop") ||
+      name.includes("floor") || name.includes("min_") || name.includes("max_") ||
+      name.includes("core_step") || name.includes("core_base")
+    ) return "threshold";
+    return "amplitude";
+  }
+
+  function paramFieldLabel(familyKey, fieldName) {
+    const field = iterStyleParamFields(familyKey).find(item => item.name === fieldName);
+    return field?.label || ALL_FIELD_LABELS[fieldName] || fieldName;
+  }
+
+  // 偏离展示/执行的基准：始终只以【均衡基准】为源；配置保存时只保存 balanced + deviation。
+  const GLOBAL_STYLE_DEFAULTS = {global_buy_step_pct: 26, global_sell_step_pct: 48, global_risk_multiplier: 1.0};
+  const GLOBAL_EXECUTION_DEFAULTS = {core_step_pct: 22, buy_step_limit_pct: 28, sell_step_limit_pct: 45};
+  const GLOBAL_POSITION_DEFAULTS = {core_min_position_pct: 5, core_max_position_pct: 92, strict_min_position_pct: 0, strict_max_position_pct: 60};
+
+  function readGlobalField(name, fallback) {
+    const el = document.querySelector(`#global-config-body [data-global-field="${name}"]`);
+    if (el) return numberOr(el.value, fallback);
+    return numberOr(globalConfigState[name], fallback);
+  }
 
   function getGlobalStyleBase() {
+    const buy = readGlobalField("global_buy_step_pct", GLOBAL_STYLE_DEFAULTS.global_buy_step_pct);
+    const sell = readGlobalField("global_sell_step_pct", GLOBAL_STYLE_DEFAULTS.global_sell_step_pct);
+    const risk = readGlobalField("global_risk_multiplier", GLOBAL_STYLE_DEFAULTS.global_risk_multiplier);
+    return {
+      global_buy_step_pct: buy,
+      global_sell_step_pct: sell,
+      global_risk_multiplier: risk,
+      // 供偏离预览统一使用：操作幅度字段仍沿用 buy_step_pct / sell_step_pct。
+      buy_step_pct: buy,
+      sell_step_pct: sell,
+      risk_multiplier: risk,
+    };
+  }
+
+  function getGlobalExecutionBase() {
     const out = {};
-    for (const [key, def] of Object.entries(GLOBAL_STYLE_DEFAULTS)) {
-      const el = document.querySelector(`#global-config-body [data-global-field="${key}"]`);
-      out[key] = el ? numberOr(el.value, def) : (initialConfig[key] ?? def);
-    }
+    for (const [key, fallback] of Object.entries(GLOBAL_EXECUTION_DEFAULTS)) out[key] = readGlobalField(key, fallback);
     return out;
   }
 
   function getGlobalPositionBase() {
-    const q = (name, def) => {
-      const el = document.querySelector(`#global-config-body [data-global-field="${name}"]`);
-      return el ? numberOr(el.value, def) : (initialConfig[name] ?? def);
-    };
-    return {
-      core_min_position_pct: q("core_min_position_pct", 5),
-      core_max_position_pct: q("core_max_position_pct", 92),
-      strict_min_position_pct: q("strict_min_position_pct", 0),
-      strict_max_position_pct: q("strict_max_position_pct", 60),
-    };
+    const out = {};
+    for (const [key, fallback] of Object.entries(GLOBAL_POSITION_DEFAULTS)) out[key] = readGlobalField(key, fallback);
+    return out;
   }
 
-  // 获取某风格自身的预设基础值（不带偏离修正）
-  function getStyleBaseValues(familyKey, styleKey) {
+  function roundedPct(value) {
+    return Math.round(numberOr(value, 0) * 10) / 10;
+  }
+
+  function formatPreviewNumber(value) {
+    const n = roundedPct(value);
+    return Number.isInteger(n) ? String(n) : n.toFixed(1).replace(/\.0$/, "");
+  }
+
+  function getBalancedCoreBasePct(familyKey) {
     const params = getFamilyParams(familyKey);
-    const entry = (params.strategy_mix || {})[styleKey] || {};
+    const balanced = (params.strategy_mix || {}).balanced || defaultStyleEntry("balanced", "balanced", familyKey);
+    const defaults = defaultCoreBasePct("balanced", familyKey);
     const out = {};
-    for (const f of [...AMPLITUDE_FIELDS, ...THRESHOLD_FIELDS]) {
-      if (entry[f] !== undefined) out[f] = numberOr(entry[f], 0);
+    const raw = balanced.core_base_pct && typeof balanced.core_base_pct === "object" ? balanced.core_base_pct : {};
+    for (const state of Object.keys(strategyMarketStates)) out[state] = numberOr(raw[state], defaults[state]);
+    return out;
+  }
+
+  function balancedFieldFallback(familyKey, fieldName) {
+    const preset = familyStylePreset(familyKey, "balanced");
+    const fieldSpec = iterStyleParamFields(familyKey).find(item => item.name === fieldName) || {name: fieldName, type: "number", min: 0, max: 100};
+    return fieldDefaultValue(fieldSpec, preset, 0);
+  }
+
+  function getBalancedBaseValues(familyKey) {
+    const params = getFamilyParams(familyKey);
+    const balanced = (params.strategy_mix || {}).balanced || defaultStyleEntry("balanced", "balanced", familyKey);
+    const out = Object.assign({}, getGlobalStyleBase(), getGlobalExecutionBase(), getGlobalPositionBase());
+
+    // 策略 Python schema 声明的参数，统一从【均衡】读取。
+    for (const field of iterStyleParamFields(familyKey)) {
+      if (!field.name || field.name === "core_base_pct") continue;
+      const fallback = balancedFieldFallback(familyKey, field.name);
+      out[field.name] = normaliseParamValue(balanced[field.name], field, fallback);
     }
     return out;
   }
 
-  function applyDeviations(familyKey, styleKey, ampDev, thrDev) {
-    const params = getFamilyParams(familyKey);
-    const entry = params.strategy_mix[styleKey];
-    if (!entry) return;
-    setGlobalDeviation(styleKey, ampDev, thrDev);
+  function getDeviationBaseValue(familyKey, fieldName) {
+    return getBalancedBaseValues(familyKey)[fieldName];
+  }
+
+  function getPreviewFields(familyKey, requestedFields) {
+    const base = getBalancedBaseValues(familyKey);
+    return (requestedFields || Object.keys(base)).filter(name => base[name] !== undefined && deviationGroupForField(name));
+  }
+
+  function computeDeviationValue(baseValue, devPct, styleKey) {
     const isAgg = styleKey === "aggressive";
-    const styleBase = getStyleBaseValues(familyKey, styleKey);
-    const balanced = params.strategy_mix.balanced || {};
-    const bPreset = familyStylePreset(familyKey, "balanced");
-    for (const field of iterStyleParamFields(familyKey)) {
-      if (!field.name || field.name === "core_base_pct") continue;
-      // 偏离字段从该风格自身预设读取，其他字段从均衡 entry 读取
-      let bVal;
-      if (Object.prototype.hasOwnProperty.call(styleBase, field.name)) {
-        bVal = styleBase[field.name];
-      } else {
-        bVal = numberOr(balanced[field.name], fieldDefaultValue(field, bPreset, 0));
-      }
-      let dev = -1;
-      if (AMPLITUDE_FIELDS.includes(field.name)) dev = ampDev;
-      else if (THRESHOLD_FIELDS.includes(field.name)) dev = thrDev;
-      else { entry[field.name] = normaliseParamValue(bVal, field, bVal); continue; }
-      const computed = applyDeviation(bVal, dev, isAgg);
-      entry[field.name] = normaliseParamValue(Math.round(computed * 10) / 10, field, bVal);
+    return roundedPct(applyDeviation(numberOr(baseValue, 0), devPct, isAgg));
+  }
+
+  function renderDeviationPreview(familyKey, styleKey, requestedFields) {
+    const box = document.createElement("div");
+    box.className = "multiplier-preview simple";
+    box.dataset.previewFamily = familyKey;
+    box.dataset.previewStyle = styleKey;
+
+    const grid = document.createElement("div");
+    grid.className = "multiplier-preview-grid";
+    for (const fieldName of getPreviewFields(familyKey, requestedFields)) {
+      const row = document.createElement("div");
+      row.className = "preview-row";
+      row.dataset.previewField = fieldName;
+      appendTextEl(row, "span", "preview-name", paramFieldLabel(familyKey, fieldName));
+      appendTextEl(row, "span", "preview-val", "");
+      grid.appendChild(row);
     }
-    const bCore = balanced.core_base_pct || defaultCoreBasePct("balanced", familyKey);
-    entry.core_base_pct = {};
-    for (const state of Object.keys(strategyMarketStates)) {
-      const bCoreVal = numberOr(bCore[state], defaultCoreBasePct("balanced", familyKey)[state]);
-      entry.core_base_pct[state] = Math.round(applyDeviation(bCoreVal, thrDev, isAgg) * 10) / 10;
+    box.appendChild(grid);
+    refreshDeviationPreviewBox(box);
+    return box;
+  }
+
+  function refreshDeviationPreviewBox(box) {
+    if (!box) return;
+    const familyKey = box.dataset.previewFamily || activeFamilyKeyFromForm();
+    const styleKey = box.dataset.previewStyle || activeStyleKeyFromForm();
+    const devs = getDeviations(styleKey);
+    const base = getBalancedBaseValues(familyKey);
+    for (const row of $$(".preview-row", box)) {
+      const fieldName = row.dataset.previewField;
+      if (!fieldName || base[fieldName] === undefined) continue;
+      const dev = deviationGroupForField(fieldName) === "amplitude" ? devs.amplitude : devs.threshold;
+      const bVal = roundedPct(base[fieldName]);
+      const computed = computeDeviationValue(bVal, dev, styleKey);
+
+      const val = row.querySelector(".preview-val");
+      if (val) val.textContent = `${formatPreviewNumber(bVal)}→${formatPreviewNumber(computed)}`;
     }
+  }
+
+  function refreshDeviationPreviews(root = document) {
+    for (const box of $$(".multiplier-preview", root)) refreshDeviationPreviewBox(box);
+  }
+
+  function applyDeviations(familyKey, styleKey, ampDev, thrDev) {
+    // 只保存偏离度；有效值由展示层/后端运行时按均衡基准临时计算。
+    setGlobalDeviation(styleKey, ampDev, thrDev);
+    refreshDeviationPreviews(document);
   }
 
   function collectStrategyMix(data) {
     const familyKey = data?.strategy_family || activeFamilyKeyFromForm();
-    const params = getFamilyParams(familyKey);
-    const selectedStyle = strategyKeys.includes(data?.strategy) ? data.strategy : activeStyleKeyFromForm();
-    for (const key of strategyKeys) {
-      if (!params.strategy_mix[key]) params.strategy_mix[key] = defaultStyleEntry(key, selectedStyle, familyKey);
-      params.strategy_mix[key].enabled = key === selectedStyle;
-      params.strategy_mix[key].weight_pct = key === selectedStyle ? 100 : 0;
-    }
-    return params.strategy_mix;
+    return balancedOnlyMix(familyKey);
   }
 
   function strategySummaryText(data) {
     const styleKey = strategyKeys.includes(data?.strategy) ? data.strategy : activeStyleKeyFromForm();
-    return `参数风格：${strategyText(styleKey)}<br>风格使用方式：左侧选择当前执行风格，且不再跟随总体策略分别记忆；顶部【参数】只负责编辑各风格微调。`;
+    return `参数风格：${strategyText(styleKey)}<br>风格使用方式：只保存【均衡】基准；防守/进攻由偏离值实时计算，当前执行风格由左侧选择。`;
   }
 
   function renderSchemaField(field, values) {
@@ -628,13 +734,21 @@
       retry_count: Number(data.retry_count || 2),
       danjuan_cookie: data.danjuan_cookie || ""
     };
-    // 全局仓位边界
+    // 只保存均衡基准；防守/进攻的有效值由 deviation 临时计算。
+    const gStyle = getGlobalStyleBase();
+    payload.global_buy_step_pct = gStyle.global_buy_step_pct;
+    payload.global_sell_step_pct = gStyle.global_sell_step_pct;
+    payload.global_risk_multiplier = gStyle.global_risk_multiplier;
+    const gExec = getGlobalExecutionBase();
+    payload.core_step_pct = gExec.core_step_pct;
+    payload.buy_step_limit_pct = gExec.buy_step_limit_pct;
+    payload.sell_step_limit_pct = gExec.sell_step_limit_pct;
     const gPos = getGlobalPositionBase();
     payload.core_min_position_pct = gPos.core_min_position_pct;
     payload.core_max_position_pct = gPos.core_max_position_pct;
     payload.strict_min_position_pct = gPos.strict_min_position_pct;
     payload.strict_max_position_pct = gPos.strict_max_position_pct;
-    // 全局偏离度（后端从策略预设+偏离度自行计算有效值）
+    // 全局偏离度：后端从均衡基准 + 偏离度临时计算有效值。
     payload.deviation = {};
     for (const sk of strategyKeys) {
       const d = globalDeviation[sk] || {amplitude: 0, threshold: 0};
@@ -707,7 +821,7 @@
     const speedHead = document.createElement("div");
     speedHead.className = "family-param-group-title";
     appendTextEl(speedHead, "strong", "", "均衡基准 · 执行速度");
-    appendTextEl(speedHead, "em", "", "进攻和防守都从此基准偏离。");
+    appendTextEl(speedHead, "em", "", "防守/进攻都从这个均衡基准 + 偏离值计算，不单独保存。");
     speedBox.appendChild(speedHead);
     const speedGrid = document.createElement("div");
     speedGrid.className = "global-field-row";
@@ -726,7 +840,7 @@
       input.step = String(f.step ?? 0.1);
       input.min = String(f.min ?? 0);
       input.max = String(f.max ?? 100);
-      input.value = numberOr(initialConfig[f.name], f.default);
+      input.value = numberOr(globalConfigState[f.name], f.default);
       input.dataset.globalField = f.name;
       label.appendChild(input);
       speedGrid.appendChild(label);
@@ -757,7 +871,7 @@
       appendTextEl(label, "span", "", f.label);
       const input = document.createElement("input");
       input.type = "number"; input.step = "0.1"; input.min = "0"; input.max = "100";
-      input.value = numberOr(initialConfig[f.name], f.default);
+      input.value = numberOr(globalConfigState[f.name], f.default);
       input.dataset.globalField = f.name;
       label.appendChild(input);
       boundGrid.appendChild(label);
@@ -787,7 +901,7 @@
       appendTextEl(label, "span", "", f.label);
       const input = document.createElement("input");
       input.type = "number"; input.step = "0.1"; input.min = "0"; input.max = "100";
-      input.value = numberOr(initialConfig[f.name], f.default);
+      input.value = numberOr(globalConfigState[f.name], f.default);
       input.dataset.globalField = f.name;
       label.appendChild(input);
       execGrid.appendChild(label);
@@ -796,19 +910,19 @@
     body.appendChild(execBox);
 
     // ③ 基础仓位表
-    const entry = (params.strategy_mix || {})[activeStyle] || {};
-    const coreBase = entry.core_base_pct || defaultCoreBasePct(activeStyle, activeFamily);
+    const entry = (params.strategy_mix || {}).balanced || defaultStyleEntry("balanced", "balanced", activeFamily);
+    const coreBase = entry.core_base_pct || defaultCoreBasePct("balanced", activeFamily);
     const coreSection = document.createElement("details");
     coreSection.className = "family-core-tune";
     coreSection.open = true;
-    appendTextEl(coreSection, "summary", "", `基础目标仓位表（${strategyInfo[activeStyle]?.name || activeStyle}）`);
+    appendTextEl(coreSection, "summary", "", `基础目标仓位表（均衡基准）`);
     appendTextEl(coreSection, "p", "family-param-help", "不同趋势状态下的基础目标仓位；后续再叠加估值、质量和风控修正。");
     const coreGrid = document.createElement("div");
     coreGrid.className = "family-core-grid";
     for (const [state, stateName] of Object.entries(strategyMarketStates)) {
       const label = document.createElement("label");
       label.className = "mini-field";
-      label.dataset.tip = `${stateName}状态下，当前风格的基础目标仓位。`;
+      label.dataset.tip = `${stateName}状态下，均衡基准的基础目标仓位。`;
       appendTextEl(label, "span", "", `${stateName}%`);
       const input = document.createElement("input");
       input.type = "number"; input.step = "0.1"; input.min = "0"; input.max = "100";
@@ -841,8 +955,8 @@
       const ampLbl = document.createElement("label");
       ampLbl.className = "mini-field multiplier-field";
       ampLbl.dataset.tip = isAgg
-        ? "向右拖 = 买入更快、卖出更慢。0%=风格预设值。"
-        : "向右拖 = 买入更慢、卖出更快。0%=风格预设值。";
+        ? "向右拖 = 买入更快、卖出更慢。0%=与均衡基准一致。"
+        : "向右拖 = 买入更慢、卖出更快。0%=与均衡基准一致。";
       appendTextEl(ampLbl, "span", "", "操作幅度偏离");
       const ampInput = document.createElement("input");
       ampInput.type = "range"; ampInput.min = "0"; ampInput.max = "100"; ampInput.step = "1";
@@ -860,8 +974,8 @@
       const thrLbl = document.createElement("label");
       thrLbl.className = "mini-field multiplier-field";
       thrLbl.dataset.tip = isAgg
-        ? "向右拖 = 阈值向100%推（更宽松）。0%=风格预设值。"
-        : "向右拖 = 阈值向0%压（更严格）。0%=风格预设值。";
+        ? "向右拖 = 阈值向100%推（更宽松）。0%=与均衡基准一致。"
+        : "向右拖 = 阈值向0%压（更严格）。0%=与均衡基准一致。";
       appendTextEl(thrLbl, "span", "", "操作阈值偏离");
       const thrInput = document.createElement("input");
       thrInput.type = "range"; thrInput.min = "0"; thrInput.max = "100"; thrInput.step = "1";
@@ -877,27 +991,7 @@
 
       box.appendChild(g);
 
-      // 预览：所有受影响字段（基础值取自该风格自身的预设）
-      const styleBase = getStyleBaseValues(activeFamilyKeyFromForm(), styleKey);
-      const preview = document.createElement("div");
-      preview.className = "multiplier-preview";
-      const previewGrid = document.createElement("div");
-      previewGrid.className = "multiplier-preview-grid";
-      const allPreviewFields = [...AMPLITUDE_FIELDS, ...THRESHOLD_FIELDS];
-      for (const f of allPreviewFields) {
-        let bVal = styleBase[f];
-        if (bVal === undefined) continue;
-        const dev = AMPLITUDE_FIELDS.includes(f) ? devs.amplitude : devs.threshold;
-        const computed = Math.round(applyDeviation(bVal, dev, isAgg) * 10) / 10;
-        const row = document.createElement("div");
-        row.className = "preview-row";
-        appendTextEl(row, "span", "preview-name", ALL_FIELD_LABELS[f] || f);
-        appendTextEl(row, "span", "preview-arrow", `${bVal} →`);
-        appendTextEl(row, "span", "preview-val", String(computed));
-        previewGrid.appendChild(row);
-      }
-      preview.appendChild(previewGrid);
-      box.appendChild(preview);
+      box.appendChild(renderDeviationPreview(activeFamilyKeyFromForm(), styleKey));
       return box;
     };
 
@@ -1029,7 +1123,7 @@
     const body = $("#family-settings-body");
     if (!body) return;
     if (title) title.textContent = `${family.name || familyKey} · 参数微调`;
-    if (subtitle) subtitle.textContent = "编辑均衡基准参数。非均衡风格的偏离度请在左侧【执行速度】和此处【操作阈值】中调整。";
+    if (subtitle) subtitle.textContent = "编辑均衡基准参数；防守/进攻只由偏离值实时计算，不再保存单独配置。";
     body.innerHTML = "";
 
     const intro = document.createElement("section");
@@ -1058,65 +1152,53 @@
     head.appendChild(headText);
     section.appendChild(head);
 
-    // 非均衡时：操作阈值偏离度
+    // 非均衡时：显示偏离度；仍只编辑均衡基准。
     const activeStyle = activeStyleKeyFromForm();
     if (activeStyle !== "balanced") {
       const devs = getDeviations(activeStyle);
       const isAgg = activeStyle === "aggressive";
       const devDir = isAgg ? "进攻" : "防守";
-      const devTip = isAgg
-        ? "向右拖动 = 向100%方向推。0%=与均衡一致，100%=所有阈值推到100%。"
-        : "向右拖动 = 向0%方向压。0%=与均衡一致，100%=所有阈值压到0%。";
+      const tipAmp = isAgg
+        ? "向右拖动 = 相关幅度类参数向100%方向推。0%=与均衡基准一致。"
+        : "向右拖动 = 相关幅度类参数向0%方向压。0%=与均衡基准一致。";
+      const tipThr = isAgg
+        ? "向右拖动 = 相关阈值/仓位类参数向100%方向推。0%=与均衡基准一致。"
+        : "向右拖动 = 相关阈值/仓位类参数向0%方向压。0%=与均衡基准一致。";
 
-      const thrBox = document.createElement("div");
-      thrBox.className = "family-param-subgroup multiplier-section";
-      const thrHead = document.createElement("div");
-      thrHead.className = "family-param-group-title";
-      appendTextEl(thrHead, "strong", "", `操作阈值（${devDir}偏离度）`);
-      appendTextEl(thrHead, "em", "", "控制单次买入/卖出/补仓上限和仓位上限。");
-      thrBox.appendChild(thrHead);
+      const devBox = document.createElement("div");
+      devBox.className = "family-param-subgroup multiplier-section";
+      const devHead = document.createElement("div");
+      devHead.className = "family-param-group-title";
+      appendTextEl(devHead, "strong", "", `${devDir}偏离度`);
+      appendTextEl(devHead, "em", "", "下方仍编辑均衡基准；这里实时展示当前风格由偏离计算出的有效值。");
+      devBox.appendChild(devHead);
 
-      const thrGrid = document.createElement("div");
-      thrGrid.className = "family-param-grid multiplier-grid";
-      const thrLabel = document.createElement("label");
-      thrLabel.className = "mini-field multiplier-field";
-      thrLabel.dataset.tip = devTip;
-      appendTextEl(thrLabel, "span", "", `${devDir}偏离度`);
-      const thrInput = document.createElement("input");
-      thrInput.type = "range"; thrInput.min = "0"; thrInput.max = "100"; thrInput.step = "1";
-      thrInput.value = String(devs.threshold);
-      thrInput.className = "multiplier-slider";
-      thrInput.dataset.familyParam = familyKey;
-      thrInput.dataset.styleKey = activeStyle;
-      thrInput.dataset.field = "threshold_deviation";
-      thrLabel.appendChild(thrInput);
-      const thrVal = document.createElement("span");
-      thrVal.className = "multiplier-value";
-      thrVal.textContent = `${devs.threshold}%`;
-      thrLabel.appendChild(thrVal);
-      thrGrid.appendChild(thrLabel);
-      thrBox.appendChild(thrGrid);
-
-      // 预览：该风格自身的预设基础值 + 阈值偏离
-      const styleBase = getStyleBaseValues(familyKey, activeStyle);
-      const preview = document.createElement("div");
-      preview.className = "multiplier-preview";
-      const previewGrid = document.createElement("div");
-      previewGrid.className = "multiplier-preview-grid";
-      for (const f of THRESHOLD_FIELDS) {
-        const bVal = styleBase[f];
-        if (bVal === undefined) continue;
-        const computed = Math.round(applyDeviation(bVal, devs.threshold, isAgg) * 10) / 10;
-        const row = document.createElement("div");
-        row.className = "preview-row";
-        appendTextEl(row, "span", "preview-name", ALL_FIELD_LABELS[f] || f);
-        appendTextEl(row, "span", "preview-arrow", `${bVal} →`);
-        appendTextEl(row, "span", "preview-val", String(computed));
-        previewGrid.appendChild(row);
-      }
-      preview.appendChild(previewGrid);
-      thrBox.appendChild(preview);
-      section.appendChild(thrBox);
+      const devGrid = document.createElement("div");
+      devGrid.className = "family-param-grid multiplier-grid";
+      const renderDevSlider = (field, title, value, tip) => {
+        const label = document.createElement("label");
+        label.className = "mini-field multiplier-field";
+        label.dataset.tip = tip;
+        appendTextEl(label, "span", "", title);
+        const input = document.createElement("input");
+        input.type = "range"; input.min = "0"; input.max = "100"; input.step = "1";
+        input.value = String(value);
+        input.className = "multiplier-slider";
+        input.dataset.familyParam = familyKey;
+        input.dataset.styleKey = activeStyle;
+        input.dataset.field = field;
+        label.appendChild(input);
+        const val = document.createElement("span");
+        val.className = "multiplier-value";
+        val.textContent = `${value}%`;
+        label.appendChild(val);
+        devGrid.appendChild(label);
+      };
+      renderDevSlider("amplitude_deviation", "操作/权重幅度偏离", devs.amplitude, tipAmp);
+      renderDevSlider("threshold_deviation", "阈值/仓位偏离", devs.threshold, tipThr);
+      devBox.appendChild(devGrid);
+      devBox.appendChild(renderDeviationPreview(familyKey, activeStyle));
+      section.appendChild(devBox);
     }
 
     {
@@ -1230,34 +1312,16 @@
     const styleKey = target.dataset.styleKey;
     const field = target.dataset.field;
     if (!styleKey || !field) return false;
-    // 偏离度滑块：一键基于均衡计算
+    // 偏离度滑块：只改偏离值与当前展示，不写入防守/进攻单独参数。
     if (field === "amplitude_deviation" || field === "threshold_deviation") {
       const dev = clampNumber(target.value, 0, 100);
       const prev = getDeviations(styleKey);
       const ampDev = field === "amplitude_deviation" ? dev : prev.amplitude;
       const thrDev = field === "threshold_deviation" ? dev : prev.threshold;
       setGlobalDeviation(styleKey, ampDev, thrDev);
-      applyDeviations(familyKey, styleKey, ampDev, thrDev);
       const valEl = target.parentElement?.querySelector?.(".multiplier-value");
       if (valEl) valEl.textContent = `${dev}%`;
-      const isAgg = styleKey === "aggressive";
-      const fieldNames = field === "amplitude_deviation" ? AMPLITUDE_FIELDS : THRESHOLD_FIELDS;
-      const styleBase = getStyleBaseValues(familyKey, styleKey);
-      const previewItems = target.closest(".multiplier-section")?.querySelectorAll?.(".preview-row");
-      if (previewItems) {
-        let i = 0;
-        for (const f of fieldNames) {
-          const bVal = styleBase[f];
-          if (bVal === undefined) { if (previewItems[i]) i++; continue; }
-          if (previewItems[i]) {
-            const arrow = previewItems[i].querySelector(".preview-arrow");
-            const val = previewItems[i].querySelector(".preview-val");
-            if (arrow) arrow.textContent = `${bVal} →`;
-            if (val) val.textContent = String(Math.round(applyDeviation(bVal, dev, isAgg) * 10) / 10);
-          }
-          i++;
-        }
-      }
+      refreshDeviationPreviews(target.closest(".multiplier-section") || document);
       updateStrategySummary();
       return true;
     }
@@ -1274,6 +1338,7 @@
       const raw = target.type === "checkbox" ? target.checked : target.value;
       params.strategy_mix[styleKey][field] = normaliseParamValue(raw, fieldSpec, fallback);
     }
+    refreshDeviationPreviews(document);
     updateStrategySummary();
     return true;
   }
@@ -1580,6 +1645,13 @@
 
     try {
       const data = await postJSON("/api/config", toConfigPayload());
+      if (data.config && typeof data.config === "object") {
+        for (const key of Object.keys(globalConfigState)) {
+          if (data.config[key] !== undefined && data.config[key] !== null && data.config[key] !== "") {
+            globalConfigState[key] = numberOr(data.config[key], globalConfigState[key]);
+          }
+        }
+      }
       $("#current-position-text").textContent = data.current_pos_text || "--";
       updateStrategySummary();
       if (!quiet) showToast(data.message || "配置已保存");
@@ -2162,6 +2234,8 @@
       const target = event.target;
       // 全局配置字段（仓位边界、执行速度）
       if (target?.dataset?.globalField) {
+        globalConfigState[target.dataset.globalField] = numberOr(target.value, globalConfigState[target.dataset.globalField]);
+        refreshDeviationPreviews(document);
         saveConfigDebounced();
         updateStrategySummary();
         return;
@@ -2170,11 +2244,11 @@
       if (target?.dataset?.globalCoreBase) {
         const state = target.dataset.globalCoreBase;
         const familyKey = activeFamilyKeyFromForm();
-        const styleKey = activeStyleKeyFromForm();
         const params = getFamilyParams(familyKey);
-        if (!params.strategy_mix[styleKey]) params.strategy_mix[styleKey] = defaultStyleEntry(styleKey, styleKey, familyKey);
-        if (!params.strategy_mix[styleKey].core_base_pct) params.strategy_mix[styleKey].core_base_pct = {};
-        params.strategy_mix[styleKey].core_base_pct[state] = clampNumber(target.value, 0, 100);
+        if (!params.strategy_mix.balanced) params.strategy_mix.balanced = defaultStyleEntry("balanced", "balanced", familyKey);
+        if (!params.strategy_mix.balanced.core_base_pct) params.strategy_mix.balanced.core_base_pct = {};
+        params.strategy_mix.balanced.core_base_pct[state] = clampNumber(target.value, 0, 100);
+        refreshDeviationPreviews(document);
         saveConfigDebounced();
         updateStrategySummary();
         return;
@@ -2195,7 +2269,19 @@
 
     document.addEventListener("input", (event) => {
       const t = event.target;
-      if (t?.dataset?.globalField || t?.dataset?.globalCoreBase) {
+      if (t?.dataset?.globalCoreBase) {
+        const familyKey = activeFamilyKeyFromForm();
+        const params = getFamilyParams(familyKey);
+        if (!params.strategy_mix.balanced) params.strategy_mix.balanced = defaultStyleEntry("balanced", "balanced", familyKey);
+        if (!params.strategy_mix.balanced.core_base_pct) params.strategy_mix.balanced.core_base_pct = {};
+        params.strategy_mix.balanced.core_base_pct[t.dataset.globalCoreBase] = clampNumber(t.value, 0, 100);
+        refreshDeviationPreviews(document);
+        saveConfigDebounced();
+        return;
+      }
+      if (t?.dataset?.globalField) {
+        globalConfigState[t.dataset.globalField] = numberOr(t.value, globalConfigState[t.dataset.globalField]);
+        refreshDeviationPreviews(document);
         saveConfigDebounced();
         return;
       }
@@ -2207,35 +2293,10 @@
         const cur = getDeviations(styleKey);
         if (isAmp) setGlobalDeviation(styleKey, dev, cur.threshold);
         else setGlobalDeviation(styleKey, cur.amplitude, dev);
-        const updated = getDeviations(styleKey);
-        applyDeviations(activeFamilyKeyFromForm(), styleKey, updated.amplitude, updated.threshold);
-        // 更新当前滑块显示值
         const parentLabel = t.closest(".multiplier-field");
         const valEl = parentLabel?.querySelector?.(".multiplier-value");
         if (valEl) valEl.textContent = `${dev}%`;
-        // 更新预览
-        const section = t.closest(".multiplier-section");
-        const isAgg = styleKey === "aggressive";
-        const styleBase = getStyleBaseValues(activeFamilyKeyFromForm(), styleKey);
-        const ampDev = updated.amplitude;
-        const thrDev = updated.threshold;
-        const previewItems = section?.querySelectorAll?.(".preview-row");
-        if (previewItems) {
-          let i = 0;
-          const allPreviewFields = [...AMPLITUDE_FIELDS, ...THRESHOLD_FIELDS];
-          for (const f of allPreviewFields) {
-            const bVal = styleBase[f];
-            if (bVal === undefined) continue;
-            if (previewItems[i]) {
-              const fDev = AMPLITUDE_FIELDS.includes(f) ? ampDev : thrDev;
-              const arrow = previewItems[i].querySelector(".preview-arrow");
-              const val = previewItems[i].querySelector(".preview-val");
-              if (arrow) arrow.textContent = `${bVal} →`;
-              if (val) val.textContent = String(Math.round(applyDeviation(bVal, fDev, isAgg) * 10) / 10);
-            }
-            i++;
-          }
-        }
+        refreshDeviationPreviews(t.closest(".multiplier-section") || document);
         saveConfigDebounced();
         return;
       }

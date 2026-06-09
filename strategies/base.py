@@ -298,6 +298,116 @@ def normalise_strategy_lab_config(cfg: Dict[str, Any]) -> None:
     cfg["strategy_mix"] = normalized
 
 
+# 偏离参数只是一层“均衡基准 -> 当前风格展示/运行值”的计算。
+# 保存层只保留 balanced 基准；defensive/aggressive 由 deviation 临时计算。
+DEVIATION_AMPLITUDE_FIELDS = {"buy_step_pct", "sell_step_pct"}
+DEVIATION_THRESHOLD_FIELDS = {
+    "core_min_position_pct", "core_max_position_pct",
+    "strict_min_position_pct", "strict_max_position_pct",
+    "core_step_pct", "buy_step_limit_pct", "sell_step_limit_pct",
+    "bear_cap_pct", "below200_cap_pct", "risk_event_cap_pct",
+    "high_valuation_cap_sideways_pct", "high_valuation_cap_trend_pct",
+    "extreme_valuation_cap_sideways_pct", "extreme_valuation_cap_trend_pct",
+}
+
+
+def _deviation_group_for_field(name: str) -> Optional[str]:
+    """把策略 schema 字段归入偏离组。
+
+    - 幅度组：信号强度、因子权重、手动修正强度等。
+    - 阈值组：仓位上限、买卖上限、均线阈值、仓位边界等。
+    - 非百分数字段（如 risk_multiplier、checkbox、select）不套 0~100 偏离公式。
+    """
+    key = str(name or "")
+    low = key.lower()
+    if not low or low in {"risk_multiplier", "global_risk_multiplier"}:
+        return None
+    if key in DEVIATION_AMPLITUDE_FIELDS:
+        return "amplitude"
+    if key in DEVIATION_THRESHOLD_FIELDS:
+        return "threshold"
+    if not low.endswith("_pct"):
+        return None
+    if (
+        "cap" in low or "limit" in low or "threshold" in low or
+        "above" in low or "below" in low or "stop" in low or
+        "floor" in low or "min_" in low or "max_" in low or
+        "core_step" in low or "core_base" in low
+    ):
+        return "threshold"
+    return "amplitude"
+
+
+def _style_deviation(cfg: Optional[Dict[str, Any]], key: str) -> Tuple[float, float]:
+    cfg = cfg or {}
+    deviation = cfg.get("deviation") if isinstance(cfg.get("deviation"), dict) else {}
+    raw = deviation.get(key) if isinstance(deviation.get(key), dict) else {}
+    return (
+        clamp(_as_float(raw.get("amplitude"), 0.0), 0.0, 100.0),
+        clamp(_as_float(raw.get("threshold"), 0.0), 0.0, 100.0),
+    )
+
+
+def _apply_deviation_pct(base: float, dev_pct: float, key: str) -> float:
+    base = clamp(_as_float(base, 0.0), 0.0, 100.0)
+    if key == "balanced" or dev_pct <= 0:
+        return round(base, 1)
+    if key == "aggressive":
+        return round(base + (100.0 - base) * dev_pct / 100.0, 1)
+    return round(base * (1.0 - dev_pct / 100.0), 1)
+
+
+def _balanced_entry_value(balanced: Dict[str, Any], field: Dict[str, Any], cfg: Optional[Dict[str, Any]]) -> Any:
+    preset = _family_style_preset(cfg, "balanced")
+    default = _field_default_value(field, preset, 0.0)
+    return _normalise_style_field_value(balanced.get(str(field.get("name") or "")), field, default)
+
+
+def _effective_entry_for_style(key: str, mix: Dict[str, Any], cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """返回当前风格的临时有效参数。
+
+    非均衡风格不再直接使用/覆盖自己的单独配置；执行时从均衡基准读取，
+    再叠加 deviation。这样调偏离值只改变展示和本次运行有效值；
+    保存层只保留 balanced 基准与 deviation。
+    """
+    raw_entry = mix.get(key) if isinstance(mix.get(key), dict) else _strategy_default_entry(key, cfg, key)
+    if key == "balanced":
+        return dict(raw_entry)
+
+    balanced = mix.get("balanced") if isinstance(mix.get("balanced"), dict) else _strategy_default_entry("balanced", cfg, "balanced")
+    amp_dev, thr_dev = _style_deviation(cfg, key)
+    effective = dict(raw_entry)
+
+    # 操作幅度：优先使用全局均衡基准；缺失再回退到均衡 entry / 均衡 preset。
+    balanced_preset = _family_style_preset(cfg, "balanced")
+    base_buy = _as_float((cfg or {}).get("global_buy_step_pct"), _as_float(balanced.get("buy_step_pct"), float(balanced_preset.get("buy_step", 0.26)) * 100.0))
+    base_sell = _as_float((cfg or {}).get("global_sell_step_pct"), _as_float(balanced.get("sell_step_pct"), float(balanced_preset.get("sell_step", 0.48)) * 100.0))
+    effective["buy_step_pct"] = _apply_deviation_pct(base_buy, amp_dev, key)
+    effective["sell_step_pct"] = _apply_deviation_pct(base_sell, amp_dev, key)
+    effective["risk_multiplier"] = clamp(_as_float((cfg or {}).get("global_risk_multiplier"), _as_float(balanced.get("risk_multiplier"), 1.0)), 0.1, 5.0)
+
+    # 策略 Python schema 中声明的参数：以均衡为源；阈值类再叠加 threshold deviation。
+    for field in _iter_style_param_fields(_style_param_schema(cfg)):
+        name = str(field.get("name") or "")
+        if not name or name in {"core_base_pct", "buy_step_pct", "sell_step_pct", "risk_multiplier"}:
+            continue
+        base_value = _balanced_entry_value(balanced, field, cfg)
+        group = _deviation_group_for_field(name)
+        if group == "amplitude":
+            effective[name] = _normalise_style_field_value(_apply_deviation_pct(float(base_value), amp_dev, key), field, base_value)
+        elif group == "threshold":
+            effective[name] = _normalise_style_field_value(_apply_deviation_pct(float(base_value), thr_dev, key), field, base_value)
+        else:
+            effective[name] = base_value
+
+    balanced_core = balanced.get("core_base_pct") if isinstance(balanced.get("core_base_pct"), dict) else _strategy_default_entry("balanced", cfg, "balanced").get("core_base_pct", {})
+    effective["core_base_pct"] = {
+        state: _apply_deviation_pct(_as_float(balanced_core.get(state), 50.0), thr_dev, key)
+        for state in STRATEGY_MARKET_STATES
+    }
+    return effective
+
+
 def _entry_to_strategy(key: str, entry: Dict[str, Any], cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     preset = _family_style_preset(cfg, key)
     preset["key"] = key
@@ -328,12 +438,12 @@ def get_strategy_mix_entries(cfg: Dict[str, Any]) -> List[Tuple[str, Dict[str, A
         weight = clamp(_as_float(raw_entry.get("weight_pct"), 0.0), 0.0, 100.0)
         if weight <= 0:
             continue
-        entries.append((key, _entry_to_strategy(key, raw_entry, cfg), weight))
+        entries.append((key, _entry_to_strategy(key, _effective_entry_for_style(key, mix, cfg), cfg), weight))
         total += weight
     if total <= 0:
         key = normalise_strategy_key(cfg.get("strategy"))
         raw_entry = mix.get(key) or _strategy_default_entry(key, cfg, key)
-        return [(key, _entry_to_strategy(key, raw_entry, cfg), 1.0)]
+        return [(key, _entry_to_strategy(key, _effective_entry_for_style(key, mix, cfg), cfg), 1.0)]
     return [(key, strategy, weight / total) for key, strategy, weight in entries]
 
 
@@ -342,7 +452,7 @@ def get_strategy(cfg: Dict[str, Any]) -> Dict[str, Any]:
     normalise_strategy_lab_config(cfg)
     key = normalise_strategy_key(cfg.get("strategy", "balanced"))
     entry = cfg.get("strategy_mix", {}).get(key) or _strategy_default_entry(key, cfg, key)
-    return _entry_to_strategy(key, entry, cfg)
+    return _entry_to_strategy(key, _effective_entry_for_style(key, cfg.get("strategy_mix", {}) or {}, cfg), cfg)
 
 def style_mix_summary(cfg: Dict[str, Any]) -> str:
     strategy = get_strategy(cfg)
