@@ -18,7 +18,7 @@
   <header class="topbar">
     <div class="brand">
       <h1>趋势风控仓位助手</h1>
-      <p>计划资金=100%上限；自动拉取行情，PE/ROE可自动填充也可手动覆盖</p>
+      <p>计划资金=100%上限；自动拉取行情、估值与净值因子</p>
     </div>
     <div id="strategy-family-tabs" class="top-strategy-tabs" data-current-family="{{ cfg.strategy_family }}" aria-label="总体策略切换"></div>
     <div class="top-actions">
@@ -64,6 +64,7 @@
         <input type="hidden" name="symbol_name" value="{{ cfg.symbol_name }}">
         <input type="hidden" name="market" value="{{ cfg.market }}">
         <input type="hidden" name="asset_kind" value="{{ cfg.asset_kind }}">
+        <input type="hidden" name="strategy_family" value="{{ cfg.strategy_family }}">
         <input type="hidden" name="strategy_mode" value="single">
 
         <div id="settings-modal" class="settings-modal" hidden aria-hidden="true">
@@ -299,8 +300,8 @@
     <form id="signal-form">
       <section class="card signal-card neutral" data-section="auto-data">
         <div class="card-title">
-          <h2>① 自动数据 / 手动覆盖</h2>
-          <span class="pill neutral">可改</span>
+          <h2>① 自动数据</h2>
+          <span class="pill neutral">自动填充</span>
         </div>
         <div class="auto-actions">
           <button id="fetch-data-btn" class="btn mini" type="button">拉取所选标的数据</button>
@@ -315,145 +316,9 @@
           </div>
         </div>
 
-        <div class="data-grid auto-manual-core-grid">
-          <label class="field" data-tip="自动获取失败时可手填。PE百分位越高越贵，计算使用连续曲线，不用硬分段。">
-            <span>历史 PE 百分位 %</span>
-            <input type="number" step="0.1" min="0" max="100" name="pe_percentile" placeholder="例如 85">
-          </label>
-          <label class="field" data-tip="ROE是质量修正，不是买卖信号。12%左右中性，18%以上较强，8%以下偏弱。">
-            <span>ROE %</span>
-            <input type="number" step="0.1" name="roe_pct" placeholder="例如 22.5">
-          </label>
-          <label class="field" data-tip="可选。金融、周期、指数有时PB比PE更有参考价值。">
-            <span>历史 PB 百分位 %</span>
-            <input type="number" step="0.1" min="0" max="100" name="pb_percentile" placeholder="可空">
-          </label>
-          <label class="field" data-tip="买入价到止损价的百分比距离。例如买入100、止损94，就填6。系统会用 单笔风险预算 ÷ 止损距离 来限制仓位。">
-            <span>买入价到止损价距离 %</span>
-            <input type="number" step="0.1" min="0" max="80" name="stop_loss_pct" value="6">
-          </label>
-        </div>
       </section>
 
-      <div id="strategy-specific-inputs" class="strategy-specific-inputs" hidden></div>
-
-      <section class="card signal-card neutral" data-section="market-context">
-        <div class="card-title">
-          <h2>② 大趋势环境</h2>
-          <span class="pill neutral">先判断能不能做</span>
-        </div>
-        <div class="choice-grid mixed-choice market-grid">
-          <label data-impact="wait" data-choice-group="market_state" data-tip="价格反复穿越均线，假突破较多，仓位要打折。">
-            <input type="checkbox" name="market_state" value="sideways" checked> 震荡/无趋势
-          </label>
-          <label data-impact="sell-strong" data-choice-group="market_state" data-tip="价格在200日线下方，且200日线向下；原则上不新增买入。">
-            <input type="checkbox" name="market_state" value="bear"> 200日线下方且向下
-          </label>
-          <label data-impact="wait" data-choice-group="market_state" data-tip="价格仍在200日线下方，但已开始反弹；只能小仓验证。">
-            <input type="checkbox" name="market_state" value="below_200"> 未站上200日线
-          </label>
-          <label data-impact="buy" data-choice-group="market_state" data-tip="价格在200日线上方，50日线走平或向上，可以开始做趋势仓。">
-            <input type="checkbox" name="market_state" value="above_200"> 站上200日线
-          </label>
-          <label data-impact="buy-strong" data-choice-group="market_state" data-tip="价格 > 50日线 > 200日线，且均线向上，是最适合加仓的环境。">
-            <input type="checkbox" name="market_state" value="strong_bull"> 50日线 > 200日线强多头
-          </label>
-          <label data-impact="sell" data-tip="大盘、同类ETF或板块同步跌破关键均线时，单个标的信号要降权。">
-            <input type="checkbox" name="market_risk"> 大盘/板块同步走弱
-          </label>
-        </div>
-      </section>
-
-      <section class="card signal-card event-zone" data-section="entry-setup">
-        <div class="card-title">
-          <h2>③ 入场信号</h2>
-          <span class="pill buy">只保留三类</span>
-        </div>
-        <div class="choice-grid">
-          <label data-impact="wait" data-choice-group="entry_state" data-tip="没有站回、突破、回踩不破或持续新高等明确买点。">
-            <input type="checkbox" name="entry_state" value="none" checked> 暂无买点
-          </label>
-          <label data-impact="buy" data-choice-group="entry_state" data-tip="下跌后站回50日线，但未完全确认，只能试仓。">
-            <input type="checkbox" name="entry_state" value="reversal_50"> 站回50日线反转试仓
-          </label>
-          <label data-impact="buy" data-choice-group="entry_state" data-tip="多头环境中突破平台/前高，最好用收盘价确认，而不是盘中刺破。">
-            <input type="checkbox" name="entry_state" value="breakout"> 平台/前高突破
-          </label>
-          <label data-impact="buy-strong" data-choice-group="entry_state" data-tip="多头趋势中回踩20/50日线不破，通常比追高更稳。">
-            <input type="checkbox" name="entry_state" value="pullback_hold"> 回踩20/50日线不破
-          </label>
-          <label data-impact="buy-strong" data-choice-group="entry_state" data-tip="强多头中持续创新高，适合已有盈利后加仓，不适合亏损加仓。">
-            <input type="checkbox" name="entry_state" value="continuation_high"> 强趋势持续创新高
-          </label>
-        </div>
-      </section>
-
-      <section class="card signal-card pattern-zone" data-section="volume-confirm">
-        <div class="card-title">
-          <h2>④ 量价辅助确认</h2>
-          <span class="pill wait">只加减权重</span>
-        </div>
-        <div class="check-grid volume-confirm-grid">
-          <label data-impact="wait" data-tip="没有明显放量突破、回踩缩量、冲高回落、收盘未站稳或远离均线。">
-            <input type="checkbox" name="volume_state" value="none" checked> 暂无明显量价信号
-          </label>
-          <label data-impact="buy" data-tip="突破时放量是加分项，但不能替代趋势和止损。">
-            <input type="checkbox" name="volume_confirm"> 突破时放量
-          </label>
-          <label data-impact="buy" data-tip="回踩缩量说明抛压较小，是辅助确认。">
-            <input type="checkbox" name="pullback_volume_dry"> 回踩缩量
-          </label>
-          <label data-impact="sell" data-tip="长上影/冲高回落代表上方抛压，买入仓位自动降低。">
-            <input type="checkbox" name="upper_shadow"> 放量长上影 / 冲高回落
-          </label>
-          <label data-impact="sell" data-tip="突破后没有收在关键位上方，不视为有效突破。">
-            <input type="checkbox" name="failed_close"> 收盘未站稳关键位
-          </label>
-          <label data-impact="sell" data-tip="价格明显远离20日/50日均线时，追高风险收益比变差。">
-            <input type="checkbox" name="far_from_ma"> 远离均线 / 涨速过快
-          </label>
-        </div>
-      </section>
-
-      <section class="card signal-card context-zone" data-section="exit-setup">
-        <div class="card-title">
-          <h2>⑤ 减仓 / 清仓信号</h2>
-          <span class="pill danger">风险优先</span>
-        </div>
-        <div class="choice-grid">
-          <label data-impact="wait" data-choice-group="exit_state" data-tip="没有跌破20/50/200日线、突破失败或触发初始止损。">
-            <input type="checkbox" name="exit_state" value="none" checked> 暂无破位
-          </label>
-          <label data-impact="sell" data-choice-group="exit_state" data-tip="短线趋势弱化，适合先减一部分或收紧止损。">
-            <input type="checkbox" name="exit_state" value="below_20"> 跌破20日线
-          </label>
-          <label data-impact="sell" data-choice-group="exit_state" data-tip="突破失败是常见亏损来源，优先降风险。">
-            <input type="checkbox" name="exit_state" value="failed_breakout"> 突破失败
-          </label>
-          <label data-impact="sell-strong" data-choice-group="exit_state" data-tip="50日线失守代表中期趋势破坏，至少大减仓。">
-            <input type="checkbox" name="exit_state" value="below_50"> 跌破50日线
-          </label>
-          <label data-impact="sell-strong" data-choice-group="exit_state" data-tip="200日线失守代表大趋势破坏，交易仓应退出。">
-            <input type="checkbox" name="exit_state" value="below_200"> 跌破200日线
-          </label>
-          <label data-impact="sell-strong" data-choice-group="exit_state" data-tip="初始止损触发后不要犹豫，不补亏损仓。">
-            <input type="checkbox" name="exit_state" value="hit_stop"> 触发初始止损
-          </label>
-        </div>
-      </section>
-
-      <section class="card signal-card neutral" data-section="profit-stage">
-        <div class="card-title">
-          <h2>⑥ 盈利阶段</h2>
-          <span class="pill neutral">止盈辅助</span>
-        </div>
-        <div class="choice-grid compact-choice">
-          <label data-impact="wait" data-choice-group="profit_state" data-tip="未达到 1R 盈利，或没有填写当前涨跌幅。"><input type="checkbox" name="profit_state" value="none" checked> 无明显盈利</label>
-          <label data-impact="buy" data-choice-group="profit_state"><input type="checkbox" name="profit_state" value="profit_1r"> 盈利≥1R</label>
-          <label data-impact="sell" data-choice-group="profit_state"><input type="checkbox" name="profit_state" value="profit_2r"> 盈利≥2R</label>
-          <label data-impact="sell" data-choice-group="profit_state"><input type="checkbox" name="profit_state" value="profit_3r"> 盈利≥3R</label>
-        </div>
-      </section>
+      <div id="strategy-specific-inputs" class="strategy-specific-inputs"></div>
     </form>
   </main>
 
@@ -775,6 +640,87 @@
 @media (max-width: 1100px) { .auto-data-key-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 700px) { .auto-actions, #auto-data-modal .auto-data-modal-tools { flex-direction: column; align-items: stretch; } .auto-data-key-metrics { grid-template-columns: 1fr; } #auto-data-modal { padding: 8px; } #auto-data-modal .auto-data-dialog { width: calc(100vw - 16px); max-height: calc(100dvh - 16px); } #auto-data-modal .auto-data-table { min-width: 760px; } }
 
+
+ .strategy-specific-inputs { display: grid; gap: 10px; }
+.strategy-dynamic-desc { margin: -2px 0 10px; color: var(--muted); font-size: 13px; line-height: 1.55; }
+.strategy-dynamic-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+  align-items: stretch;
+}
+.strategy-dynamic-field { grid-column: 1 / -1; }
+/* 单个布尔信号作为独立小卡片进入外层五列表格；成组选项仍占满整行。 */
+.strategy-dynamic-field.strategy-dynamic-bool { grid-column: auto; }
+.strategy-dynamic-label { margin-bottom: 8px; font-size: 12px; color: var(--muted); font-weight: 800; }
+
+/* 动态策略选项统一紧凑卡片：单选圆点，多选方框；桌面端固定一行最多 5 个。 */
+.strategy-dynamic-choice .dynamic-choice-grid.dynamic-choice-grid {
+  display: grid !important;
+  grid-template-columns: repeat(5, minmax(0, 1fr)) !important;
+  gap: 8px !important;
+  align-items: stretch;
+}
+.strategy-dynamic-bool .dynamic-choice-grid.dynamic-choice-grid { grid-template-columns: 1fr !important; }
+.strategy-dynamic-choice .dynamic-choice-grid > label {
+  display: flex !important;
+  align-items: center;
+  gap: 7px;
+  min-height: 46px !important;
+  padding: 8px 9px !important;
+  border: 1px solid var(--line) !important;
+  border-radius: 13px !important;
+  background: rgba(255,255,255,.62) !important;
+  color: #3f3025;
+  font-size: 13px;
+  font-weight: 900;
+  line-height: 1.25;
+  cursor: pointer;
+  overflow: hidden;
+  transition: transform .12s ease, border-color .12s ease, background .12s ease, box-shadow .12s ease, opacity .12s ease;
+}
+.strategy-dynamic-choice .dynamic-choice-grid > label:hover { transform: translateY(-1px); background: #fffdf9 !important; }
+.strategy-dynamic-choice .dynamic-choice-grid > label:has(input:checked) {
+  border-color: var(--accent) !important;
+  background: #f3e4d0 !important;
+  box-shadow: 0 0 0 3px rgba(188, 142, 88, .10);
+}
+.strategy-dynamic-choice .dynamic-choice-grid > label:has(input:not(:checked)) { opacity: .88; }
+.strategy-dynamic-choice .dynamic-choice-grid > label span { min-width: 0; overflow-wrap: anywhere; }
+.strategy-dynamic-choice .dynamic-choice-grid input[type="radio"],
+.strategy-dynamic-choice .dynamic-choice-grid input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  border: 2px solid #cdbba4;
+  background: #fffdf8;
+  box-shadow: inset 0 0 0 3px #fffdf8;
+}
+.strategy-dynamic-choice .dynamic-choice-grid input[type="radio"] { border-radius: 999px; }
+.strategy-dynamic-choice .dynamic-choice-grid input[type="checkbox"] { border-radius: 4px; }
+.strategy-dynamic-choice .dynamic-choice-grid input[type="radio"]:checked,
+.strategy-dynamic-choice .dynamic-choice-grid input[type="checkbox"]:checked {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+@media (max-width: 1200px) {
+  .strategy-dynamic-grid,
+  .strategy-dynamic-choice .dynamic-choice-grid.dynamic-choice-grid { grid-template-columns: repeat(4, minmax(0, 1fr)) !important; }
+}
+@media (max-width: 980px) {
+  .strategy-dynamic-grid,
+  .strategy-dynamic-choice .dynamic-choice-grid.dynamic-choice-grid { grid-template-columns: repeat(3, minmax(0, 1fr)) !important; }
+}
+@media (max-width: 700px) {
+  .strategy-dynamic-grid,
+  .strategy-dynamic-choice .dynamic-choice-grid.dynamic-choice-grid { grid-template-columns: 1fr !important; }
+}
+
+.inline-check { display: inline-flex; align-items: center; gap: 6px; color: #3f3025; font-weight: 800; }
+
 </style>
 
 <script>
@@ -825,11 +771,9 @@
     ["boll_percent_b", "BOLL%B"], ["return_60d", "60日收益"], ["distance_ma200_pct", "距MA200"]
   ];
   const FIELD_MAP = new Map(AUTO_DATA_FIELDS.map(([group, key, label, tip]) => [key, {group, key, label, tip}]));
-  // 弹窗默认只展示“实际获取/实际计算到值”的字段，避免出现一堆空表单。
-  // 少数核心手动覆盖项即使为空也保留，方便用户直接补录。
-  const AUTO_DATA_KEEP_EMPTY_KEYS = new Set([
-    "pe_percentile", "pb_percentile", "roe_pct", "stop_loss_pct", "current_profit_pct"
-  ]);
+  // 弹窗默认只展示“实际获取/实际计算到值”的字段，避免出现一堆空行。
+  // 首页不再提供 PE/PB/ROE/止损距离的可编辑输入，因此空字段不保留。
+  const AUTO_DATA_KEEP_EMPTY_KEYS = new Set([]);
   let lastIndicators = {};
 
   const $ = (sel, root = document) => root.querySelector(sel);
@@ -954,8 +898,51 @@
   }
   function syncInputValue(key, value, {overwriteUser = true} = {}) {
     const targetValue = isBlank(value) ? "" : String(value);
-    const existing = externalInputFor(key);
-    const ext = existing || ensureAutoHiddenInput(key);
+    const visibleItems = $$(`#signal-form [name="${cssEscape(key)}"]`).filter(el => el.dataset.autoHidden !== "1");
+    if (visibleItems.length) {
+      const first = visibleItems[0];
+      const isStrategyChoice = !!first.closest("#strategy-specific-inputs");
+      if ((first.type === "radio" || first.type === "checkbox") && isStrategyChoice) {
+        // 自动数据不点亮策略选项；用户没点时使用隐藏字段，用户点了则以可视选项优先。
+        const ext = ensureAutoHiddenInput(key);
+        if (ext && (overwriteUser || !ext.value)) {
+          ext.value = targetValue;
+          ext.dispatchEvent(new Event("input", {bubbles: true}));
+          ext.dispatchEvent(new Event("change", {bubbles: true}));
+        }
+        return;
+      }
+      if (first.type === "radio") {
+        let changed = false;
+        visibleItems.forEach(el => {
+          const shouldCheck = String(el.value) === targetValue;
+          if (el.checked !== shouldCheck) changed = true;
+          el.checked = shouldCheck;
+        });
+        if (changed) {
+          first.dispatchEvent(new Event("input", {bubbles: true}));
+          first.dispatchEvent(new Event("change", {bubbles: true}));
+        }
+        return;
+      }
+      if (first.type === "checkbox") {
+        const v = targetValue.toLowerCase();
+        const checked = ["1", "true", "on", "yes", "是"].includes(v) || value === true;
+        if (overwriteUser || !first.checked) {
+          first.checked = checked;
+          first.dispatchEvent(new Event("input", {bubbles: true}));
+          first.dispatchEvent(new Event("change", {bubbles: true}));
+        }
+        return;
+      }
+      if (overwriteUser || !first.value) {
+        first.value = targetValue;
+        first.dispatchEvent(new Event("input", {bubbles: true}));
+        first.dispatchEvent(new Event("change", {bubbles: true}));
+      }
+      return;
+    }
+    const ext = ensureAutoHiddenInput(key);
     if (ext && (overwriteUser || !ext.value)) {
       ext.value = targetValue;
       ext.dispatchEvent(new Event("input", {bubbles: true}));
@@ -1013,15 +1000,298 @@
       form.dispatchEvent(new Event("change", {bubbles: true}));
     }
   }
+
+  const STRATEGY_FAMILY_SELECTOR = "[data-strategy-family],[data-family],[data-family-key],[data-strategy-family-key],[data-key],[data-value]";
+
+  function allStrategyFamilies() {
+    return window.STRATEGY_FAMILIES || {};
+  }
+  function validStrategyFamilyKey(key) {
+    const families = allStrategyFamilies();
+    const value = String(key || "").trim();
+    return value && families[value] ? value : "";
+  }
+  function keyFromStrategyElement(el) {
+    if (!el || !el.dataset) return "";
+    return el.dataset.strategyFamily || el.dataset.family || el.dataset.familyKey || el.dataset.strategyFamilyKey || el.dataset.value || el.dataset.key || "";
+  }
+  function resolveActiveStrategyFamily(fallback = "") {
+    const families = allStrategyFamilies();
+    const explicit = validStrategyFamilyKey(fallback);
+    if (explicit) return explicit;
+
+    const tabs = $("#strategy-family-tabs");
+    const active = tabs?.querySelector(".active, .selected, [aria-selected='true']");
+    let key = keyFromStrategyElement(active) || keyFromStrategyElement(active?.closest(STRATEGY_FAMILY_SELECTOR));
+    const hidden = $('#config-form [name="strategy_family"]');
+    key = key || hidden?.value || tabs?.dataset?.currentFamily || window.INITIAL_CONFIG?.strategy_family || "";
+    if (key && families[key]) return key;
+    const first = Object.keys(families)[0] || "";
+    return first;
+  }
+
+  function ensureStrategyFamilyHiddenInput() {
+    const form = $("#config-form");
+    if (!form) return null;
+    let hidden = $('#config-form [name="strategy_family"]');
+    if (!hidden) {
+      hidden = document.createElement("input");
+      hidden.type = "hidden";
+      hidden.name = "strategy_family";
+      form.appendChild(hidden);
+    }
+    return hidden;
+  }
+
+  function setActiveStrategyFamilyKey(key) {
+    key = validStrategyFamilyKey(key);
+    if (!key) return "";
+    const tabs = $("#strategy-family-tabs");
+    if (tabs) {
+      if (tabs.dataset.currentFamily !== key) tabs.dataset.currentFamily = key;
+      $$(STRATEGY_FAMILY_SELECTOR, tabs).forEach(el => {
+        const itemKey = keyFromStrategyElement(el);
+        if (!itemKey) return;
+        const matched = itemKey === key;
+        el.classList.toggle("active", matched);
+        if (el.hasAttribute("aria-selected")) el.setAttribute("aria-selected", matched ? "true" : "false");
+      });
+    }
+    const hidden = ensureStrategyFamilyHiddenInput();
+    if (hidden) hidden.value = key;
+    if (window.INITIAL_CONFIG && typeof window.INITIAL_CONFIG === "object") window.INITIAL_CONFIG.strategy_family = key;
+    return key;
+  }
+
+  function strategyFamilyKeyFromTarget(target) {
+    const el = target?.closest ? target.closest(`#strategy-family-tabs ${STRATEGY_FAMILY_SELECTOR}`) : null;
+    return validStrategyFamilyKey(keyFromStrategyElement(el));
+  }
+  function fieldNamesFromSchema(schema = []) {
+    const names = new Set();
+    for (const section of schema || []) {
+      for (const field of section.fields || []) {
+        if (field && field.name) names.add(String(field.name));
+      }
+    }
+    return names;
+  }
+  function cleanOptionLabel(label) {
+    let text = String(label || "").trim();
+    // 视觉层统一清理策略选项前缀：不再显示“自动 / +1 / -1 / 0”这类编码提示。
+    text = text.replace(/^自动\s*[:：-]?\s*/i, "");
+    text = text.replace(/^[+＋]?1\s*[:：-]?\s*/, "");
+    text = text.replace(/^[-－]1\s*[:：-]?\s*/, "");
+    text = text.replace(/^0\s*[:：-]?\s*/, "");
+    return text.trim();
+  }
+  function isNoSignalOption(value, label) {
+    const v = String(value ?? "").trim().toLowerCase();
+    const t = String(label ?? "").trim();
+    return (
+      v === "" ||
+      v === "auto" ||
+      /^(无信号|无影响信号|无影响|不手动选择|不提供额外)/.test(t)
+    );
+  }
+  function normaliseOptions(options = []) {
+    return (options || []).map(item => {
+      if (Array.isArray(item)) {
+        const rawLabel = String(item[1] ?? item[0] ?? "");
+        return {value: String(item[0] ?? ""), label: cleanOptionLabel(rawLabel), rawLabel, impact: String(item[2] || "neutral"), tip: String(item[3] || "")};
+      }
+      if (item && typeof item === "object") {
+        const rawLabel = String(item.label ?? item.value ?? "");
+        return {value: String(item.value ?? ""), label: cleanOptionLabel(rawLabel), rawLabel, impact: String(item.impact || item.tone || "neutral"), tip: String(item.tip || "")};
+      }
+      const rawLabel = String(item ?? "");
+      return {value: rawLabel, label: cleanOptionLabel(rawLabel), rawLabel, impact: "neutral", tip: ""};
+    }).filter(item => !isNoSignalOption(item.value, item.rawLabel) && item.label !== "");
+  }
+  function renderChoiceCardField(field = {}, inputType = "radio") {
+    const name = String(field.name || "");
+    if (!name) return "";
+    const label = String(field.label || name);
+    const tip = String(field.tip || "");
+    // 策略选项不再默认选中。自动数据仍写入隐藏字段参与计算；可视按钮只表示用户手动选择。
+    let options = normaliseOptions(field.options || []);
+    const hasExplicitOptions = options.length > 0;
+    if (inputType === "checkbox" && !options.length) {
+      options = [{value: "on", label: cleanOptionLabel(label), impact: "neutral", tip}];
+    }
+    const showGroupLabel = inputType === "radio" || (inputType === "checkbox" && hasExplicitOptions);
+    const boolClass = inputType === "checkbox" && !hasExplicitOptions ? " strategy-dynamic-bool" : "";
+    return `
+      <div class="strategy-dynamic-field strategy-dynamic-choice ${inputType === "checkbox" ? "strategy-dynamic-multi" : "strategy-dynamic-single"}${boolClass}" data-tip="${escapeHtml(tip)}">
+        ${showGroupLabel ? `<div class="strategy-dynamic-label">${escapeHtml(label)}</div>` : ""}
+        <div class="choice-grid compact-choice dynamic-choice-grid">
+          ${options.map(opt => {
+            return `
+              <label data-impact="${escapeHtml(opt.impact)}" ${opt.tip ? `data-tip="${escapeHtml(opt.tip)}"` : ""}>
+                <input type="${inputType}" name="${escapeHtml(name)}" value="${escapeHtml(opt.value)}">
+                <span>${escapeHtml(opt.label)}</span>
+              </label>`;
+          }).join("")}
+        </div>
+      </div>`;
+  }
+
+  function renderStrategyField(field = {}) {
+    const name = String(field.name || "");
+    if (!name) return "";
+    const type = String(field.type || "select").toLowerCase();
+    const label = String(field.label || name);
+    const tip = String(field.tip || "");
+    const defaultValue = field.default === undefined || field.default === null ? "" : String(field.default);
+    if (["choice", "choice_group", "radio", "select"].includes(type)) {
+      return renderChoiceCardField(field, "radio");
+    }
+    if (["checkbox", "bool", "boolean"].includes(type)) {
+      return renderChoiceCardField(field, "checkbox");
+    }
+    if (["multi_choice", "checkbox_group", "multi", "multiselect"].includes(type)) {
+      return renderChoiceCardField(field, "checkbox");
+    }
+    const inputType = type === "number" ? "number" : "text";
+    const step = field.step || (inputType === "number" ? "0.01" : "");
+    const min = field.min !== undefined ? ` min="${escapeHtml(field.min)}"` : "";
+    const max = field.max !== undefined ? ` max="${escapeHtml(field.max)}"` : "";
+    return `
+      <label class="field" data-tip="${escapeHtml(tip)}">
+        <span>${escapeHtml(label)}</span>
+        <input type="${inputType}" name="${escapeHtml(name)}" value="${escapeHtml(defaultValue)}"${step ? ` step="${escapeHtml(step)}"` : ""}${min}${max}>
+      </label>`;
+  }
+  function applyStrategyFieldValues(schema = [], preserved = {}) {
+    for (const section of schema || []) {
+      for (const field of section.fields || []) {
+        const name = String(field.name || "");
+        if (!name) continue;
+        const explicit = preserved[name];
+        const autoValue = lastIndicators && Object.prototype.hasOwnProperty.call(lastIndicators, name) ? lastIndicators[name] : undefined;
+        const value = !isBlank(explicit) ? explicit : (!isBlank(autoValue) ? autoValue : field.default);
+        if (isBlank(value)) continue;
+        const items = $$(`#signal-form [name="${cssEscape(name)}"]`).filter(el => el.dataset.autoHidden !== "1");
+        if (!items.length) continue;
+        if (items[0].type === "radio" || items[0].type === "checkbox") {
+          // 保持策略信号初始未选择；自动/默认值只通过隐藏字段参与计算，不点亮可视选项。
+          continue;
+        } else {
+          items[0].value = String(value);
+        }
+      }
+    }
+  }
+  function renderStrategySpecificInputs(familyKey = "") {
+    const host = $("#strategy-specific-inputs");
+    if (!host) return;
+    const families = allStrategyFamilies();
+    const key = validStrategyFamilyKey(familyKey) || resolveActiveStrategyFamily(familyKey);
+    if (key) setActiveStrategyFamilyKey(key);
+    const family = families[key] || {};
+    const schema = Array.isArray(family.input_schema) ? family.input_schema : [];
+    const names = fieldNamesFromSchema(schema);
+    const preserved = {};
+    names.forEach(name => {
+      const hidden = $(`#signal-form input[type="hidden"][data-auto-hidden="1"][name="${cssEscape(name)}"]`);
+      if (hidden) {
+        preserved[name] = hidden.value;
+        hidden.remove();
+      }
+    });
+    if (!schema.length) {
+      host.hidden = true;
+      host.innerHTML = "";
+      return;
+    }
+    host.hidden = false;
+    host.dataset.strategyFamily = key;
+    host.innerHTML = schema.map((section, index) => {
+      const tone = section.tone || "neutral";
+      const title = section.title || `策略输入 ${index + 1}`;
+      const pill = section.pill || family.short_name || family.name || "策略";
+      const desc = section.desc ? `<p class="strategy-dynamic-desc">${escapeHtml(section.desc)}</p>` : "";
+      const fields = (section.fields || []).map(renderStrategyField).join("");
+      return `
+        <section class="card signal-card ${escapeHtml(tone)}" data-section="strategy-dynamic" data-strategy-input-section="${index}">
+          <div class="card-title">
+            <h2>${escapeHtml(title)}</h2>
+            <span class="pill neutral">${escapeHtml(pill)}</span>
+          </div>
+          ${desc}
+          <div class="data-grid strategy-dynamic-grid">${fields}</div>
+        </section>`;
+    }).join("");
+    applyStrategyFieldValues(schema, preserved);
+    notifyFormChanged();
+  }
+  window.__renderStrategySpecificInputs = renderStrategySpecificInputs;
+
+  function handleToggleableRadioPointer(event) {
+    const label = event.target?.closest ? event.target.closest(".strategy-dynamic-single .dynamic-choice-grid label") : null;
+    if (!label) return;
+    const radio = label.querySelector('input[type="radio"]');
+    if (!radio) return;
+    radio.dataset.wasCheckedBeforeClick = radio.checked ? "1" : "0";
+  }
+
+  function handleToggleableRadioClick(event) {
+    const label = event.target?.closest ? event.target.closest(".strategy-dynamic-single .dynamic-choice-grid label") : null;
+    if (!label) return;
+    const radio = label.querySelector('input[type="radio"]');
+    if (!radio) return;
+    if (radio.dataset.wasCheckedBeforeClick === "1") {
+      event.preventDefault();
+      event.stopPropagation();
+      radio.checked = false;
+      radio.dataset.wasCheckedBeforeClick = "0";
+      radio.dispatchEvent(new Event("change", {bubbles: true}));
+      notifyFormChanged();
+    }
+  }
+
   function initAutoDataModal() {
     buildModalFields({});
     renderSummary({});
+    renderStrategySpecificInputs(resolveActiveStrategyFamily());
+    const tabs = $("#strategy-family-tabs");
+    if (tabs && window.MutationObserver) {
+      new MutationObserver(() => {
+        const key = validStrategyFamilyKey(tabs.dataset.currentFamily) || resolveActiveStrategyFamily();
+        renderStrategySpecificInputs(key);
+      }).observe(tabs, {childList: true, subtree: true, attributes: true, attributeFilter: ["class", "data-current-family", "aria-selected"]});
+    }
+    document.addEventListener("pointerdown", handleToggleableRadioPointer, true);
     document.addEventListener("click", event => {
+      handleToggleableRadioClick(event);
+      if (event.defaultPrevented) return;
       if (event.target.closest("#open-auto-data-modal-btn")) openModal();
       if (event.target.closest("[data-close-auto-data]")) closeModal();
+      if (event.target.closest("#strategy-family-tabs")) {
+        const clickedKey = strategyFamilyKeyFromTarget(event.target);
+        if (clickedKey) {
+          setActiveStrategyFamilyKey(clickedKey);
+          renderStrategySpecificInputs(clickedKey);
+          [40, 120, 300, 600].forEach(delay => setTimeout(() => renderStrategySpecificInputs(clickedKey), delay));
+        } else {
+          [0, 80, 240].forEach(delay => setTimeout(() => renderStrategySpecificInputs(resolveActiveStrategyFamily()), delay));
+        }
+      }
+    });
+    document.addEventListener("change", event => {
+      const target = event.target;
+      if (target && target.name === "strategy_family") {
+        const key = validStrategyFamilyKey(target.value);
+        if (key) renderStrategySpecificInputs(key);
+      }
     });
     document.addEventListener("input", event => {
       if (event.target.closest("#auto-data-filter")) filterModal(event.target.value);
+      const target = event.target;
+      if (target && target.name === "strategy_family") {
+        const key = validStrategyFamilyKey(target.value);
+        if (key) renderStrategySpecificInputs(key);
+      }
     });
     document.addEventListener("keydown", event => {
       if (event.key === "Escape" && !$("#auto-data-modal")?.hidden) closeModal();
@@ -1040,6 +1310,15 @@
           }
         }).catch(() => {});
       }
+      response.clone().json().then(data => {
+        const key = validStrategyFamilyKey(data?.config?.strategy_family || data?.strategy_family);
+        if (key) {
+          setActiveStrategyFamilyKey(key);
+          [0, 80, 240].forEach(delay => setTimeout(() => {
+            if (window.__renderStrategySpecificInputs) window.__renderStrategySpecificInputs(key);
+          }, delay));
+        }
+      }).catch(() => {});
     } catch (_) {}
     return response;
   };
@@ -1053,5 +1332,83 @@
 </script>
 
 <div id="hover-popover" class="hover-popover" hidden></div>
+
+<script>
+(() => {
+  // 只在右上角 ⓘ 提示图标区域显示悬浮说明；鼠标停在卡片空白处不再弹提示。
+  function ensurePopover() {
+    let pop = document.getElementById("hover-popover");
+    if (!pop) {
+      pop = document.createElement("div");
+      pop.id = "hover-popover";
+      pop.className = "hover-popover";
+      pop.hidden = true;
+      document.body.appendChild(pop);
+    }
+    return pop;
+  }
+
+  function tipTargetAtPoint(event) {
+    const el = event.target && event.target.closest ? event.target.closest("[data-tip]") : null;
+    if (!el || !el.dataset || !String(el.dataset.tip || "").trim()) return null;
+    const rect = el.getBoundingClientRect();
+    if (!rect.width || !rect.height) return null;
+
+    // data-tip 的 ⓘ 由 CSS 画在右上角；这里把可触发区域限制到这个小区域附近。
+    const hitW = Math.min(34, Math.max(24, rect.width));
+    const hitH = Math.min(34, Math.max(24, rect.height));
+    const x = event.clientX;
+    const y = event.clientY;
+    const inRect = x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+    const inIconZone = x >= rect.right - hitW && x <= rect.right && y >= rect.top && y <= rect.top + hitH;
+    return inRect && inIconZone ? el : null;
+  }
+
+  function positionPopover(pop, event) {
+    const pad = 14;
+    const rect = pop.getBoundingClientRect();
+    let x = event.clientX + 16;
+    let y = event.clientY + 16;
+    if (x + rect.width > window.innerWidth - pad) x = event.clientX - rect.width - 16;
+    if (y + rect.height > window.innerHeight - pad) y = event.clientY - rect.height - 16;
+    pop.style.left = `${Math.max(pad, x)}px`;
+    pop.style.top = `${Math.max(pad, y)}px`;
+  }
+
+  function hidePopover() {
+    const pop = document.getElementById("hover-popover");
+    if (pop) pop.hidden = true;
+  }
+
+  function handleTipPointer(event) {
+    const closestTip = event.target && event.target.closest ? event.target.closest("[data-tip]") : null;
+    if (!closestTip) return;
+
+    const target = tipTargetAtPoint(event);
+    const pop = ensurePopover();
+    if (!target) {
+      pop.hidden = true;
+      // 阻止旧的“整张卡片 hover 就显示提示”的监听器继续执行。
+      event.stopImmediatePropagation();
+      return;
+    }
+
+    pop.textContent = String(target.dataset.tip || "");
+    pop.hidden = false;
+    positionPopover(pop, event);
+    event.stopImmediatePropagation();
+  }
+
+  document.addEventListener("mouseover", handleTipPointer, true);
+  document.addEventListener("mousemove", handleTipPointer, true);
+  document.addEventListener("mouseout", event => {
+    const related = event.relatedTarget;
+    if (related && related.closest && related.closest("[data-tip]")) return;
+    hidePopover();
+  }, true);
+  document.addEventListener("scroll", hidePopover, true);
+  window.addEventListener("blur", hidePopover);
+})();
+</script>
 </body>
 </html>

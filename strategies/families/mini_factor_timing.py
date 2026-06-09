@@ -30,10 +30,10 @@ INPUT_SCHEMA = [
         "tone": "event-zone",
         "desc": "小因子策略主要依赖自动下载的历史行情因子。这里不是买点按钮，只是在自动因子不足或你有额外判断时做轻量修正。",
         "fields": [
-            {"name": "mini_trend_bias", "label": "趋势/动量修正", "type": "select", "default": "auto", "tip": "修正趋势、60/120日动量、均线斜率这类因子。", "options": [["auto", "自动：不手动修正"], ["1", "+1 动量明显偏强"], ["0", "0 动量中性"], ["-1", "-1 动量明显偏弱"]]},
-            {"name": "mini_structure_bias", "label": "结构/回撤修正", "type": "select", "default": "auto", "tip": "修正回撤修复、结构突破、距离长期高点等结构因子。", "options": [["auto", "自动：不手动修正"], ["1", "+1 结构修复/回撤有吸引力"], ["0", "0 结构中性"], ["-1", "-1 结构偏弱"]]},
-            {"name": "mini_volume_bias", "label": "量能/波动修正", "type": "select", "default": "auto", "tip": "修正量能确认、缩量回踩、波动过高等因子。", "options": [["auto", "自动：不手动修正"], ["1", "+1 量能/波动支持"], ["0", "0 中性"], ["-1", "-1 量能/波动不支持"]]},
-            {"name": "mini_risk_bias", "label": "风险上限修正", "type": "select", "default": "auto", "tip": "只用于进一步压低仓位上限，不用于增加仓位。", "options": [["auto", "自动：系统判断"], ["0", "0 无额外风险"], ["-1", "-1 有额外风险，压低上限"]]},
+            {"name": "mini_trend_bias", "label": "趋势/动量修正", "type": "select", "default": "", "tip": "修正趋势、60/120日动量、均线斜率这类因子。", "options": [["1", "动量明显偏强"], ["-1", "动量明显偏弱"]]},
+            {"name": "mini_structure_bias", "label": "结构/回撤修正", "type": "select", "default": "", "tip": "修正回撤修复、结构突破、距离长期高点等结构因子。", "options": [["1", "结构修复/回撤有吸引力"], ["-1", "结构偏弱"]]},
+            {"name": "mini_volume_bias", "label": "量能/波动修正", "type": "select", "default": "", "tip": "修正量能确认、缩量回踩、波动过高等因子。", "options": [["1", "量能/波动支持"], ["-1", "量能/波动不支持"]]},
+            {"name": "mini_risk_bias", "label": "风险上限修正", "type": "select", "default": "", "tip": "只用于进一步压低仓位上限，不用于增加仓位。", "options": [["-1", "有额外风险，压低上限"]]},
         ],
     },
 ]
@@ -65,7 +65,7 @@ def _factor_reason(scores: Dict[str, float]) -> str:
 
 
 def _manual_bias(signals: Dict[str, Any], key: str) -> int:
-    raw = str(signals.get(key, "auto") or "auto").strip().lower()
+    raw = str(signals.get(key, "0") or "0").strip().lower()
     if raw in {"-1", "0", "1"}:
         return int(raw)
     return 0

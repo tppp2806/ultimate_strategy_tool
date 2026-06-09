@@ -180,3 +180,5 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 /backtest_reports
+/data
+/data

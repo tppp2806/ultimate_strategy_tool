@@ -50,52 +50,6 @@
     }
   },
   "strategy_family_params": {
-    "five_dimension_timing": {
-      "strategy_mix": {
-        "aggressive": {
-          "enabled": false,
-          "weight_pct": 0,
-          "buy_step_pct": 100,
-          "sell_step_pct": 100,
-          "risk_multiplier": 1.25,
-          "core_base_pct": {
-            "above_200": 82,
-            "bear": 20,
-            "below_200": 36,
-            "sideways": 64,
-            "strong_bull": 92
-          }
-        },
-        "balanced": {
-          "enabled": true,
-          "weight_pct": 100,
-          "buy_step_pct": 100,
-          "sell_step_pct": 100,
-          "risk_multiplier": 1,
-          "core_base_pct": {
-            "above_200": 72,
-            "bear": 14,
-            "below_200": 28,
-            "sideways": 54,
-            "strong_bull": 84
-          }
-        },
-        "defensive": {
-          "enabled": false,
-          "weight_pct": 0,
-          "buy_step_pct": 100,
-          "sell_step_pct": 100,
-          "risk_multiplier": 0.75,
-          "core_base_pct": {
-            "above_200": 58,
-            "bear": 10,
-            "below_200": 20,
-            "sideways": 42,
-            "strong_bull": 70
-          }
-        }
-      }
-    },
     "mini_factor_timing": {
       "strategy_mix": {
         "defensive": {
@@ -206,10 +160,10 @@
   "core_max_position_pct": 100.0,
   "strict_min_position_pct": 0.0,
   "strict_max_position_pct": 100.0,
-  "symbol": "017641",
-  "symbol_name": "摩根标普500指数(QDII)人民币A",
+  "symbol": "510300",
+  "symbol_name": "沪深300ETF",
   "market": "CN",
-  "asset_kind": "fund",
+  "asset_kind": "etf",
   "data_source": "akshare",
   "proxy_mode": "system",
   "proxy_url": "",

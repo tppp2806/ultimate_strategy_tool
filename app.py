@@ -592,16 +592,15 @@ def parse_signals(form: Dict[str, Any]) -> Dict[str, Any]:
         raw = form.get(key)
         signals[key] = as_float(raw, None) if raw not in (None, "") else None
 
-    # 总体策略专属输入。
-    # 趋势信号策略仍使用 market_state / entry_state / exit_state；
-    # 五维择时和小因子择时使用这些独立字段，避免只是把同一套趋势按钮换个名字。
+    # 总体策略专属输入：不再使用“自动”可视选项。
+    # 未选择时按 0 = 无影响信号处理；自动行情因子仍通过 hidden 字段进入策略。
     for key in (
         "five_valuation_vote", "five_fund_vote", "five_tech_vote",
         "five_sentiment_vote", "five_fundamental_vote", "five_risk_vote",
         "mini_trend_bias", "mini_structure_bias", "mini_volume_bias", "mini_risk_bias",
     ):
-        raw = str(form.get(key, "auto") or "auto").strip()
-        signals[key] = raw if raw in {"auto", "-1", "0", "1"} else "auto"
+        raw = str(form.get(key, "0") or "0").strip()
+        signals[key] = raw if raw in {"-1", "0", "1"} else "0"
     return signals
 
 

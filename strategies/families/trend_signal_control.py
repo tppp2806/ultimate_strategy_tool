@@ -23,6 +23,108 @@ FAMILY_META: Dict[str, Any] = {
 }
 
 
+INPUT_SCHEMA = [
+    {
+        "title": "② 策略信号 / 趋势环境",
+        "pill": "趋势信号",
+        "tone": "neutral",
+        "desc": "本区域由 strategies/families/trend_signal_control.py 的 INPUT_SCHEMA 自动生成；更换总体策略后会自动替换。",
+        "fields": [
+            {
+                "name": "market_state",
+                "label": "大趋势环境",
+                "type": "choice",
+                "default": "",
+                "tip": "判断当前标的处在长期趋势、防守区还是震荡区。",
+                "options": [
+                    ["bear", "200日线下方且向下", "sell-strong", "大趋势不利，原则上不新增买入。"],
+                    ["below_200", "未站上200日线", "wait", "反转确认不足，只能小仓验证。"],
+                    ["above_200", "站上200日线", "buy", "可以开始做趋势仓。"],
+                    ["strong_bull", "50日线 > 200日线强多头", "buy-strong", "最适合顺势持有和分批加仓。"],
+                ],
+            },
+            {"name": "market_risk", "label": "大盘/板块同步走弱", "type": "checkbox", "default": False, "tip": "同类资产同步走弱时，单个标的信号需要降权。"},
+        ],
+    },
+    {
+        "title": "③ 入场信号",
+        "pill": "趋势信号",
+        "tone": "event-zone",
+        "desc": "只描述当前是否具备趋势内加仓理由；场外基金低频策略不追求日内买点。",
+        "fields": [
+            {
+                "name": "entry_state",
+                "label": "入场状态",
+                "type": "choice",
+                "default": "",
+                "tip": "没有明确买点时保持 none。",
+                "options": [
+                    ["reversal_50", "站回50日线反转试仓", "buy", "下跌后站回50日线，但未完全确认。"],
+                    ["breakout", "平台/前高突破", "buy", "最好用收盘价确认，而不是盘中刺破。"],
+                    ["pullback_hold", "回踩20/50日线不破", "buy-strong", "趋势内回踩不破通常比追高更稳。"],
+                    ["continuation_high", "强趋势持续创新高", "buy-strong", "适合已有盈利后顺势持有。"],
+                ],
+            },
+        ],
+    },
+    {
+        "title": "④ 风险 / 结构确认",
+        "pill": "趋势信号",
+        "tone": "pattern-zone",
+        "desc": "这些是辅助判断，只影响仓位权重，不单独决定买卖。",
+        "fields": [
+            {"name": "volume_confirm", "label": "突破时放量", "type": "checkbox", "default": False, "tip": "场外基金通常无真实成交量，主要给场内ETF参考。"},
+            {"name": "pullback_volume_dry", "label": "回踩缩量", "type": "checkbox", "default": False, "tip": "场外基金通常无真实成交量，谨慎使用。"},
+            {"name": "upper_shadow", "label": "放量长上影 / 冲高回落", "type": "checkbox", "default": False, "tip": "说明上方抛压较明显。"},
+            {"name": "failed_close", "label": "收盘未站稳关键位", "type": "checkbox", "default": False, "tip": "突破确认不足。"},
+            {"name": "far_from_ma", "label": "远离均线 / 涨速过快", "type": "checkbox", "default": False, "tip": "追高风险收益比下降。"},
+        ],
+    },
+    {
+        "title": "⑤ 减仓 / 清仓信号",
+        "pill": "趋势信号",
+        "tone": "context-zone",
+        "desc": "风险信号优先于加仓信号；定投增强模式下通常先降交易仓，不直接清掉核心仓。",
+        "fields": [
+            {
+                "name": "exit_state",
+                "label": "退出状态",
+                "type": "choice",
+                "default": "",
+                "tip": "没有破位时保持 none。",
+                "options": [
+                    ["below_20", "跌破20日线", "sell", "短线趋势弱化。"],
+                    ["failed_breakout", "突破失败", "sell", "入场理由减弱，需要先控风险。"],
+                    ["below_50", "跌破50日线", "sell-strong", "中期趋势明显受损。"],
+                    ["below_200", "跌破200日线", "sell-strong", "长期趋势失守。"],
+                    ["hit_stop", "触发初始止损", "sell-strong", "交易增强仓理由失效。"],
+                ],
+            },
+        ],
+    },
+    {
+        "title": "⑥ 盈利阶段",
+        "pill": "趋势信号",
+        "tone": "neutral",
+        "desc": "盈利阶段只作为止盈辅助，不作为独立预测信号。",
+        "fields": [
+            {
+                "name": "profit_state",
+                "label": "盈利状态",
+                "type": "choice",
+                "default": "",
+                "tip": "根据当前盈亏和止损距离判断。",
+                "options": [
+                    ["profit_1r", "盈利≥1R", "buy", "可继续持有。"],
+                    ["profit_2r", "盈利≥2R", "sell", "可开始释放部分交易仓。"],
+                    ["profit_3r", "盈利≥3R", "sell", "可进一步止盈。"],
+                ],
+            },
+        ],
+    },
+]
+
+
 def target_weight(cfg: Dict[str, Any], signals: Dict[str, Any]) -> Tuple[float, List[str]]:
     """趋势信号风控策略的目标仓位生成器。
 
