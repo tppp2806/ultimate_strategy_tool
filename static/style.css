@@ -17,7 +17,7 @@
   --blue-soft: #e4ecf4;
   --shadow: 0 8px 22px rgba(82, 62, 38, .08);
   --radius: 18px;
-  --topbar-h: 70px;
+  --topbar-h: 86px;
 }
 
 * { box-sizing: border-box; }
@@ -79,6 +79,182 @@ button, input, select { font: inherit; }
 }
 
 .top-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+.top-strategy-tabs {
+  flex: 1 1 420px;
+  min-width: 280px;
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  overflow-x: auto;
+  padding: 2px;
+}
+.top-strategy-tab {
+  position: relative;
+  display: grid;
+  gap: 2px;
+  min-width: 150px;
+  padding: 8px 12px;
+  border: 1px solid rgba(255,255,255,.24);
+  border-radius: 15px;
+  background: rgba(255,255,255,.08);
+  color: #fff6e8;
+  cursor: pointer;
+  transition: background .12s ease, border-color .12s ease, transform .12s ease;
+}
+.top-strategy-tab:hover {
+  transform: translateY(-1px);
+  background: rgba(255,255,255,.14);
+}
+.top-strategy-tab input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+.top-strategy-tab span {
+  font-size: 13px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+.top-strategy-tab em {
+  color: #e8d8c2;
+  font-size: 11px;
+  font-style: normal;
+  white-space: nowrap;
+}
+.top-strategy-tab:has(input:checked) {
+  border-color: rgba(255,246,232,.82);
+  background: #fff6e8;
+  color: #3a2b20;
+}
+.top-strategy-tab:has(input:checked) em { color: #76563b; }
+
+
+
+/* v80：顶部总体策略下拉栏布局修复
+   之前 app.js 已改成 top-strategy-select-card，但 CSS 仍停留在旧卡片/旧横向按钮样式，
+   导致 select 撑满顶部、说明文字和参数按钮换行重叠。 */
+.top-strategy-tabs {
+  flex: 1 1 min(760px, 52vw);
+  min-width: 360px;
+  max-width: 920px;
+  justify-content: center;
+  overflow: visible;
+}
+.top-strategy-select-card {
+  width: min(900px, 100%);
+  min-width: 0;
+  height: 62px;
+  display: grid;
+  grid-template-columns: minmax(230px, 360px) minmax(180px, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 1px solid rgba(255,255,255,.24);
+  border-radius: 18px;
+  background: rgba(255,255,255,.08);
+  color: #fff6e8;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.08);
+  overflow: hidden;
+}
+.top-strategy-select-label {
+  min-width: 0;
+  display: grid;
+  grid-template-rows: 15px minmax(0, 1fr);
+  gap: 3px;
+  align-items: center;
+}
+.top-strategy-select-label > span {
+  display: block;
+  color: #eadcc8;
+  font-size: 11px;
+  font-weight: 900;
+  line-height: 1;
+  white-space: nowrap;
+}
+.top-strategy-select-label select {
+  width: 100%;
+  min-width: 0;
+  height: 38px;
+  border: 1px solid rgba(255,255,255,.36);
+  border-radius: 14px;
+  padding: 0 38px 0 14px;
+  background: #fff6e8;
+  color: #33251b;
+  font-size: 16px;
+  font-weight: 950;
+  line-height: 38px;
+  box-shadow: none;
+}
+.top-strategy-select-meta {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+  align-content: center;
+  overflow: hidden;
+}
+.top-strategy-select-meta strong,
+.top-strategy-select-meta em {
+  min-width: 0;
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.top-strategy-select-meta strong {
+  color: #fff6e8;
+  font-size: 13px;
+  font-weight: 950;
+  line-height: 1.15;
+}
+.top-strategy-select-meta em {
+  color: #e8d8c2;
+  font-size: 12px;
+  font-style: normal;
+  line-height: 1.25;
+}
+.top-strategy-select-card .strategy-card-settings-btn {
+  align-self: center;
+  justify-self: end;
+  flex: 0 0 auto;
+  height: 38px;
+  padding: 0 14px;
+  border-color: rgba(255,255,255,.24);
+  background: rgba(255,255,255,.12);
+  color: #fff6e8;
+}
+
+@media (max-width: 1280px) {
+  :root { --topbar-h: 106px; }
+  .topbar { flex-wrap: wrap; align-items: stretch; }
+  .brand { flex: 1 1 320px; }
+  .top-actions { flex: 0 0 auto; }
+  .top-strategy-tabs {
+    order: 3;
+    flex: 1 1 100%;
+    max-width: none;
+    min-width: 0;
+    justify-content: stretch;
+  }
+  .top-strategy-select-card {
+    width: 100%;
+    grid-template-columns: minmax(220px, 360px) minmax(120px, 1fr) auto;
+  }
+}
+
+@media (max-width: 760px) {
+  :root { --topbar-h: 164px; }
+  .top-strategy-select-card {
+    height: auto;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "select btn"
+      "meta meta";
+  }
+  .top-strategy-select-label { grid-area: select; }
+  .top-strategy-select-meta { grid-area: meta; }
+  .top-strategy-select-card .strategy-card-settings-btn { grid-area: btn; }
+}
 
 .ghost-btn {
   border: 1px solid rgba(255,255,255,.28);
@@ -1616,4 +1792,619 @@ input[type="date"]::-webkit-calendar-picker-indicator {
 .trade-table tr.trade-row.hold > td[data-col="方向"] { color: #4d6682; }
 .trade-table tr.trade-row.neutral {
   background: rgba(255,255,255,.46);
+}
+
+/* v16：设置页高级参数折叠区 */
+.advanced-params {
+  grid-column: 1 / -1;
+  border: 1px solid rgba(120, 93, 54, 0.18);
+  border-radius: 18px;
+  padding: 12px 14px;
+  background: linear-gradient(135deg, rgba(255, 248, 232, 0.86), rgba(255, 255, 255, 0.72));
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.7);
+}
+.advanced-params > summary {
+  cursor: pointer;
+  font-weight: 800;
+  color: #6b4b22;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.advanced-params > summary::-webkit-details-marker { display: none; }
+.advanced-params > summary::after {
+  content: "展开";
+  font-size: 12px;
+  font-weight: 700;
+  color: #8a6a35;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: rgba(138, 106, 53, 0.10);
+}
+.advanced-params[open] > summary::after { content: "收起"; }
+.settings-subtitle {
+  margin: 14px 0 8px;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  color: #8a6a35;
+}
+.settings-grid.nested {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0;
+}
+.settings-grid.nested.three-cols { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.settings-grid.nested.four-cols { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.checkbox-field {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+  min-height: 48px;
+}
+.checkbox-field input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  accent-color: #9b6b28;
+}
+@media (max-width: 900px) {
+  .settings-grid.nested,
+  .settings-grid.nested.three-cols,
+  .settings-grid.nested.four-cols {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* 策略实验台 */
+.strategy-lab {
+  gap: 10px;
+}
+.strategy-family-picker,
+.strategy-single-picker {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+}
+.strategy-lab-panel {
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  background: rgba(255,255,255,.5);
+  padding: 9px 10px;
+}
+.strategy-lab-panel > summary {
+  cursor: pointer;
+  font-weight: 900;
+  color: #46372b;
+}
+.strategy-lab-item {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  background: rgba(255,255,255,.55);
+  transition: opacity .15s ease, border-color .15s ease, background .15s ease;
+}
+.strategy-lab-item.is-active {
+  border-color: var(--accent);
+  background: #fff8ed;
+}
+.strategy-lab-item.is-disabled {
+  opacity: .46;
+}
+.strategy-lab-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  align-items: stretch;
+}
+.style-title {
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255,255,255,.62);
+}
+.style-title strong {
+  display: block;
+  font-size: 14px;
+}
+.style-title em {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+}
+.checkbox-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255,255,255,.62);
+}
+.checkbox-field span {
+  margin: 0;
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.35;
+}
+.checkbox-field em {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 500;
+}
+.mini-field {
+  display: block;
+  padding: 8px 9px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255,255,255,.66);
+}
+.mini-field span {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+.mini-field input {
+  width: 100%;
+  border: 1px solid #cfc1b2;
+  border-radius: 9px;
+  padding: 7px 8px;
+  background: #fffdfa;
+  color: var(--ink);
+}
+.strategy-param-grid,
+.strategy-core-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(108px, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+}
+.strategy-core-tune {
+  margin-top: 8px;
+  padding: 8px;
+  border-radius: 12px;
+  background: rgba(239,228,211,.55);
+}
+.strategy-core-tune > summary {
+  cursor: pointer;
+  font-weight: 900;
+  color: #4d3b2c;
+}
+body.strategy-single-mode .strategy-lab-item:not(.is-selected) {
+  opacity: .55;
+}
+
+@media (max-width: 1100px) {
+  :root { --topbar-h: 118px; }
+  .topbar { align-items: stretch; flex-wrap: wrap; }
+  .brand { flex: 1 1 260px; }
+  .top-strategy-tabs { order: 3; flex-basis: 100%; justify-content: flex-start; }
+}
+
+
+/* 顶部总体策略卡片：动态渲染，不写死策略数量 */
+.top-strategy-card {
+  flex: 0 0 clamp(230px, 24vw, 330px);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: stretch;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid rgba(255,255,255,.22);
+  border-radius: 18px;
+  background: rgba(255,255,255,.08);
+  color: #fff6e8;
+  transition: background .12s ease, border-color .12s ease, transform .12s ease;
+}
+.top-strategy-card:hover {
+  transform: translateY(-1px);
+  background: rgba(255,255,255,.13);
+}
+.top-strategy-card.is-active {
+  border-color: rgba(255,246,232,.86);
+  background: #fff6e8;
+  color: #33251b;
+}
+.top-strategy-main {
+  position: relative;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  cursor: pointer;
+}
+.top-strategy-main input {
+  width: 17px;
+  height: 17px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+.top-strategy-copy { min-width: 0; display: block; }
+.top-strategy-copy strong,
+.top-strategy-copy em,
+.top-strategy-copy small {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.top-strategy-copy strong { font-size: 13px; font-weight: 950; }
+.top-strategy-copy em { margin-top: 2px; color: #e8d8c2; font-size: 11px; font-style: normal; }
+.top-strategy-copy small { margin-top: 3px; color: #d8c4ad; font-size: 11px; }
+.top-strategy-card.is-active .top-strategy-copy em,
+.top-strategy-card.is-active .top-strategy-copy small { color: #76563b; }
+.strategy-card-settings-btn {
+  align-self: center;
+  border: 1px solid rgba(255,255,255,.28);
+  border-radius: 999px;
+  background: rgba(255,255,255,.12);
+  color: inherit;
+  padding: 7px 10px;
+  font-size: 12px;
+  font-weight: 900;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.top-strategy-card.is-active .strategy-card-settings-btn {
+  border-color: #bda891;
+  background: #efe2d0;
+  color: var(--accent-dark);
+}
+.strategy-card-settings-btn:hover { filter: brightness(1.04); }
+
+.strategy-hint-card {
+  display: grid;
+  gap: 4px;
+  padding: 10px 11px;
+  border: 1px dashed #bda891;
+  border-radius: 14px;
+  background: #fff8ed;
+  color: #4d3b2c;
+  font-size: 13px;
+  line-height: 1.45;
+}
+.strategy-hint-card strong { color: var(--accent-dark); }
+.strategy-hint-card span { color: var(--muted); }
+
+/* 每个总体策略自己的右侧参数编辑页 */
+.family-settings[hidden] { display: none; }
+.family-settings {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+}
+.family-settings-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(39, 27, 18, .28);
+  backdrop-filter: blur(2px);
+}
+.family-settings-panel {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  bottom: 14px;
+  width: min(760px, calc(100vw - 28px));
+  overflow: auto;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  background: #fffaf2;
+  box-shadow: 0 18px 48px rgba(48, 34, 22, .24);
+}
+.family-settings-head {
+  position: sticky;
+  top: -14px;
+  z-index: 2;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin: -14px -14px 12px;
+  padding: 14px;
+  background: #2f241d;
+  color: #fff6e8;
+  border-radius: 22px 22px 0 0;
+}
+.family-settings-head h2 { margin: 0 0 4px; font-size: 20px; }
+.family-settings-head p { margin: 0; color: #e8d8c2; font-size: 13px; }
+.family-settings-body { display: grid; gap: 12px; }
+.family-editor-intro,
+.family-style-picker,
+.family-param-card {
+  border: 1px solid var(--line);
+  border-radius: 17px;
+  background: rgba(255,255,255,.62);
+  padding: 12px;
+}
+.family-editor-intro strong { display: block; font-size: 17px; color: var(--accent-dark); }
+.family-editor-intro p { margin: 6px 0; color: var(--muted); line-height: 1.5; }
+.family-editor-intro em { color: #76563b; font-style: normal; font-size: 12px; font-weight: 800; }
+.family-style-picker legend { padding: 0 6px; font-weight: 900; color: #46372b; }
+.family-style-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 8px;
+}
+.family-style-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  min-height: 58px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: #fffdf9;
+  cursor: pointer;
+}
+.family-style-option.is-active { border-color: var(--accent); background: #f3e4d0; }
+.family-style-option span strong, .family-style-option span em { display: block; }
+.family-style-option span strong { font-size: 14px; }
+.family-style-option span em { margin-top: 2px; color: var(--muted); font-size: 12px; font-style: normal; }
+.family-param-list { display: grid; gap: 10px; }
+.family-param-card.is-muted { display: none; }
+.family-param-card.is-active { border-color: var(--accent); background: #fff8ed; }
+.family-param-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: flex-start;
+  margin-bottom: 9px;
+}
+.family-param-head strong { display: block; color: var(--accent-dark); }
+.family-param-head em { display: block; margin-top: 2px; color: var(--muted); font-size: 12px; font-style: normal; }
+.family-param-badge {
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: #efe2d0;
+  color: var(--accent-dark);
+  font-size: 12px;
+  font-weight: 900;
+}
+.family-param-grid,
+.family-core-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px;
+}
+.family-core-tune {
+  margin-top: 8px;
+  padding: 8px;
+  border-radius: 13px;
+  background: rgba(239,228,211,.55);
+}
+.family-core-tune > summary { cursor: pointer; font-weight: 900; color: #4d3b2c; }
+
+@media (max-width: 1100px) {
+  :root { --topbar-h: 148px; }
+  .top-strategy-card { flex-basis: min(310px, 86vw); }
+}
+@media (max-width: 720px) {
+  .family-settings-panel { left: 8px; right: 8px; top: 8px; bottom: 8px; width: auto; }
+}
+
+.strategy-specific-inputs {
+  display: grid;
+  gap: 10px;
+}
+.strategy-specific-inputs[hidden] {
+  display: none !important;
+}
+.strategy-schema-desc {
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: #f1e5d5;
+  color: #594939;
+  line-height: 1.55;
+  font-size: 13px;
+}
+.strategy-schema-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+}
+.strategy-schema-field select {
+  width: 100%;
+  border: 1px solid #cfc1b2;
+  border-radius: 10px;
+  padding: 8px 9px;
+  background: #fffdfa;
+  color: var(--ink);
+  font-size: 14px;
+}
+
+
+/* v80 final overrides：覆盖旧顶部卡片媒体规则，避免旧 --topbar-h:148px 和 flex-basis 干扰下拉栏。 */
+@media (max-width: 1100px) {
+  :root { --topbar-h: 118px; }
+  .top-strategy-tabs { order: 3; flex-basis: 100%; max-width: none; overflow: visible; }
+  .top-strategy-select-card { width: 100%; }
+}
+@media (max-width: 760px) {
+  :root { --topbar-h: 164px; }
+}
+
+
+/* v81：顶部总体策略下拉栏垂直居中 + 左侧参数风格位置调整
+   - 参数风格已经移动到【仓位模式】下方，这里只保留紧凑卡片样式；
+   - 顶部策略栏改成固定网格，不再被旧卡片样式/旧媒体规则影响。 */
+.topbar {
+  align-items: center;
+  min-height: var(--topbar-h);
+}
+.brand {
+  flex: 0 1 390px;
+  display: grid;
+  align-content: center;
+}
+.top-actions {
+  flex: 0 0 auto;
+  align-items: center;
+}
+.top-strategy-tabs {
+  flex: 1 1 min(760px, 54vw);
+  min-width: 390px;
+  max-width: 920px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: visible;
+  padding: 0;
+  align-self: center;
+}
+.top-strategy-select-card {
+  width: 100%;
+  min-width: 0;
+  height: 58px;
+  display: grid;
+  grid-template-columns: minmax(220px, 360px) minmax(180px, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 10px;
+  border: 1px solid rgba(255,255,255,.24);
+  border-radius: 18px;
+  background: rgba(255,255,255,.08);
+  color: #fff6e8;
+  overflow: hidden;
+}
+.top-strategy-select-label {
+  min-width: 0;
+  display: grid;
+  grid-template-rows: auto 34px;
+  gap: 3px;
+  align-items: center;
+  align-content: center;
+  margin: 0;
+}
+.top-strategy-select-label > span {
+  height: 12px;
+  line-height: 12px;
+  font-size: 10px;
+  font-weight: 950;
+  color: #eadcc8;
+  white-space: nowrap;
+}
+.top-strategy-select-label select {
+  width: 100%;
+  height: 34px;
+  min-height: 34px;
+  line-height: 34px;
+  margin: 0;
+  padding: 0 34px 0 13px;
+  border-radius: 13px;
+  font-size: 14px;
+  font-weight: 950;
+  background: #fff6e8;
+  color: #33251b;
+}
+.top-strategy-select-meta {
+  min-width: 0;
+  display: grid;
+  align-content: center;
+  gap: 2px;
+  overflow: hidden;
+}
+.top-strategy-select-meta strong {
+  line-height: 1.15;
+  font-size: 13px;
+  font-weight: 950;
+  color: #fff6e8;
+}
+.top-strategy-select-meta em {
+  line-height: 1.25;
+  font-size: 12px;
+  color: #e8d8c2;
+}
+.top-strategy-select-meta strong,
+.top-strategy-select-meta em {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.top-strategy-select-card .strategy-card-settings-btn {
+  align-self: center;
+  justify-self: end;
+  height: 34px;
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 13px;
+  border-color: rgba(255,255,255,.24);
+  background: rgba(255,255,255,.12);
+  color: #fff6e8;
+  line-height: 1;
+}
+.active-style-picker {
+  margin-top: 0;
+}
+.active-style-picker legend {
+  padding: 0 6px;
+  color: #46372b;
+  font-weight: 900;
+}
+.active-style-grid {
+  display: grid;
+  gap: 8px;
+}
+.active-style-picker .strategy-option {
+  min-height: 56px;
+}
+.style-apply-note,
+.strategy-hint-card {
+  display: none !important;
+}
+@media (max-width: 1280px) {
+  :root { --topbar-h: 112px; }
+  .topbar {
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  .brand { flex: 1 1 320px; }
+  .top-actions { flex: 0 0 auto; }
+  .top-strategy-tabs {
+    order: 3;
+    flex: 1 1 100%;
+    min-width: 0;
+    max-width: none;
+    justify-content: stretch;
+  }
+  .top-strategy-select-card {
+    width: 100%;
+    grid-template-columns: minmax(220px, 360px) minmax(160px, 1fr) auto;
+  }
+}
+@media (max-width: 760px) {
+  :root { --topbar-h: 166px; }
+  .top-strategy-select-card {
+    height: auto;
+    min-height: 74px;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "select btn"
+      "meta meta";
+    align-items: center;
+  }
+  .top-strategy-select-label { grid-area: select; }
+  .top-strategy-select-meta { grid-area: meta; }
+  .top-strategy-select-card .strategy-card-settings-btn { grid-area: btn; }
 }

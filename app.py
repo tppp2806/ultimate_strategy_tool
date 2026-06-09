@@ -18,17 +18,43 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from flask import Flask, jsonify, render_template, request
 
+from strategies.strategy_engine import (
+    ADVANCED_PARAM_DEFAULTS,
+    ADVANCED_PARAM_KEYS,
+    DEFAULT_STRATEGY_FAMILY,
+    STRATEGY_FAMILIES,
+    STRATEGY_MARKET_STATES,
+    STRATEGY_PRESETS,
+    _ADVANCED_PCT_KEYS,
+    core_asset_floor_bounds,
+    core_asset_profile,
+    core_target_weight,
+    get_strategy,
+    lower_floor,
+    normalise_strategy_family_config,
+    normalise_strategy_lab_config,
+    full_strategy_summary,
+    strategy_family_summary,
+    strategy_mix_summary,
+)
+
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(APP_DIR, "data")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 INDEX_MAP_PATH = os.path.join(DATA_DIR, "index_map.json")
+
+# 历史回测落盘缓存：把历史行情/净值、历史估值，以及常用技术衍生字段保存为 CSV。
+# 以后扩大回测区间时，优先读取本地缓存，只补网络上缺失的日期段。
+HISTORY_CACHE_DIR = os.path.join(DATA_DIR, "history_cache")
+PRICE_HISTORY_CACHE_DIR = os.path.join(HISTORY_CACHE_DIR, "prices")
+VALUATION_HISTORY_CACHE_DIR = os.path.join(HISTORY_CACHE_DIR, "valuations")
 
 app = Flask(__name__)
 app.secret_key = "local-trend-risk-position-tool"
 
 # 进程内轻量缓存：同一轮本地使用中，参数完全相同的搜索、拉取、回测、连通性测试不重复执行。
 # 不落盘，不保存原始参数；只用参数摘要作为 key，避免把 Cookie/代理等敏感配置写进缓存索引。
-RUNTIME_CACHE_VERSION = 14
+RUNTIME_CACHE_VERSION = 21
 RUNTIME_CACHE_MAX_ITEMS = 160
 RUNTIME_CACHE_TTL_SEC: Dict[str, int] = {
     "search": 6 * 60 * 60,
@@ -95,38 +121,20 @@ def add_cache_meta(payload: Dict[str, Any], hit: bool, age_sec: int = 0) -> Dict
     return out
 
 
-STRATEGY_PRESETS: Dict[str, Dict[str, Any]] = {
-    "defensive": {
-        "name": "防守",
-        "buy_step": 0.18,
-        "sell_step": 0.55,
-        "risk_multiplier": 0.75,
-        "desc": "买入更慢，卖出更快；适合不想承受大回撤。",
-    },
-    "balanced": {
-        "name": "均衡",
-        "buy_step": 0.28,
-        "sell_step": 0.45,
-        "risk_multiplier": 1.00,
-        "desc": "默认档；趋势、止损、仓位三者平衡。",
-    },
-    "aggressive": {
-        "name": "进攻",
-        "buy_step": 0.38,
-        "sell_step": 0.35,
-        "risk_multiplier": 1.25,
-        "desc": "盈利后加仓更快，但破位清仓不打折。",
-    },
-}
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "plan_amount": 10000.0,
     "current_position_amount": 0.0,
     "current_profit_pct": 0.0,
+    "strategy_family": DEFAULT_STRATEGY_FAMILY,
     "strategy": "balanced",
+    "strategy_mode": "single",  # 固定单风格；总体策略由 strategy_family 切换
+    "strategy_mix": {},
+    "strategy_family_params": {},
     "position_mode": "core_satellite",  # core_satellite / strict_trade
     "risk_per_trade_pct": 1.0,
     "backtest_risk_free_rate_pct": 2.0,
+    **ADVANCED_PARAM_DEFAULTS,
     "symbol": "",
     "symbol_name": "",
     "market": "auto",
@@ -430,6 +438,7 @@ def ensure_config() -> Dict[str, Any]:
     if merged.get("strategy") not in STRATEGY_PRESETS:
         old = str(merged.get("risk_sensitivity", "balanced"))
         merged["strategy"] = old if old in STRATEGY_PRESETS else "balanced"
+    apply_active_family_params(merged)
     if merged.get("position_mode") not in {"core_satellite", "strict_trade"}:
         merged["position_mode"] = "core_satellite"
 
@@ -452,6 +461,8 @@ def ensure_config() -> Dict[str, Any]:
         merged["valuation_method"] = "system_calc"
     merged["request_timeout_sec"] = clamp(as_float(merged.get("request_timeout_sec"), 12.0), 3.0, 60.0)
     merged["retry_count"] = int(clamp(as_float(merged.get("retry_count"), 2.0), 0.0, 5.0))
+    normalise_advanced_config(merged)
+    apply_active_family_params(merged)
 
     save_config(merged)
     return merged
@@ -463,24 +474,60 @@ def save_config(cfg: Dict[str, Any]) -> None:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
 
-def get_strategy(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    return STRATEGY_PRESETS.get(str(cfg.get("strategy", "balanced")), STRATEGY_PRESETS["balanced"])
+def apply_active_family_params(cfg: Dict[str, Any]) -> None:
+    """把当前总体策略对应的微调参数载入 cfg。
 
-
-def core_asset_profile(cfg: Dict[str, Any]) -> str:
-    """仓位模式识别。
-
-    只要用户选择【长期底仓 + 交易仓】，就统一启用底仓 + 交易仓策略；
-    不再按标普500 / 纳指100 / 沪深300 / 上证50 / 普通基金做区别对待。
+    参数风格 strategy 是全局选择：切换总体策略时不再分别记忆
+    防守/均衡/进攻。strategy_family_params 只保存每个总体策略下
+    各参数风格的微调值（strategy_mix），不保存当前执行风格。
     """
-    return "core" if str(cfg.get("position_mode", "core_satellite")) == "core_satellite" else ""
+    normalise_strategy_family_config(cfg)
+    if cfg.get("strategy") not in STRATEGY_PRESETS:
+        cfg["strategy"] = "balanced"
+
+    family_key = str(cfg.get("strategy_family") or DEFAULT_STRATEGY_FAMILY)
+    all_params = cfg.get("strategy_family_params") if isinstance(cfg.get("strategy_family_params"), dict) else {}
+    active = all_params.get(family_key) if isinstance(all_params.get(family_key), dict) else {}
+
+    if isinstance(active.get("strategy_mix"), dict):
+        cfg["strategy_mix"] = active.get("strategy_mix") or {}
+
+    normalise_strategy_lab_config(cfg)
+
+    cleaned_params: Dict[str, Dict[str, Any]] = {}
+    for key, value in all_params.items():
+        if key not in STRATEGY_FAMILIES or not isinstance(value, dict):
+            continue
+        mix = value.get("strategy_mix") if isinstance(value.get("strategy_mix"), dict) else {}
+        cleaned_params[key] = {"strategy_mix": mix}
+
+    cleaned_params[family_key] = {"strategy_mix": cfg.get("strategy_mix", {})}
+    cfg["strategy_family_params"] = cleaned_params
 
 
-def core_asset_floor_bounds(profile: str) -> Tuple[float, float]:
-    if profile:
-        # 长期底仓模式允许长期在场，但仍给熊市/破位保留降仓空间。
-        return 0.05, 0.92
-    return 0.0, 0.60
+def advanced_pct(cfg: Dict[str, Any], key: str, default: float, min_value: float = 0.0, max_value: float = 100.0) -> float:
+    """读取设置页百分数字段，并转换为 0~1。"""
+    return clamp(as_float(cfg.get(key), default), min_value, max_value) / 100.0
+
+
+def advanced_bool(cfg: Dict[str, Any], key: str, default: bool = True) -> bool:
+    value = cfg.get(key, default)
+    if isinstance(value, str):
+        return value.lower() not in {"0", "false", "off", "no", ""}
+    return bool(value)
+
+
+def normalise_advanced_config(cfg: Dict[str, Any]) -> None:
+    """把高级参数统一清洗到 cfg，避免旧配置/空值导致策略异常。"""
+    cfg["trade_step_limit_enabled"] = advanced_bool(cfg, "trade_step_limit_enabled", True)
+    for key, default in ADVANCED_PARAM_DEFAULTS.items():
+        if key == "trade_step_limit_enabled":
+            continue
+        cfg[key] = clamp(as_float(cfg.get(key), default), 0.0, 100.0)
+    # 避免最小仓位高于最大仓位。
+    cfg["core_min_position_pct"] = min(float(cfg["core_min_position_pct"]), float(cfg["core_max_position_pct"]))
+    cfg["strict_min_position_pct"] = min(float(cfg["strict_min_position_pct"]), float(cfg["strict_max_position_pct"]))
+
 
 
 def current_position(cfg: Dict[str, Any]) -> float:
@@ -489,123 +536,14 @@ def current_position(cfg: Dict[str, Any]) -> float:
     return clamp(current_amount / plan, 0.0, 2.0) if plan > 0 else 0.0
 
 
-def lower_floor(cfg: Dict[str, Any], signals: Any) -> float:
-    """系统自动计算动态防守仓位。
 
-    - 纯交易仓：0%。
-    - 长期底仓+交易仓：不是固定死守底仓，而是随趋势、估值、质量和风险状态动态下降。
-    - 趋势好时保留长期暴露；行情变差、跌破关键线或触发止损时，防守仓位可降到 0%~10%。
-    - 计划资金仍然是 100% 上限；这里不是仓位上限，只是风险状态下最多保留的防守目标。
-    """
-    if cfg.get("position_mode") == "strict_trade":
-        return 0.0
-
-    if isinstance(signals, dict):
-        market_state = str(signals.get("market_state", "sideways"))
-        exit_state = str(signals.get("exit_state", "none"))
-        pe = signals.get("pe_percentile")
-        pb = signals.get("pb_percentile")
-        roe = signals.get("roe_pct")
-        market_risk = bool(signals.get("market_risk"))
-    else:
-        market_state = str(signals or "sideways")
-        exit_state = "none"
-        pe = pb = roe = None
-        market_risk = False
-
-    # 长期底仓 + 交易仓：核心不是“等信号才买”，而是先建立基础暴露，
-    # 再用交易仓做增强。否则均衡/进攻档在上涨年份会长期低仓，连定投都跑不赢。
-    profile = core_asset_profile(cfg)
-    if profile:
-        base_map = {
-            "bear": 0.08,
-            "below_200": 0.18,
-            "sideways": 0.55,
-            "above_200": 0.68,
-            "strong_bull": 0.78,
-        }
-    else:
-        base_map = {
-            "bear": 0.00,
-            "below_200": 0.03,
-            "sideways": 0.18,
-            "above_200": 0.30,
-            "strong_bull": 0.42,
-        }
-    floor = base_map.get(market_state, 0.12)
-
-    pe_v: Optional[float] = None
-    pb_v: Optional[float] = None
-
-    # 估值是“降速器”，不是长期底仓模式的清仓开关。
-    # 中高估会降低目标底仓，但不会让策略因为 79%~80% 这种边界长期只剩个位数仓位。
-    if pe is not None:
-        pe_v = clamp(as_float(pe), 0.0, 100.0)
-        if profile:
-            floor += (50.0 - pe_v) / 100.0 * 0.06
-            if pe_v >= 80:
-                floor -= (pe_v - 80.0) / 20.0 * 0.12
-        else:
-            floor += (50.0 - pe_v) / 100.0 * 0.12
-            if pe_v >= 80:
-                floor -= (pe_v - 80.0) / 20.0 * 0.08
-    elif pb is not None:
-        pb_v = clamp(as_float(pb), 0.0, 100.0)
-        floor += (50.0 - pb_v) / 100.0 * (0.05 if profile else 0.08)
-        if pb_v >= 80:
-            floor -= (pb_v - 80.0) / 20.0 * (0.08 if profile else 0.05)
-
-    # ROE只做质量微调，不允许它覆盖趋势纪律。
-    if roe is not None:
-        roe_v = as_float(roe)
-        floor += clamp((roe_v - 12.0) / 20.0, -0.04, 0.05)
-
-    # 系统性风险出现时，底仓进一步变成防守仓；长期底仓模式降速，但不因单个风险标签直接清零。
-    if market_risk:
-        floor *= (0.68 if profile else 0.55)
-
-    # 风险事件对防守仓位设置硬上限。长期底仓模式也会防守，但不会退化成纯交易仓。
-    if profile:
-        hard_caps = {
-            "bear": 0.16,
-            "below_200": 0.26,
-            "hit_stop": 0.18,
-            "below_50": 0.42,
-            "failed_breakout": 0.52,
-            "below_20": 0.60,
-        }
-    else:
-        hard_caps = {
-            "bear": 0.05,
-            "below_200": 0.10,
-            "hit_stop": 0.05,
-            "below_50": 0.15,
-            "failed_breakout": 0.20,
-            "below_20": 0.25,
-        }
-
-    if market_state == "bear":
-        floor = min(floor, hard_caps["bear"])
-    elif market_state == "below_200":
-        floor = min(floor, hard_caps["below_200"])
-
-    if exit_state == "hit_stop":
-        floor = min(floor, hard_caps["hit_stop"])
-        if not profile and (market_state in {"bear", "below_200"} or market_risk or (pe_v is not None and pe_v >= 80)):
-            floor = 0.0
-    elif exit_state == "below_200":
-        floor = min(floor, hard_caps["below_200"])
-        if not profile and (market_risk or (pe_v is not None and pe_v >= 80)):
-            floor = min(floor, 0.03)
-    elif exit_state == "below_50":
-        floor = min(floor, hard_caps["below_50"])
-    elif exit_state == "failed_breakout":
-        floor = min(floor, hard_caps["failed_breakout"])
-    elif exit_state == "below_20":
-        floor = min(floor, hard_caps["below_20"])
-
-    low, high = core_asset_floor_bounds(profile)
-    return clamp(floor, low, high)
+def target_action_from_delta(cur: float, target: float, buy_label: str = "加仓", sell_label: str = "减仓") -> str:
+    """根据目标仓位差额给动作命名；这里只命名，不决定是否成交。"""
+    if target > cur + 0.01:
+        return "买入" if cur <= 0.005 else buy_label
+    if target < cur - 0.01:
+        return "清仓" if target <= 0.005 else sell_label
+    return "持有" if cur > 0.005 else "观望"
 
 def parse_optional_pct(form: Dict[str, Any], key: str) -> Optional[float]:
     raw = form.get(key)
@@ -621,7 +559,8 @@ def parse_signals(form: Dict[str, Any]) -> Dict[str, Any]:
     pe_percentile = parse_optional_pct(form, "pe_percentile")
     roe_pct = parse_optional_pct(form, "roe_pct")
     pb_percentile = parse_optional_pct(form, "pb_percentile")
-    return {
+
+    signals = {
         "market_state": str(form.get("market_state", "sideways")),
         "entry_state": str(form.get("entry_state", "none")),
         "exit_state": str(form.get("exit_state", "none")),
@@ -637,6 +576,30 @@ def parse_signals(form: Dict[str, Any]) -> Dict[str, Any]:
         "pb_percentile": clamp(pb_percentile, 0.0, 100.0) if pb_percentile is not None else None,
         "roe_pct": roe_pct,
     }
+
+    # 给“小因子择时策略”保留自动行情因子。手动表单没有这些字段时为 None；
+    # 自动拉取/回测时 compute_indicators 会填充，策略文件可直接读取。
+    optional_numeric_keys = (
+        "close", "ma20", "ma50", "ma200", "atr14", "atr_pct",
+        "volume_ratio_20d", "return_20d", "return_60d", "return_120d",
+        "volatility_20d", "volatility_60d", "drawdown_252d",
+        "ma50_slope_20d", "ma200_slope_20d", "distance_ma50_pct", "distance_ma200_pct",
+    )
+    for key in optional_numeric_keys:
+        raw = form.get(key)
+        signals[key] = as_float(raw, None) if raw not in (None, "") else None
+
+    # 总体策略专属输入。
+    # 趋势信号策略仍使用 market_state / entry_state / exit_state；
+    # 五维择时和小因子择时使用这些独立字段，避免只是把同一套趋势按钮换个名字。
+    for key in (
+        "five_valuation_vote", "five_fund_vote", "five_tech_vote",
+        "five_sentiment_vote", "five_fundamental_vote", "five_risk_vote",
+        "mini_trend_bias", "mini_structure_bias", "mini_volume_bias", "mini_risk_bias",
+    ):
+        raw = str(form.get(key, "auto") or "auto").strip()
+        signals[key] = raw if raw in {"auto", "-1", "0", "1"} else "auto"
+    return signals
 
 
 def trend_score(signals: Dict[str, Any]) -> int:
@@ -862,14 +825,18 @@ def core_allocation_step_limit(cfg: Dict[str, Any], signals: Dict[str, Any], str
     notes: List[str] = []
     profile = core_asset_profile(cfg)
     strategy_key = str(cfg.get("strategy", "balanced"))
-    if profile:
-        # 底仓补足必须明显快于定投，否则上涨年份会被现金拖累。
-        # 防守/均衡/进攻分别约用 6/4/3 个检查周期补到 60%~80% 区间。
-        base_by_strategy = {"defensive": 0.13, "balanced": 0.22, "aggressive": 0.30}
-    else:
-        base_by_strategy = {"defensive": 0.05, "balanced": 0.08, "aggressive": 0.11}
+    if not advanced_bool(cfg, "trade_step_limit_enabled", True):
+        notes.append("单次操作上限已关闭：本次允许直接调到目标仓位。")
+        return 1.0, notes
 
-    step = base_by_strategy.get(strategy_key, base_by_strategy["balanced"])
+    if profile:
+        default_key = f"core_step_{strategy_key}_pct"
+        default_pct = ADVANCED_PARAM_DEFAULTS.get(default_key, ADVANCED_PARAM_DEFAULTS["core_step_balanced_pct"])
+    else:
+        default_key = f"buy_step_{strategy_key}_pct"
+        default_pct = {"defensive": 5.0, "balanced": 8.0, "aggressive": 11.0}.get(strategy_key, 8.0)
+
+    step = advanced_pct(cfg, default_key, float(default_pct))
     market = str(signals.get("market_state", "sideways"))
     if market == "strong_bull":
         step *= 1.15
@@ -902,9 +869,9 @@ def core_allocation_step_limit(cfg: Dict[str, Any], signals: Dict[str, Any], str
         step *= 0.70 if profile else 0.55
 
     if signals.get("allocation_fill"):
-        label = "长期底仓" if profile else "基础配置"
+        label = "定投增强仓" if profile else "基础配置"
         notes.append(f"{label}补足按配置仓节奏执行，本次最多新增 {pct2(step)}，不按单笔交易止损预算过度压低。")
-    return clamp(step, 0.01, float(strategy.get("buy_step", 0.28))), notes
+    return clamp(step, 0.01, 1.0), notes
 
 
 
@@ -1157,8 +1124,10 @@ def trade_frequency_profile(signals: Dict[str, Any], action: str) -> Tuple[str, 
     return "不操作 / 等待信号", 1.0, notes
 
 
-def dynamic_sell_step_limit(strategy: Dict[str, Any], signals: Dict[str, Any], action: str) -> Tuple[float, List[str]]:
+def dynamic_sell_step_limit(cfg: Dict[str, Any], strategy: Dict[str, Any], signals: Dict[str, Any], action: str) -> Tuple[float, List[str]]:
     """卖出上限动态化：轻微风险少卖，严重风险允许快速退出。"""
+    if not advanced_bool(cfg, "trade_step_limit_enabled", True):
+        return 1.0, ["单次操作上限已关闭：卖出也允许直接调到目标仓位。"]
     base = float(strategy["sell_step"])
     exit_state = signals.get("exit_state", "none")
     profit = signals.get("profit_state", "none")
@@ -1229,6 +1198,33 @@ def buy_opportunity_multiplier(signal_quality: int, expected_r: float, frequency
     mult = clamp(quality_mult * odds_mult * frequency_mult, 0.0, 1.0)
     return mult, notes, reject
 
+
+
+def active_strategy_family_key(cfg: Dict[str, Any]) -> str:
+    """当前总体策略 key。用于把“总体策略方法论”和“参数风格”彻底分开。"""
+    try:
+        return normalise_strategy_family_key(cfg.get("strategy_family"))
+    except Exception:
+        return DEFAULT_STRATEGY_FAMILY
+
+
+def is_trend_signal_family(cfg: Dict[str, Any]) -> bool:
+    """只有趋势信号风控策略才使用入场/破位信号作为硬性交易规则。"""
+    return active_strategy_family_key(cfg) == "trend_signal_control"
+
+
+def strategy_rule_label(signals: Dict[str, Any], fallback: str = "目标仓位模型") -> str:
+    label = str(signals.get("strategy_match_label") or "").strip()
+    return label or fallback
+
+
+def strategy_confidence_hint(signals: Dict[str, Any], fallback: int) -> int:
+    raw = signals.get("strategy_confidence")
+    try:
+        return int(clamp(float(raw), 1, 99))
+    except Exception:
+        return int(fallback)
+
 def raw_target_by_signal(cfg: Dict[str, Any], signals: Dict[str, Any], cur: float) -> Tuple[str, float, str, List[str], int]:
     market = signals["market_state"]
     entry = signals["entry_state"]
@@ -1240,9 +1236,31 @@ def raw_target_by_signal(cfg: Dict[str, Any], signals: Dict[str, Any], cur: floa
     action = "观望"
     matched = "未触发明确信号"
     target = cur
+    is_core_mode = cfg.get("position_mode") == "core_satellite"
+    family_key = active_strategy_family_key(cfg)
+    trend_family = family_key == "trend_signal_control"
+    # 定投增强策略永远使用总体策略目标模型；非趋势类总体策略在纯交易仓模式下也必须使用自己的目标模型，
+    # 否则“五维/小因子”等策略会被旧的趋势交易规则覆盖，看起来像切换不生效。
+    use_target_model = is_core_mode or not trend_family
 
-    # 1. 硬退出优先
+    # 先生成“总体策略目标仓位”，再由执行层决定是否交易。
+    core_target = floor
+    core_notes: List[str] = []
+    if use_target_model:
+        signals["core_target_model"] = True
+        core_target, core_notes = core_target_weight(cfg, signals)
+
+    # 1. 硬退出优先。定投增强策略不再把 200日线/50日线 当作一键清零，
+    # 而是切换到更低的目标仓位；纯交易仓仍沿用原来的防守逻辑。
     if exit_state == "hit_stop":
+        if use_target_model:
+            action = target_action_from_delta(cur, core_target, sell_label="减仓")
+            target = core_target
+            matched = "初始止损软风控（降低交易仓）"
+            confidence = 72
+            reason.append("定投增强策略下，初始止损只作为交易仓降温信号；核心配置仓是否大幅下降由50/200日线和熊市状态确认。")
+            reason.extend(core_notes)
+            return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
         action = "清仓"
         target = floor
         matched = "跌破初始止损"
@@ -1250,7 +1268,15 @@ def raw_target_by_signal(cfg: Dict[str, Any], signals: Dict[str, Any], cur: floa
         reason.append("初始止损被触发，交易失败，先退出交易仓。")
         return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
 
-    if exit_state == "below_200":
+    if exit_state == "below_200" and trend_family:
+        if is_core_mode:
+            target = min(cur, core_target)
+            action = target_action_from_delta(cur, target, sell_label="减仓")
+            matched = "跌破200日线（核心仓防守目标）"
+            confidence = 82
+            reason.append("定投增强策略下，跌破200日线代表进入防守目标仓位；风险信号确认前不反向补仓，只在当前仓位高于防守目标时减仓。")
+            reason.extend(core_notes)
+            return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
         action = "清仓"
         target = floor
         matched = "跌破200日线"
@@ -1258,7 +1284,15 @@ def raw_target_by_signal(cfg: Dict[str, Any], signals: Dict[str, Any], cur: floa
         reason.append("200日线是大趋势过滤线，跌破后只保留动态防守仓位，严重时可以接近空仓。")
         return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
 
-    if exit_state == "below_50":
+    if exit_state == "below_50" and trend_family:
+        if is_core_mode:
+            target = min(cur, core_target)
+            action = target_action_from_delta(cur, target, sell_label="减仓")
+            matched = "跌破50日线（降低交易仓）"
+            confidence = 76
+            reason.append("50日线失守说明中期趋势降温，定投增强策略降低交易仓；若当前仓位低于目标，则先持有观察，不在风险信号当天补仓。")
+            reason.extend(core_notes)
+            return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
         action = "大减仓"
         target = max(floor, min(cur * 0.45, 0.30))
         matched = "跌破50日线"
@@ -1266,7 +1300,15 @@ def raw_target_by_signal(cfg: Dict[str, Any], signals: Dict[str, Any], cur: floa
         reason.append("50日线失守，中期趋势破坏，先把仓位降到防守状态。")
         return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
 
-    if exit_state == "failed_breakout":
+    if exit_state == "failed_breakout" and trend_family:
+        if is_core_mode:
+            target = min(cur, core_target)
+            action = target_action_from_delta(cur, target, sell_label="减仓")
+            matched = "突破失败（交易仓降速）"
+            confidence = 70
+            reason.append("突破失败只削减交易仓，不把定投增强仓当成短线突破仓处理；若当前仓位已经低于目标，则不反向补仓。")
+            reason.extend(core_notes)
+            return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
         action = "减仓"
         target = max(floor, cur * 0.65)
         matched = "突破失败"
@@ -1274,76 +1316,82 @@ def raw_target_by_signal(cfg: Dict[str, Any], signals: Dict[str, Any], cur: floa
         reason.append("突破后跌回突破位，说明这次入场信号失效，需要降低风险。")
         return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
 
-    # 2. 止盈：只在已有盈利和仓位时触发，不猜顶部。
+    # 2. 止盈：定投增强策略只止盈交易仓，不把核心配置仓全部卖掉。
     if profit == "profit_3r" and cur > 0:
         action = "止盈"
-        target = max(floor, cur * 0.50)
+        target = max(core_target if is_core_mode else floor, cur * 0.50)
         matched = "盈利达到3R"
         confidence = 74
-        reason.append("盈利达到3R，先兑现一半，剩余仓位用移动止损跟随趋势。")
+        reason.append("盈利达到3R，先兑现交易仓，剩余仓位用移动止损跟随趋势。")
+        if use_target_model:
+            reason.extend(core_notes)
         return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
 
     if profit == "profit_2r" and cur > 0 and (signals["upper_shadow"] or signals["far_from_ma"] or signals["failed_close"]):
         action = "止盈"
-        target = max(floor, cur * 0.67)
+        target = max(core_target if is_core_mode else floor, cur * 0.67)
         matched = "盈利达到2R + 风险形态"
         confidence = 72
-        reason.append("盈利达到2R且出现冲高/远离均线/未站稳，先兑现约三分之一。")
+        reason.append("盈利达到2R且出现冲高/远离均线/未站稳，先兑现交易仓。")
+        if use_target_model:
+            reason.extend(core_notes)
         return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
 
-    if exit_state == "below_20":
+    if exit_state == "below_20" and trend_family:
+        if is_core_mode:
+            action = target_action_from_delta(cur, core_target, buy_label="加仓", sell_label="减仓")
+            # 20日线只是短线信号；如果模型目标低于当前，不主动卖出，只停止追买。
+            if action in {"减仓", "清仓"}:
+                action = "持有" if cur > 0 else "观望"
+                target = cur
+                matched = "跌破20日线（暂停追买）"
+                reason.append("20日线失守只代表短线降温，暂不为了短线波动卖出定投增强仓。")
+            else:
+                target = core_target
+                matched = "跌破20日线（按目标仓位降速补足）"
+                if action in {"买入", "加仓"}:
+                    signals["allocation_fill"] = True
+                    signals["allocation_soft_pullback"] = True
+                reason.append("价格跌破20日线但中长期趋势未确认破坏，定投增强仓仍可按降速目标补足。")
+            confidence = 62
+            reason.extend(core_notes)
+            return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
         matched = "跌破20日线"
         confidence = 66
-        if cfg.get("position_mode") == "core_satellite":
-            if cur > floor + 0.01:
-                action = "持有"
-                target = cur
-                matched = "跌破20日线（长期底仓不因短线回落减仓）"
-                reason.append("长期底仓+交易仓模式下，20日线失守只视为短线降温，不直接卖出核心仓；等待50日线/200日线确认。")
-            elif floor > cur + 0.01 and market in {"sideways", "above_200", "strong_bull"} and not signals.get("market_risk"):
-                signals["allocation_fill"] = True
-                signals["allocation_soft_pullback"] = True
-                action = "加仓"
-                target = floor
-                matched = "回落中补足长期底仓"
-                confidence = 62
-                reason.append("价格跌破20日线但中长期趋势尚未破坏，长期底仓仍按降速节奏补足；不把短线回落误判为趋势失败。")
-            else:
-                action = "持有" if cur > 0 else "观望"
-                target = cur
-                matched = "跌破20日线（等待确认）"
-                reason.append("20日线失守属于短线弱化，当前仓位不高，先等待50日线确认。")
+        if cur > floor:
+            action = "减仓"
+            target = max(floor, cur * 0.75)
+            reason.append("20日线失守属于短线弱化，先减一部分，等待50日线确认。")
         else:
-            if cur > floor:
-                action = "减仓"
-                target = max(floor, cur * 0.75)
-                reason.append("20日线失守属于短线弱化，先减一部分，等待50日线确认。")
+            action = "持有" if cur > 0 else "观望"
+            target = cur
+            matched = "跌破20日线（当前仓位已低于防守目标）"
+            reason.append("20日线失守，但当前仓位已经低于系统防守仓位，本次不追加卖出，也不因防守仓位差额买入。")
+        return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
+
+    # 3. 总体策略目标仓位模型。
+    if use_target_model:
+        target = core_target
+        action = target_action_from_delta(cur, target, buy_label="加仓", sell_label="减仓")
+        base_rule = strategy_rule_label(signals, "目标仓位模型")
+        confidence = strategy_confidence_hint(signals, 68 if action in {"买入", "加仓"} else 62)
+        if action in {"买入", "加仓"}:
+            signals["allocation_fill"] = True
+            matched = f"{base_rule}：补足目标仓位"
+            if trend_family:
+                reason.append("定投增强策略模式按目标仓位建设核心仓，不再等短线买点才入场。")
             else:
-                action = "持有" if cur > 0 else "观望"
-                target = cur
-                matched = "跌破20日线（当前仓位已低于防守目标）"
-                reason.append("20日线失守，但当前仓位已经低于系统防守仓位，本次不追加卖出，也不因防守仓位差额买入。")
+                reason.append("当前总体策略直接输出目标仓位；入场/破位信号只作为该策略的输入因子，不再套用趋势策略的硬规则。")
+        elif action in {"减仓", "清仓"}:
+            matched = f"{base_rule}：降低到目标仓位"
+            reason.append("目标仓位低于当前仓位，按当前总体策略降低交易仓。")
+        else:
+            matched = f"{base_rule}：维持区间"
+            reason.append("当前仓位已经接近当前总体策略目标仓位，不做机械再平衡。")
+        reason.extend(core_notes)
         return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
 
-    # 3. 长期底仓 + 交易仓：基础配置仓补足。
-    # 这不是“交易追买”，而是当趋势未坏、没有卖出信号、也没有明显追高风险时，
-    # 允许把极低仓位逐步补到动态防守仓位附近，避免宽基/核心资产长期只有个位数仓位。
-    if (
-        cfg.get("position_mode") == "core_satellite"
-        and exit_state == "none"
-        and market in {"sideways", "above_200", "strong_bull"}
-        and not signals.get("market_risk")
-        and floor > cur + 0.01
-    ):
-        signals["allocation_fill"] = True
-        action = "加仓"
-        target = floor
-        matched = "补足长期底仓"
-        confidence = 65 if market == "sideways" else 70
-        reason.append("长期底仓+交易仓模式下，只要趋势没有破坏且当前仓位低于动态底仓，就按检查周期持续补足底仓；入场形态、上影线、远离均线只影响补仓速度，不再直接阻断底仓建设。")
-        return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
-
-    # 4. 大趋势不利时，不主动新增买入。
+    # 4. 纯交易仓：趋势信号风控策略保留原趋势交易逻辑。
     if market == "bear":
         action = "观望" if cur <= floor else "减仓"
         target = min(cur, floor)
@@ -1352,7 +1400,6 @@ def raw_target_by_signal(cfg: Dict[str, Any], signals: Dict[str, Any], cur: floa
         reason.append("价格在200日线下方且200日线向下，不做新增买入。")
         return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
 
-    # 5. 入场 / 加仓。不按标的类型设上限，统一以计划资金100%为上限。
     if market == "below_200":
         if entry == "reversal_50":
             action = "试仓"
@@ -1450,7 +1497,19 @@ def compute_decision(cfg: Dict[str, Any], form: Dict[str, Any]) -> Decision:
     profit_pct = as_float(cfg.get("current_profit_pct"), 0.0)
     stop_pct = signals.get("stop_loss_pct", 0.0) * 100
     if cur > 0 and stop_pct > 0 and profit_pct <= -stop_pct:
-        signals["exit_state"] = "hit_stop"
+        if core_asset_profile(cfg):
+            # 【定投增强策略】不能套用短线“初始止损=硬退出”。
+            # 否则会出现刚补到 50%~60%，小幅回撤后又砍到 18% 的反复打脸，
+            # 解除单次操作上限后这种来回会更剧烈。这里把它降级为软风控：
+            # - 若已经跌破 200 日线，保留原 below_200 防守；
+            # - 若只是短线回撤，把风险状态提高到 below_50，降低交易仓但不硬砍核心仓。
+            prev_exit = str(signals.get("exit_state", "none"))
+            if prev_exit in {"none", "below_20", "failed_breakout"}:
+                signals["exit_state"] = "below_50"
+            signals["stop_triggered_auto"] = True
+            signals["core_stop_softened"] = True
+        else:
+            signals["exit_state"] = "hit_stop"
 
     risk, risk_notes = risk_score(signals, cfg)
     t_score = trend_score(signals)
@@ -1468,21 +1527,24 @@ def compute_decision(cfg: Dict[str, Any], form: Dict[str, Any]) -> Decision:
     warnings.extend(frequency_notes)
 
     # 量价只做确认，不主导。
-    if signals["volume_confirm"] and action in {"买入", "加仓", "重仓"}:
-        raw_target += 0.03
-        reasons.append("突破时放量，作为确认项小幅加分。")
-    if signals["pullback_volume_dry"] and action in {"试仓", "买入", "加仓"}:
-        raw_target += 0.02
-        reasons.append("回踩缩量，说明抛压较小，作为辅助确认。")
-    if signals["upper_shadow"] and action in {"买入", "加仓", "重仓"}:
-        raw_target -= 0.06
-        warnings.append("出现长上影/冲高回落，新买入仓位被压低。")
-    if signals["failed_close"] and action in {"买入", "加仓", "重仓"}:
-        raw_target -= 0.06
-        warnings.append("未站稳关键价位，新增仓位被压低。")
-    if signals["far_from_ma"] and action in {"买入", "加仓", "重仓"}:
-        raw_target -= 0.05
-        warnings.append("价格远离均线，避免追高，新增仓位被压低。")
+    # 目标仓位模型类策略（定投增强、五维、小因子）已经在各自策略文件中处理量价/情绪/风险，
+    # 这里不再二次叠加，避免不同总体策略最后又被同一套趋势确认规则拉回同质化。
+    if not signals.get("core_target_model"):
+        if signals["volume_confirm"] and action in {"买入", "加仓", "重仓"}:
+            raw_target += 0.03
+            reasons.append("突破时放量，作为确认项小幅加分。")
+        if signals["pullback_volume_dry"] and action in {"试仓", "买入", "加仓"}:
+            raw_target += 0.02
+            reasons.append("回踩缩量，说明抛压较小，作为辅助确认。")
+        if signals["upper_shadow"] and action in {"买入", "加仓", "重仓"}:
+            raw_target -= 0.06
+            warnings.append("出现长上影/冲高回落，新买入仓位被压低。")
+        if signals["failed_close"] and action in {"买入", "加仓", "重仓"}:
+            raw_target -= 0.06
+            warnings.append("未站稳关键价位，新增仓位被压低。")
+        if signals["far_from_ma"] and action in {"买入", "加仓", "重仓"}:
+            raw_target -= 0.05
+            warnings.append("价格远离均线，避免追高，新增仓位被压低。")
 
     val_adj_raw, val_notes = valuation_penalty_bonus(signals, action)
     q_adj_raw, q_notes = quality_bonus(signals, action)
@@ -1497,54 +1559,70 @@ def compute_decision(cfg: Dict[str, Any], form: Dict[str, Any]) -> Decision:
     applied_val_adj = 0.0
     applied_q_adj = 0.0
 
-    if action in buy_actions:
+    if signals.get("core_target_model"):
+        # 目标仓位模型已经在 core_target_weight() 中连续纳入 PE/PB/ROE，
+        # 这里不再二次叠加估值/质量修正，避免核心配置仓被重复压低。
+        if val_notes:
+            warnings.append("估值已纳入目标仓位模型，本次不再二次修正目标仓位。")
+        warnings.extend(val_notes)
+        if q_notes:
+            warnings.append("质量指标已纳入目标仓位模型，本次不再二次修正目标仓位。")
+            warnings.extend(q_notes)
+    elif action in buy_actions:
         applied_val_adj = val_adj_raw
         applied_q_adj = q_adj_raw
         raw_target += applied_val_adj + applied_q_adj
+        warnings.extend(val_notes)
+        warnings.extend(q_notes)
     elif action in sell_actions:
         applied_val_adj = min(val_adj_raw, 0.0)
         raw_target = max(floor, raw_target + applied_val_adj)
+        warnings.extend(val_notes)
+        if q_notes and signals.get("roe_pct") is not None:
+            warnings.append("ROE仅作为买入质量修正；当前不是新增仓位信号，因此不改变目标仓位。")
     else:
         if val_notes:
             warnings.append("估值仅作为新增仓位刹车；未出现破位/止盈信号时，不单独触发减仓。")
-
-    warnings.extend(val_notes)
-    if action in buy_actions:
-        warnings.extend(q_notes)
-    elif q_notes and signals.get("roe_pct") is not None:
-        warnings.append("ROE仅作为买入质量修正；当前不是新增仓位信号，因此不改变目标仓位。")
+        warnings.extend(val_notes)
+        if q_notes and signals.get("roe_pct") is not None:
+            warnings.append("ROE仅作为买入质量修正；当前不是新增仓位信号，因此不改变目标仓位。")
 
     is_allocation_fill = bool(signals.get("allocation_fill"))
     if is_allocation_fill:
         base_buy_step_limit, allocation_step_notes = core_allocation_step_limit(cfg, signals, strategy)
         warnings.extend(allocation_step_notes)
     else:
-        base_buy_step_limit = min(float(strategy["buy_step"]), r_cap)
+        base_buy_step_limit = 1.0 if not advanced_bool(cfg, "trade_step_limit_enabled", True) else min(float(strategy["buy_step"]), r_cap)
     buy_step_limit = base_buy_step_limit
     if action in buy_actions:
-        buy_mult, buy_mult_notes = buy_step_sensitivity(signals)
-        opp_mult, opp_notes, reject_for_odds = buy_opportunity_multiplier(signal_quality, expected_r, frequency_mult)
-        if is_allocation_fill:
-            # 底仓补足不是赔率型短线交易。它的核心目标是“比无脑定投更早建立长期暴露”，
-            # 因此不再被信号质量/赔率/频率二次打折；估值、趋势、风险降速已在
-            # core_allocation_step_limit 中完成。
-            buy_step_limit = base_buy_step_limit
+        if not advanced_bool(cfg, "trade_step_limit_enabled", True):
+            buy_step_limit = 1.0
             reject_for_odds = False
+            warnings.append("单次操作上限已关闭：买入允许直接调到目标仓位。")
         else:
-            buy_step_limit = base_buy_step_limit * buy_mult * opp_mult
-        if buy_mult < 0.999 and base_buy_step_limit > 0 and not is_allocation_fill:
-            warnings.extend(buy_mult_notes)
-        if opp_mult < 0.999 and base_buy_step_limit > 0 and not is_allocation_fill:
-            warnings.extend(opp_notes)
-        if reject_for_odds:
-            raw_target = cur
-            reasons.append("信号质量/赔率过滤未通过，本次不新增交易仓。")
-    sell_step_limit, sell_limit_notes = dynamic_sell_step_limit(strategy, signals, action)
+            buy_mult, buy_mult_notes = buy_step_sensitivity(signals)
+            opp_mult, opp_notes, reject_for_odds = buy_opportunity_multiplier(signal_quality, expected_r, frequency_mult)
+            if is_allocation_fill:
+                # 底仓补足不是赔率型短线交易。它的核心目标是“比无脑定投更早建立长期暴露”，
+                # 因此不再被信号质量/赔率/频率二次打折；估值、趋势、风险降速已在
+                # core_allocation_step_limit 中完成。
+                buy_step_limit = base_buy_step_limit
+                reject_for_odds = False
+            else:
+                buy_step_limit = base_buy_step_limit * buy_mult * opp_mult
+            if buy_mult < 0.999 and base_buy_step_limit > 0 and not is_allocation_fill:
+                warnings.extend(buy_mult_notes)
+            if opp_mult < 0.999 and base_buy_step_limit > 0 and not is_allocation_fill:
+                warnings.extend(opp_notes)
+            if reject_for_odds:
+                raw_target = cur
+                reasons.append("信号质量/赔率过滤未通过，本次不新增交易仓。")
+    sell_step_limit, sell_limit_notes = dynamic_sell_step_limit(cfg, strategy, signals, action)
     warnings.extend(sell_limit_notes)
 
     target = raw_target
     if action in {"试仓", "买入", "加仓", "重仓"}:
-        if r_cap <= 0 and not is_allocation_fill:
+        if r_cap <= 0 and not is_allocation_fill and advanced_bool(cfg, "trade_step_limit_enabled", True):
             target = cur
             action = "观望" if cur <= 0 else "持有"
             confidence = min(confidence, 54)
@@ -1723,8 +1801,9 @@ def decision_to_payload(cfg: Dict[str, Any], result: Decision) -> Dict[str, Any]
         {"label": "当前持仓", "value": money(as_float(cfg.get("current_position_amount"), 0.0))},
         {"label": "目标持仓", "value": money(amount["target_amount"])},
         {"label": "标的", "value": f"{cfg.get('symbol_name') or '--'} {cfg.get('symbol') or ''}".strip(), "wide": True},
-        {"label": "策略", "value": f"{strategy['name']}：{strategy['desc']}", "wide": True},
-        {"label": "仓位模式", "value": "长期底仓 + 交易仓" if cfg.get("position_mode") == "core_satellite" else "纯交易仓", "wide": True},
+        {"label": "总体策略", "value": strategy_family_summary(cfg).replace("<br>", " / "), "wide": True},
+        {"label": "参数风格", "value": f"{strategy['name']}：{strategy['desc']}", "wide": True},
+        {"label": "仓位模式", "value": "定投增强策略" if cfg.get("position_mode") == "core_satellite" else "纯交易仓", "wide": True},
         {"label": "命中规则", "value": result.matched_rule, "wide": True},
     ]
 
@@ -3210,7 +3289,7 @@ def fetch_akshare_index_valuation_series(symbol: str, asset_kind: str, options: 
     except Exception as e:
         raise ValueError(f"{e}；AKShare/乐咕历史指数估值诊断：" + "；".join(diagnostics[-24:]))
 
-def fetch_historical_valuation_series(symbol: str, market: str, asset_kind: str, cfg: Dict[str, Any], symbol_name: str = "") -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
+def fetch_historical_valuation_series_uncached(symbol: str, market: str, asset_kind: str, cfg: Dict[str, Any], symbol_name: str = "") -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
     """回测用历史估值序列。优先国内指数/ETF/基金映射；A股个股尝试乐咕。"""
     options = fetch_options_from_cfg(cfg)
     market_u = str(market or "auto").upper()
@@ -3996,7 +4075,36 @@ def compute_indicators(records: List[Dict[str, float]], fundamentals: Dict[str, 
     ma20 = sma(closes, 20)
     ma50 = sma(closes, 50)
     ma200 = sma(closes, 200)
+    ma50_prev = sma(closes[:-20], 50) if len(closes) >= 70 else None
     ma200_prev = sma(closes[:-20], 200) if len(closes) >= 220 else None
+
+    def period_return(n: int) -> Optional[float]:
+        if len(closes) <= n or closes[-n - 1] <= 0:
+            return None
+        return close / closes[-n - 1] - 1.0
+
+    def annualized_vol(n: int) -> Optional[float]:
+        if len(closes) <= n:
+            return None
+        rets: List[float] = []
+        window = closes[-(n + 1):]
+        for j in range(1, len(window)):
+            prev = window[j - 1]
+            if prev > 0:
+                rets.append(window[j] / prev - 1.0)
+        if len(rets) < 2:
+            return None
+        mean = sum(rets) / len(rets)
+        var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+        return math.sqrt(max(var, 0.0)) * math.sqrt(252.0)
+
+    def slope_pct(current: Optional[float], previous: Optional[float]) -> Optional[float]:
+        if current is None or previous is None or previous <= 0:
+            return None
+        return current / previous - 1.0
+
+    high_252 = max(closes[-252:]) if len(closes) >= 60 else max(closes)
+    drawdown_252d = close / high_252 - 1.0 if high_252 > 0 else None
 
     trs: List[float] = []
     for i in range(1, len(records)):
@@ -4071,8 +4179,19 @@ def compute_indicators(records: List[Dict[str, float]], fundamentals: Dict[str, 
         "ma50": round(ma50, 4) if ma50 else None,
         "ma200": round(ma200, 4) if ma200 else None,
         "atr14": round(atr14, 4) if atr14 else None,
+        "atr_pct": round((atr14 / close * 100.0), 2) if atr14 and close else None,
         "stop_loss_pct": round(clamp(stop_loss_pct, 1.0, 80.0), 2),
         "volume_ratio_20d": round(volume_ratio, 2) if volume_ratio else None,
+        "return_20d": round(period_return(20) * 100.0, 2) if period_return(20) is not None else None,
+        "return_60d": round(period_return(60) * 100.0, 2) if period_return(60) is not None else None,
+        "return_120d": round(period_return(120) * 100.0, 2) if period_return(120) is not None else None,
+        "volatility_20d": round(annualized_vol(20) * 100.0, 2) if annualized_vol(20) is not None else None,
+        "volatility_60d": round(annualized_vol(60) * 100.0, 2) if annualized_vol(60) is not None else None,
+        "drawdown_252d": round(drawdown_252d * 100.0, 2) if drawdown_252d is not None else None,
+        "ma50_slope_20d": round(slope_pct(ma50, ma50_prev) * 100.0, 2) if slope_pct(ma50, ma50_prev) is not None else None,
+        "ma200_slope_20d": round(slope_pct(ma200, ma200_prev) * 100.0, 2) if slope_pct(ma200, ma200_prev) is not None else None,
+        "distance_ma50_pct": round((close / ma50 - 1.0) * 100.0, 2) if ma50 else None,
+        "distance_ma200_pct": round((close / ma200 - 1.0) * 100.0, 2) if ma200 else None,
         "market_state": market_state,
         "entry_state": entry_state,
         "exit_state": exit_state,
@@ -4126,8 +4245,8 @@ def enrich_indicators_with_user_position(indicators: Dict[str, Any], cfg: Dict[s
 
     # 自动触发【初始止损】的唯一量化条件：
     # 有持仓，并且当前持仓盈亏已经跌穿买入前设定的止损距离。
-    # 但核心宽基的 core_satellite 模式不把底仓当作一笔短线交易来硬清仓；
-    # 初始止损只压低交易增强仓，底仓由均线/系统风险逐步降速。
+    # 但核心宽基的 core_satellite 模式不把增强仓当作一笔短线交易来硬清仓；
+    # 初始止损只压低交易增强仓，增强仓由均线/系统风险逐步降速。
     if current_amount > 0 and stop_pct > 0 and profit_pct <= -stop_pct:
         if core_asset_profile(cfg):
             if indicators.get("exit_state") == "none":
@@ -4364,6 +4483,14 @@ BACKTEST_METRIC_NOTES: Dict[str, str] = {
     "平均仓位": "回测期间平均持仓暴露。",
     "换手率": "累计成交金额 / 初始资金。",
     "期末权益": "回测结束时策略账户权益。",
+
+    "策略准入结论": "用于判断这套策略是否值得进模拟盘：同时输给定投和持有且没有明显降低回撤时，应先暂停实盘，只做研究。",
+    "相对定投收益差": "策略总收益 - 定投策略总收益。为负表示策略输给定投。",
+    "相对持有收益差": "策略总收益 - 买入持有总收益。为负表示策略输给长期持有。",
+    "相对定投回撤改善": "定投最大回撤绝对值 - 策略最大回撤绝对值。为正表示策略比定投更抗跌。",
+    "相对持有回撤改善": "买入持有最大回撤绝对值 - 策略最大回撤绝对值。为正表示策略比持有更抗跌。",
+    "估算交易成本拖累": "按换手率、手续费和滑点粗略估计的收益拖累，用于判断是否过度交易。",
+    "估算现金拖累": "当买入持有收益为正时，用平均低仓位粗略估计错过上涨的收益拖累。",
     "估值序列最新日期": "历史估值序列中用于对比的最新日期。",
     "估值页面最新日期": "蛋卷（雪球）detail 当前页面估值接口返回的对比日期；若接口未提供则显示 --。",
     "历史PE百分位": "用历史 PE 序列本地计算得到的最新 PE 百分位。",
@@ -4405,12 +4532,479 @@ def normalize_history_records(records: List[Dict[str, Any]]) -> List[Dict[str, A
             high = as_float(r.get("high", r.get("High", r.get("最高"))), close)
             low = as_float(r.get("low", r.get("Low", r.get("最低"))), close)
             volume = as_float(r.get("volume", r.get("Volume", r.get("成交量"))), 0.0)
-            cleaned.append({"date": d, "open": open_, "high": high, "low": low, "close": close, "volume": volume})
+            amount = as_float(r.get("amount", r.get("Amount", r.get("成交额"))), 0.0)
+            cleaned.append({"date": d, "open": open_, "high": high, "low": low, "close": close, "volume": volume, "amount": amount})
         except Exception:
             continue
     dedup = {r["date"]: r for r in cleaned}
     return [dedup[k] for k in sorted(dedup)]
 
+
+
+
+HISTORY_PRICE_RAW_COLUMNS = ["date", "open", "high", "low", "close", "volume", "amount"]
+HISTORY_PRICE_DERIVED_COLUMNS = [
+    "ma20", "ma50", "ma200", "atr14", "atr_pct", "return_20d", "return_60d", "return_120d",
+    "volatility_20d", "volatility_60d", "drawdown_252d", "ma50_slope_20d", "ma200_slope_20d",
+    "distance_ma50_pct", "distance_ma200_pct", "volume_ratio_20d",
+]
+HISTORY_VALUATION_COLUMNS = [
+    "date", "current_pe", "pe_percentile", "current_pb", "pb_percentile", "roe_pct",
+    "valuation_source", "valuation_note", "valuation_extra_note", "valuation_date",
+]
+
+
+def history_cache_enabled(cfg: Dict[str, Any]) -> bool:
+    """默认开启历史落盘缓存；除非配置里显式写 history_cache_enabled=false。"""
+    value = cfg.get("history_cache_enabled", True)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "off", "no", "关闭", "否"}
+    return bool(value)
+
+
+def _cache_safe_part(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "unknown"
+    raw = re.sub(r"\s+", "_", raw)
+    raw = re.sub(r"[^0-9A-Za-z\u4e00-\u9fa5_.-]+", "_", raw)
+    return raw[:80] or "unknown"
+
+
+def _history_cache_file(folder: str, *parts: Any) -> str:
+    os.makedirs(folder, exist_ok=True)
+    name = "__".join(_cache_safe_part(p) for p in parts) + ".csv"
+    return os.path.join(folder, name)
+
+
+def _history_meta_path(csv_path: str) -> str:
+    return csv_path[:-4] + ".meta.json" if csv_path.endswith(".csv") else csv_path + ".meta.json"
+
+
+def _read_history_meta(csv_path: str) -> Dict[str, Any]:
+    try:
+        with open(_history_meta_path(csv_path), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_history_meta(csv_path: str, meta: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+        payload = dict(meta or {})
+        payload["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(_history_meta_path(csv_path), "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _read_history_csv(path: str) -> List[Dict[str, Any]]:
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8-sig", newline="") as f:
+            rows = list(csv.DictReader(f))
+    except Exception:
+        return []
+    return rows
+
+
+def _write_history_csv(path: str, rows: List[Dict[str, Any]], columns: List[str]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    all_columns = list(columns)
+    for row in rows:
+        for key in row.keys():
+            if key not in all_columns:
+                all_columns.append(key)
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=all_columns, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in all_columns})
+
+
+def _date_range_of_rows(rows: List[Dict[str, Any]]) -> Tuple[Optional[date], Optional[date]]:
+    dates: List[date] = []
+    for row in rows:
+        try:
+            dates.append(parse_date_safe(row.get("date") or row.get("日期")))
+        except Exception:
+            continue
+    if not dates:
+        return None, None
+    return min(dates), max(dates)
+
+
+def _filter_history_rows(rows: List[Dict[str, Any]], start: date, end: date) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            ds = parse_date_safe(row.get("date") or row.get("日期"))
+        except Exception:
+            continue
+        if start <= ds <= end:
+            out.append(row)
+    return sorted(out, key=lambda r: str(r.get("date") or r.get("日期") or ""))
+
+
+def _merge_history_rows(*groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+    for rows in groups:
+        for row in rows or []:
+            try:
+                ds = parse_date_safe(row.get("date") or row.get("日期")).isoformat()
+            except Exception:
+                continue
+            item = dict(merged.get(ds, {}))
+            # 新数据覆盖旧数据中的空值，也覆盖原始行情字段，确保网络补抓后的修正可以生效。
+            for key, value in row.items():
+                if value not in (None, "") or key not in item:
+                    item[key] = value
+            item["date"] = ds
+            merged[ds] = item
+    return [merged[k] for k in sorted(merged)]
+
+
+def _cache_missing_ranges(cached_rows: List[Dict[str, Any]], start: date, end: date) -> List[Tuple[date, date]]:
+    min_d, max_d = _date_range_of_rows(cached_rows)
+    if min_d is None or max_d is None:
+        return [(start, end)]
+    ranges: List[Tuple[date, date]] = []
+    if start < min_d:
+        ranges.append((start, min(end, min_d - timedelta(days=1))))
+    if end > max_d:
+        ranges.append((max(start, max_d + timedelta(days=1)), end))
+    return [(a, b) for a, b in ranges if a <= b]
+
+
+def _expand_missing_range_for_fetch(
+    missing_start: date,
+    missing_end: date,
+    cached_rows: List[Dict[str, Any]],
+    requested_start: date,
+    requested_end: date,
+    is_fund: bool,
+) -> Tuple[date, date]:
+    """短缺口也要能补。
+
+    旧的网络抓取函数会要求至少 20/60 条记录；如果只缺最近三天，直接抓三天会被判定数据太少。
+    因此这里允许向缓存重叠区扩展一小段，只补必要方向附近的数据，不回到整段重抓。
+    """
+    min_d, max_d = _date_range_of_rows(cached_rows)
+    buffer_days = 90 if is_fund else 180
+    fetch_start, fetch_end = missing_start, missing_end
+    if min_d and missing_end < min_d:
+        fetch_end = min(requested_end, missing_end + timedelta(days=buffer_days))
+    if max_d and missing_start > max_d:
+        fetch_start = max(requested_start, missing_start - timedelta(days=buffer_days))
+    return fetch_start, fetch_end
+
+
+def _price_cache_key(symbol: str, market: str, source: str, asset_kind: str, cfg: Dict[str, Any]) -> Tuple[str, str, str, str, str]:
+    return (
+        "price_v2",
+        str(market or "auto").upper(),
+        str(resolve_asset_kind(symbol, market, asset_kind, str(cfg.get("symbol_name") or "")) or "auto").lower(),
+        normalize_backtest_source(source, market),
+        str(symbol or "").strip().upper() if re.search(r"[A-Za-z]", str(symbol or "")) else re.sub(r"\D", "", str(symbol or "")) or str(symbol or "").strip(),
+    )
+
+
+def _valuation_cache_key(symbol: str, market: str, asset_kind: str, cfg: Dict[str, Any], symbol_name: str) -> Tuple[str, str, str, str, str, str]:
+    return (
+        "valuation_v2",
+        str(market or "auto").upper(),
+        str(resolve_asset_kind(symbol, market, asset_kind, symbol_name) or "auto").lower(),
+        str(cfg.get("valuation_method") or "system_calc"),
+        str(symbol or "").strip().upper() if re.search(r"[A-Za-z]", str(symbol or "")) else re.sub(r"\D", "", str(symbol or "")) or str(symbol or "").strip(),
+        _cache_safe_part(symbol_name or "noname"),
+    )
+
+
+def _as_optional_float_cell(value: Any) -> Any:
+    if value in (None, ""):
+        return ""
+    try:
+        v = float(value)
+        if math.isnan(v) or math.isinf(v):
+            return ""
+        return round(v, 6)
+    except Exception:
+        return value
+
+
+def enrich_history_records_for_cache(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """保存行情/净值时同步写入常用技术衍生字段。
+
+    回测仍会按当日以前数据动态计算信号，避免未来函数；这些字段主要用于下次读取、人工检查、
+    以及后续策略直接复用缓存表，不必重复从网络拉取。每一行的指标只使用该行及以前的数据。
+    """
+    base = normalize_history_records(records)
+    closes = [float(r["close"]) for r in base]
+    highs = [float(r.get("high") or r.get("close") or 0.0) for r in base]
+    lows = [float(r.get("low") or r.get("close") or 0.0) for r in base]
+    vols = [float(r.get("volume") or 0.0) for r in base]
+
+    def sma_at(values: List[float], idx: int, n: int) -> Optional[float]:
+        if idx + 1 < n:
+            return None
+        return sum(values[idx - n + 1: idx + 1]) / n
+
+    def ret_at(idx: int, n: int) -> Optional[float]:
+        if idx < n or closes[idx - n] <= 0:
+            return None
+        return closes[idx] / closes[idx - n] - 1.0
+
+    def ann_vol_at(idx: int, n: int) -> Optional[float]:
+        if idx < n:
+            return None
+        rets: List[float] = []
+        for j in range(idx - n + 1, idx + 1):
+            prev = closes[j - 1]
+            if prev > 0:
+                rets.append(closes[j] / prev - 1.0)
+        if len(rets) < 2:
+            return None
+        mean = sum(rets) / len(rets)
+        var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+        return math.sqrt(max(var, 0.0)) * math.sqrt(252.0)
+
+    trs: List[float] = [0.0]
+    for idx in range(1, len(base)):
+        prev_close = closes[idx - 1]
+        trs.append(max(highs[idx] - lows[idx], abs(highs[idx] - prev_close), abs(lows[idx] - prev_close)))
+
+    out: List[Dict[str, Any]] = []
+    for idx, row in enumerate(base):
+        close = closes[idx]
+        ma20 = sma_at(closes, idx, 20)
+        ma50 = sma_at(closes, idx, 50)
+        ma200 = sma_at(closes, idx, 200)
+        ma50_prev = sma_at(closes, idx - 20, 50) if idx >= 20 else None
+        ma200_prev = sma_at(closes, idx - 20, 200) if idx >= 20 else None
+        atr14 = sum(trs[idx - 13: idx + 1]) / 14 if idx >= 14 else None
+        high_252 = max(closes[max(0, idx - 251): idx + 1]) if idx >= 0 else None
+        vol20 = sum(vols[idx - 19: idx + 1]) / 20 if idx >= 19 and any(vols[idx - 19: idx + 1]) else None
+
+        enriched = dict(row)
+        enriched.update({
+            "ma20": _as_optional_float_cell(ma20),
+            "ma50": _as_optional_float_cell(ma50),
+            "ma200": _as_optional_float_cell(ma200),
+            "atr14": _as_optional_float_cell(atr14),
+            "atr_pct": _as_optional_float_cell((atr14 / close * 100.0) if atr14 and close else None),
+            "return_20d": _as_optional_float_cell(ret_at(idx, 20) * 100.0 if ret_at(idx, 20) is not None else None),
+            "return_60d": _as_optional_float_cell(ret_at(idx, 60) * 100.0 if ret_at(idx, 60) is not None else None),
+            "return_120d": _as_optional_float_cell(ret_at(idx, 120) * 100.0 if ret_at(idx, 120) is not None else None),
+            "volatility_20d": _as_optional_float_cell(ann_vol_at(idx, 20) * 100.0 if ann_vol_at(idx, 20) is not None else None),
+            "volatility_60d": _as_optional_float_cell(ann_vol_at(idx, 60) * 100.0 if ann_vol_at(idx, 60) is not None else None),
+            "drawdown_252d": _as_optional_float_cell((close / high_252 - 1.0) * 100.0 if high_252 and high_252 > 0 else None),
+            "ma50_slope_20d": _as_optional_float_cell((ma50 / ma50_prev - 1.0) * 100.0 if ma50 and ma50_prev and ma50_prev > 0 else None),
+            "ma200_slope_20d": _as_optional_float_cell((ma200 / ma200_prev - 1.0) * 100.0 if ma200 and ma200_prev and ma200_prev > 0 else None),
+            "distance_ma50_pct": _as_optional_float_cell((close / ma50 - 1.0) * 100.0 if ma50 else None),
+            "distance_ma200_pct": _as_optional_float_cell((close / ma200 - 1.0) * 100.0 if ma200 else None),
+            "volume_ratio_20d": _as_optional_float_cell((vols[idx] / vol20) if vol20 else None),
+        })
+        out.append(enriched)
+    return out
+
+
+def _load_price_history_cache(path: str) -> List[Dict[str, Any]]:
+    rows = _read_history_csv(path)
+    if not rows:
+        return []
+    # 保留衍生列，同时把基础 OHLCV 标准化成数值。
+    normalized = normalize_history_records(rows)
+    extra_by_date = {str(r.get("date") or r.get("日期") or "")[:10]: r for r in rows}
+    out: List[Dict[str, Any]] = []
+    for row in normalized:
+        extra = extra_by_date.get(row["date"], {})
+        merged = dict(row)
+        for key in HISTORY_PRICE_DERIVED_COLUMNS:
+            if key in extra:
+                merged[key] = _as_optional_float_cell(extra.get(key))
+        out.append(merged)
+    return out
+
+
+def _save_price_history_cache(path: str, rows: List[Dict[str, Any]], meta: Dict[str, Any]) -> None:
+    enriched = enrich_history_records_for_cache(rows)
+    _write_history_csv(path, enriched, HISTORY_PRICE_RAW_COLUMNS + HISTORY_PRICE_DERIVED_COLUMNS)
+    _write_history_meta(path, meta)
+
+
+def backtest_fetch_records(
+    symbol: str,
+    market: str,
+    source: str,
+    start: date,
+    end: date,
+    cfg: Dict[str, Any],
+    asset_kind: str = "",
+) -> Tuple[List[Dict[str, Any]], str, List[str]]:
+    """带落盘缓存的历史行情/净值抓取。
+
+    第一次回测：网络下载 -> data/history_cache/prices/*.csv。
+    后续回测：若日期已覆盖则直接读本地；若只缺前后区间，则只补缺失方向附近的数据并合并去重。
+    """
+    if not history_cache_enabled(cfg):
+        return backtest_fetch_records_uncached(symbol, market, source, start, end, cfg, asset_kind)
+
+    resolved_kind = resolve_asset_kind(symbol, market, asset_kind, str(cfg.get("symbol_name") or ""))
+    is_fund = is_cn_open_fund_like(symbol, market, resolved_kind, str(cfg.get("symbol_name") or ""))
+    key = _price_cache_key(symbol, market, source, resolved_kind, cfg)
+    path = _history_cache_file(PRICE_HISTORY_CACHE_DIR, *key)
+    cached_rows = _load_price_history_cache(path)
+    meta = _read_history_meta(path)
+    fetch_errors: List[str] = []
+    missing = _cache_missing_ranges(cached_rows, start, end)
+
+    if not missing:
+        subset = _filter_history_rows(cached_rows, start, end)
+        label = str(meta.get("source_label") or "price")
+        fetch_errors.append(f"历史行情缓存命中：{os.path.relpath(path, APP_DIR)}，本地 {len(cached_rows)} 行，回测使用 {len(subset)} 行")
+        return normalize_history_records(subset), f"local_cache:{label}", fetch_errors
+
+    all_new: List[Dict[str, Any]] = []
+    source_labels: List[str] = []
+    for miss_start, miss_end in missing:
+        net_start, net_end = _expand_missing_range_for_fetch(miss_start, miss_end, cached_rows, start, end, is_fund)
+        try:
+            rows, label, errors = backtest_fetch_records_uncached(symbol, market, source, net_start, net_end, cfg, resolved_kind)
+            all_new.extend(rows)
+            source_labels.append(label)
+            fetch_errors.extend(errors)
+            fetch_errors.append(f"历史行情缓存补充：{net_start} ~ {net_end}，来源 {label}，新增/覆盖 {len(rows)} 行")
+        except Exception as exc:
+            fetch_errors.append(f"历史行情缓存补充失败：{net_start} ~ {net_end}：{str(exc)[:220]}")
+
+    if all_new:
+        merged = _merge_history_rows(cached_rows, all_new)
+        label = "+".join(sorted(set(source_labels))) or str(meta.get("source_label") or normalize_backtest_source(source, market))
+        _save_price_history_cache(path, merged, {
+            "type": "price_or_nav",
+            "symbol": symbol,
+            "market": market,
+            "asset_kind": resolved_kind,
+            "source": normalize_backtest_source(source, market),
+            "source_label": label,
+            "start": _date_range_of_rows(merged)[0].isoformat() if _date_range_of_rows(merged)[0] else "",
+            "end": _date_range_of_rows(merged)[1].isoformat() if _date_range_of_rows(merged)[1] else "",
+            "rows": len(merged),
+        })
+        cached_rows = _load_price_history_cache(path)
+        meta = _read_history_meta(path)
+    elif not cached_rows:
+        raise RuntimeError("历史行情网络下载失败，且本地没有可用缓存：" + "；".join(fetch_errors))
+
+    subset = _filter_history_rows(cached_rows, start, end)
+    if not subset:
+        raise RuntimeError("本地历史行情缓存没有覆盖本次回测区间，且网络补充失败：" + "；".join(fetch_errors))
+    label = str(meta.get("source_label") or (source_labels[-1] if source_labels else "price"))
+    fetch_errors.append(f"历史行情缓存已保存：{os.path.relpath(path, APP_DIR)}，本地 {len(cached_rows)} 行，回测使用 {len(subset)} 行")
+    return normalize_history_records(subset), f"cache+{label}", fetch_errors
+
+
+def _valuation_series_to_rows(series: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for ds in sorted(series or {}):
+        item = dict(series.get(ds) or {})
+        item["date"] = ds
+        rows.append(item)
+    return rows
+
+
+def _rows_to_valuation_series(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in rows or []:
+        try:
+            ds = parse_date_safe(row.get("date") or row.get("valuation_date")).isoformat()
+        except Exception:
+            continue
+        item: Dict[str, Any] = {}
+        for key in HISTORY_VALUATION_COLUMNS:
+            if key == "date":
+                continue
+            value = row.get(key)
+            if value in (None, ""):
+                continue
+            if key in {"current_pe", "pe_percentile", "current_pb", "pb_percentile", "roe_pct"}:
+                item[key] = as_float(value, None)  # type: ignore[arg-type]
+            else:
+                item[key] = value
+        out[ds] = item
+    return out
+
+
+def _load_valuation_history_cache(path: str) -> Dict[str, Dict[str, Any]]:
+    return _rows_to_valuation_series(_read_history_csv(path))
+
+
+def _save_valuation_history_cache(path: str, series: Dict[str, Dict[str, Any]], meta: Dict[str, Any]) -> None:
+    rows = _valuation_series_to_rows(series)
+    _write_history_csv(path, rows, HISTORY_VALUATION_COLUMNS)
+    _write_history_meta(path, meta)
+
+
+def _valuation_cache_has_coverage(series: Dict[str, Dict[str, Any]], start: Optional[date], end: Optional[date]) -> bool:
+    if not start or not end or not series:
+        return bool(series)
+    rows = _valuation_series_to_rows(series)
+    min_d, max_d = _date_range_of_rows(rows)
+    return bool(min_d and max_d and min_d <= start and max_d >= end)
+
+
+def fetch_historical_valuation_series(
+    symbol: str,
+    market: str,
+    asset_kind: str,
+    cfg: Dict[str, Any],
+    symbol_name: str = "",
+    start: Optional[date] = None,
+    end: Optional[date] = None,
+) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
+    """带落盘缓存的历史估值序列。
+
+    多数估值接口本身返回全历史序列，不一定支持按日期补段；这里优先本地命中，未覆盖时刷新并合并。
+    """
+    if not history_cache_enabled(cfg):
+        return fetch_historical_valuation_series_uncached(symbol, market, asset_kind, cfg, symbol_name)
+
+    key = _valuation_cache_key(symbol, market, asset_kind, cfg, symbol_name)
+    path = _history_cache_file(VALUATION_HISTORY_CACHE_DIR, *key)
+    cached = _load_valuation_history_cache(path)
+    trace: List[str] = []
+    if _valuation_cache_has_coverage(cached, start, end):
+        trace.append(f"历史估值缓存命中：{os.path.relpath(path, APP_DIR)}，本地 {len(cached)} 行")
+        return cached, trace
+
+    try:
+        fresh, raw_trace = fetch_historical_valuation_series_uncached(symbol, market, asset_kind, cfg, symbol_name)
+        trace.extend(raw_trace)
+        merged = merge_valuation_series(cached, fresh) if cached else fresh
+        if merged:
+            _save_valuation_history_cache(path, merged, {
+                "type": "valuation",
+                "symbol": symbol,
+                "market": market,
+                "asset_kind": resolve_asset_kind(symbol, market, asset_kind, symbol_name),
+                "valuation_method": str(cfg.get("valuation_method") or "system_calc"),
+                "symbol_name": symbol_name,
+                "start": min(merged.keys()) if merged else "",
+                "end": max(merged.keys()) if merged else "",
+                "rows": len(merged),
+            })
+            trace.append(f"历史估值缓存已保存：{os.path.relpath(path, APP_DIR)}，本地 {len(merged)} 行")
+            return merged, trace
+        return fresh, trace
+    except Exception as exc:
+        if cached:
+            trace.append(f"历史估值网络刷新失败，改用本地缓存：{str(exc)[:180]}；缓存 {len(cached)} 行")
+            return cached, trace
+        raise
 
 def backtest_yahoo_symbol(symbol: str, market: str) -> str:
     s = str(symbol or "").strip()
@@ -4751,7 +5345,7 @@ def normalize_backtest_source(source: str, market: str) -> str:
     return "auto"
 
 
-def backtest_fetch_records(symbol: str, market: str, source: str, start: date, end: date, cfg: Dict[str, Any], asset_kind: str = "") -> Tuple[List[Dict[str, Any]], str, List[str]]:
+def backtest_fetch_records_uncached(symbol: str, market: str, source: str, start: date, end: date, cfg: Dict[str, Any], asset_kind: str = "") -> Tuple[List[Dict[str, Any]], str, List[str]]:
     options = fetch_options_from_cfg(cfg)
     errors: List[str] = []
     source = normalize_backtest_source(source, market)
@@ -5237,8 +5831,67 @@ def append_valuation_comparison_metrics(
     return notes
 
 
+def build_backtest_diagnosis_metrics(
+    metrics: Dict[str, Any],
+    *,
+    total_ret: float,
+    dca_ret: float,
+    bench_ret: float,
+    strategy_mdd: float,
+    dca_mdd: float,
+    bench_mdd: float,
+    avg_exp_pct: float,
+    turnover_value: float,
+    initial_cash: float,
+    fee: float,
+    effective_slip: float,
+    trade_count: int,
+) -> None:
+    """补充回测失败归因指标。
+
+    这些是诊断指标，不参与策略交易计算：
+    - 看策略到底输给了定投还是持有；
+    - 看收益差是否换来了更低回撤；
+    - 粗略估算现金拖累和交易成本拖累。
+    """
+    ret_gap_dca = float(total_ret or 0.0) - float(dca_ret or 0.0)
+    ret_gap_hold = float(total_ret or 0.0) - float(bench_ret or 0.0)
+    dd_improve_dca = abs(float(dca_mdd or 0.0)) - abs(float(strategy_mdd or 0.0))
+    dd_improve_hold = abs(float(bench_mdd or 0.0)) - abs(float(strategy_mdd or 0.0))
+
+    turnover_ratio = float(turnover_value or 0.0) / max(float(initial_cash or 0.0), 1e-9)
+    estimated_cost_drag = turnover_ratio * max(float(fee or 0.0) + float(effective_slip or 0.0), 0.0)
+    exposure_ratio = clamp(float(avg_exp_pct or 0.0) / 100.0, 0.0, 2.0)
+    estimated_cash_drag = max(float(bench_ret or 0.0), 0.0) * max(0.0, 1.0 - exposure_ratio)
+
+    if ret_gap_dca < 0 and ret_gap_hold < 0:
+        if dd_improve_hold <= 0.03 and dd_improve_dca <= 0.03:
+            verdict = "不建议进模拟盘：收益同时差于定投/持有，且回撤改善不足。"
+        else:
+            verdict = "只适合风控研究：收益落后，但有一定回撤改善。"
+    elif ret_gap_dca >= 0 and ret_gap_hold < 0:
+        verdict = "可继续研究：优于定投但弱于持有，重点看回撤是否明显下降。"
+    elif ret_gap_hold >= 0:
+        verdict = "可进入模拟盘观察：收益不弱于持有，继续检查交易次数和样本外表现。"
+    else:
+        verdict = "中性：需要更多区间和标的验证。"
+
+    if trade_count > 80 and ret_gap_hold < 0:
+        verdict += " 交易次数偏多，优先降低信号敏感度。"
+    if exposure_ratio < 0.55 and bench_ret > 0 and ret_gap_hold < 0:
+        verdict += " 平均仓位偏低，主要风险可能是现金拖累。"
+
+    metrics["策略准入结论"] = verdict
+    metrics["相对定投收益差"] = backtest_pct(ret_gap_dca * 100)
+    metrics["相对持有收益差"] = backtest_pct(ret_gap_hold * 100)
+    metrics["相对定投回撤改善"] = backtest_pct(dd_improve_dca * 100)
+    metrics["相对持有回撤改善"] = backtest_pct(dd_improve_hold * 100)
+    metrics["估算交易成本拖累"] = backtest_pct(estimated_cost_drag * 100)
+    metrics["估算现金拖累"] = backtest_pct(estimated_cash_drag * 100)
+
+
 def backtest_metrics_rows(metrics: Dict[str, Any]) -> List[Dict[str, Any]]:
-    # 展示顺序按“先三类策略得分、再风险调整、再收益/回撤/交易/估值”排列。
+    # 展示顺序按“主指标优先、诊断项靠后”排列。
     # 前端会按同一顺序渲染；导出的核心指标 CSV 也保持这个顺序。
     order = [
         "标的核心得分", "系统策略得分", "定投策略得分", "持有策略得分",
@@ -5254,6 +5907,9 @@ def backtest_metrics_rows(metrics: Dict[str, Any]) -> List[Dict[str, Any]]:
         "历史PB", "页面PB", "PB误差",
         "历史PB百分位", "页面PB百分位", "PB百分位误差",
         "历史ROE", "页面ROE", "ROE误差",
+        # 诊断项放在后面，避免一进回测结果就被“结论/拖累”抢占主指标位置。
+        "相对定投收益差", "相对持有收益差", "相对定投回撤改善", "相对持有回撤改善",
+        "估算交易成本拖累", "估算现金拖累", "策略准入结论",
     ]
     keys = [k for k in order if k in metrics] + [k for k in metrics.keys() if k not in order]
     return [{"指标": k, "数值": metrics.get(k, "--"), "备注": BACKTEST_METRIC_NOTES.get(k, "")} for k in keys]
@@ -5333,6 +5989,9 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
 
     # 回测优先使用左侧【标的与资金】里的核心配置，避免回测页重复字段与主配置不一致。
     initial_cash = max(as_float(cfg.get("plan_amount"), as_float(data.get("initial_cash"), 100000.0)), 1.0)
+    strategy_family = str(cfg.get("strategy_family") or data.get("strategy_family") or DEFAULT_STRATEGY_FAMILY)
+    if strategy_family not in STRATEGY_FAMILIES:
+        strategy_family = DEFAULT_STRATEGY_FAMILY
     strategy = str(cfg.get("strategy") or data.get("strategy") or "balanced")
     if strategy not in STRATEGY_PRESETS:
         strategy = "balanced"
@@ -5364,7 +6023,7 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
     valuation_series: Dict[str, Dict[str, Any]] = {}
     valuation_trace: List[str] = []
     if valuation_mode == "historical":
-        valuation_series, valuation_trace = fetch_historical_valuation_series(symbol, market, asset_kind, bt_cfg, str(cfg.get("symbol_name") or data.get("symbol_name") or ""))
+        valuation_series, valuation_trace = fetch_historical_valuation_series(symbol, market, asset_kind, bt_cfg, str(cfg.get("symbol_name") or data.get("symbol_name") or ""), fetch_start, end_user)
         if valuation_series:
             fundamentals = {"valuation_note": "使用历史估值序列"}
         else:
@@ -5398,11 +6057,15 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
         is_review_day = i >= next_signal_index
         if is_review_day:
             decision_cfg = DEFAULT_CONFIG.copy()
+            decision_cfg.update({key: cfg.get(key, DEFAULT_CONFIG.get(key)) for key in ADVANCED_PARAM_KEYS})
             decision_cfg.update({
                 "plan_amount": equity_signal,
                 "current_position_amount": pos_value_signal,
                 "current_profit_pct": profit_pct,
+                "strategy_family": strategy_family,
                 "strategy": strategy,
+                "strategy_mode": cfg.get("strategy_mode", "single"),
+                "strategy_mix": cfg.get("strategy_mix", {}),
                 "position_mode": position_mode,
                 "risk_per_trade_pct": risk_per_trade_pct,
                 "symbol": symbol,
@@ -5582,6 +6245,22 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
         "换手率": backtest_pct(turnover_value / initial_cash * 100),
         "期末权益": backtest_money(eq[-1]),
     }
+
+    build_backtest_diagnosis_metrics(
+        metrics,
+        total_ret=total_ret,
+        dca_ret=dca_ret,
+        bench_ret=bench_ret,
+        strategy_mdd=strategy_mdd,
+        dca_mdd=dca_mdd,
+        bench_mdd=bench_mdd,
+        avg_exp_pct=avg_exp,
+        turnover_value=turnover_value,
+        initial_cash=initial_cash,
+        fee=fee,
+        effective_slip=effective_slip,
+        trade_count=len(trades),
+    )
     valuation_compare_notes = append_valuation_comparison_metrics(
         metrics,
         valuation_series if valuation_mode == "historical" else {},
@@ -5598,7 +6277,7 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
         os.makedirs(outdir, exist_ok=True)
         safe_symbol = re.sub(r"[^0-9A-Za-z\u4e00-\u9fa5_-]+", "_", symbol)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        prefix = f"{safe_symbol}_{strategy}_{position_mode}_{stamp}"
+        prefix = f"{safe_symbol}_{strategy_family}_{strategy}_{position_mode}_{stamp}"
         metric_path = os.path.join(outdir, f"核心指标_{prefix}.csv")
         trade_path = os.path.join(outdir, f"交易记录_{prefix}.csv")
         curve_path = os.path.join(outdir, f"权益曲线_{prefix}.csv")
@@ -5638,9 +6317,12 @@ def index():
         cfg=cfg,
         current_pos=current_position(cfg),
         strategy=strategy,
+        strategy_families=STRATEGY_FAMILIES,
         strategies=STRATEGY_PRESETS,
+        strategy_market_states=STRATEGY_MARKET_STATES,
         pct=pct,
         valuation_method_text=valuation_method_text,
+        today=date.today().isoformat(),
     )
 
 
@@ -5714,8 +6396,23 @@ def api_config():
     cfg.pop("asset_type", None)
     cfg["current_profit_pct"] = clamp(as_float(data.get("current_profit_pct"), cfg.get("current_profit_pct", 0.0)), -99.99, 9999.0)
 
+    strategy_family = str(data.get("strategy_family", cfg.get("strategy_family", DEFAULT_STRATEGY_FAMILY)))
+    cfg["strategy_family"] = strategy_family if strategy_family in STRATEGY_FAMILIES else DEFAULT_STRATEGY_FAMILY
+
     strategy = str(data.get("strategy", cfg.get("strategy", "balanced")))
     cfg["strategy"] = strategy if strategy in STRATEGY_PRESETS else "balanced"
+    # 参数风格固定为单风格；不再接收前端的组合风格。
+    cfg["strategy_mode"] = "single"
+    if "strategy_family_params" in data and isinstance(data.get("strategy_family_params"), dict):
+        cfg["strategy_family_params"] = data.get("strategy_family_params") or {}
+    if "strategy_mix" in data and isinstance(data.get("strategy_mix"), dict):
+        cfg["strategy_mix"] = data.get("strategy_mix") or {}
+        # 兼容旧前端：如果没有传 family_params，就把根级 strategy_mix 作为当前总体策略参数。
+        # 当前执行参数风格是全局 cfg["strategy"]，不再写进各总体策略配置。
+        if "strategy_family_params" not in data:
+            family_params = cfg.get("strategy_family_params") if isinstance(cfg.get("strategy_family_params"), dict) else {}
+            family_params[cfg["strategy_family"]] = {"strategy_mix": cfg["strategy_mix"]}
+            cfg["strategy_family_params"] = family_params
 
     mode = str(data.get("position_mode", cfg.get("position_mode", "core_satellite")))
     cfg["position_mode"] = mode if mode in {"core_satellite", "strict_trade"} else "core_satellite"
@@ -5732,16 +6429,24 @@ def api_config():
         cfg["valuation_method"] = "system_calc"
     cfg["request_timeout_sec"] = clamp(as_float(data.get("request_timeout_sec"), cfg.get("request_timeout_sec", 12.0)), 3.0, 60.0)
     cfg["retry_count"] = int(clamp(as_float(data.get("retry_count"), cfg.get("retry_count", 2)), 0.0, 5.0))
+    for key in ADVANCED_PARAM_KEYS:
+        if key in data:
+            if key == "trade_step_limit_enabled":
+                cfg[key] = advanced_bool(data, key, True)
+            else:
+                cfg[key] = as_float(data.get(key), ADVANCED_PARAM_DEFAULTS.get(key, 0.0))
+    normalise_advanced_config(cfg)
+    apply_active_family_params(cfg)
 
     save_config(cfg)
     strategy_obj = get_strategy(cfg)
-    mode_text = "长期底仓 + 交易仓（防守仓位动态计算）" if cfg.get("position_mode") == "core_satellite" else "纯交易仓"
+    mode_text = "定投增强策略（目标仓位动态计算）" if cfg.get("position_mode") == "core_satellite" else "纯交易仓"
     symbol_text = f"{cfg.get('symbol_name') or '未选择'} {cfg.get('symbol') or ''}".strip()
     return jsonify({
         "ok": True,
         "message": "配置已保存",
         "current_pos_text": pct(current_position(cfg)),
-        "strategy_text": f"{strategy_obj['name']}：{strategy_obj['desc']}<br>仓位模式：{mode_text}<br>标的：{symbol_text}<br>数据容错：代理 {cfg.get('proxy_mode')} / 超时 {cfg.get('request_timeout_sec')} 秒 / 重试 {cfg.get('retry_count')} 次<br>估值来源：{valuation_method_text(cfg.get('valuation_method'))}<br>回测无风险收益率：{cfg.get('backtest_risk_free_rate_pct', 2.0)}%<br>计划资金=100%上限，不按标的类型封顶。",
+        "strategy_text": f"{full_strategy_summary(cfg)}<br>仓位模式：{mode_text}<br>标的：{symbol_text}<br>数据容错：代理 {cfg.get('proxy_mode')} / 超时 {cfg.get('request_timeout_sec')} 秒 / 重试 {cfg.get('retry_count')} 次<br>估值来源：{valuation_method_text(cfg.get('valuation_method'))}<br>回测无风险收益率：{cfg.get('backtest_risk_free_rate_pct', 2.0)}%<br>单次操作上限：{'开启' if cfg.get('trade_step_limit_enabled') else '关闭，直接调到目标仓位'}<br>计划资金=100%上限，不按标的类型封顶。",
         "config": cfg,
     })
 
@@ -5890,12 +6595,14 @@ def api_backtest():
     try:
         cfg = ensure_config()
         cache_payload = {
+            "version": 19,
             "data": data,
             "cfg": {key: cfg.get(key) for key in [
-                "plan_amount", "strategy", "position_mode", "risk_per_trade_pct", "backtest_risk_free_rate_pct",
+                "plan_amount", "strategy_family", "strategy", "strategy_mix", "strategy_family_params", "position_mode", "risk_per_trade_pct", "backtest_risk_free_rate_pct",
                 "symbol", "symbol_name", "market", "asset_kind", "data_source",
                 "proxy_mode", "proxy_url", "request_timeout_sec", "retry_count",
-                "danjuan_cookie", "valuation_method"
+                "danjuan_cookie", "valuation_method",
+                *ADVANCED_PARAM_KEYS,
             ]},
         }
         cached, age = runtime_cache_get("backtest", cache_payload)

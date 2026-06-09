@@ -5,6 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>趋势风控仓位助手</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script>
+    window.STRATEGY_FAMILIES = {{ strategy_families|tojson }};
+    window.STRATEGY_INFO = {{ strategies|tojson }};
+    window.STRATEGY_MARKET_STATES = {{ strategy_market_states|tojson }};
+    window.INITIAL_CONFIG = {{ cfg|tojson }};
+  </script>
   <script defer src="{{ url_for('static', filename='app.js') }}"></script>
 </head>
 <body>
@@ -14,6 +20,7 @@
       <h1>趋势风控仓位助手</h1>
       <p>计划资金=100%上限；自动拉取行情，PE/ROE可自动填充也可手动覆盖</p>
     </div>
+    <div id="strategy-family-tabs" class="top-strategy-tabs" data-current-family="{{ cfg.strategy_family }}" aria-label="总体策略切换"></div>
     <div class="top-actions">
       <button class="ghost-btn" type="button" data-open-backtest>历史回测模拟</button>
       <button class="ghost-btn" type="button" data-back-to-main hidden>返回仓位助手</button>
@@ -21,6 +28,20 @@
       <button class="ghost-btn" type="button" data-reset-state>清空信号</button>
     </div>
   </header>
+
+  <div id="strategy-family-settings" class="family-settings" hidden aria-hidden="true">
+    <div class="family-settings-backdrop" data-close-family-settings></div>
+    <section class="family-settings-panel" role="dialog" aria-modal="true" aria-labelledby="family-settings-title">
+      <div class="family-settings-head">
+        <div>
+          <h2 id="family-settings-title">策略参数</h2>
+          <p id="family-settings-subtitle">当前总体策略的参数风格与微调。</p>
+        </div>
+        <button class="ghost-btn dark" type="button" data-close-family-settings>关闭</button>
+      </div>
+      <div id="family-settings-body" class="family-settings-body"></div>
+    </section>
+  </div>
 
   <aside class="config-pane">
     <section class="card compact">
@@ -43,6 +64,7 @@
         <input type="hidden" name="symbol_name" value="{{ cfg.symbol_name }}">
         <input type="hidden" name="market" value="{{ cfg.market }}">
         <input type="hidden" name="asset_kind" value="{{ cfg.asset_kind }}">
+        <input type="hidden" name="strategy_mode" value="single">
 
         <div id="settings-modal" class="settings-modal" hidden aria-hidden="true">
           <div class="settings-backdrop" data-close-settings></div>
@@ -98,10 +120,91 @@
                 <input type="number" step="1" min="0" max="5" name="retry_count" value="{{ cfg.retry_count }}">
               </label>
 
-              <label class="field" data-tip="用于历史回测里的夏普比率、卡玛比率和相对定投评分。2 表示年化 2%。">
+              <label class="field" data-tip="用于历史回测里的夏普比率、卡玛比率和策略评分。2 表示年化 2%。">
                 <span>无风险收益率 %</span>
                 <input type="number" step="0.1" min="-20" max="30" name="backtest_risk_free_rate_pct" value="{{ cfg.backtest_risk_free_rate_pct }}">
               </label>
+
+              <details class="advanced-params wide">
+                <summary>参数设置（高级，可折叠）</summary>
+                <p class="small">这里控制目标仓位和执行节奏。想测试“直接打到目标仓位”，可以关闭【启用单次操作上限】，或把对应单次上限调到 100%。</p>
+
+                <div class="settings-subtitle">执行层</div>
+                <div class="settings-grid nested">
+                  <label class="field checkbox-field" data-tip="关闭后，检查日会直接调到策略目标仓位；仍保留操作周期、最小执行变化、手续费和滑点。">
+                    <input type="checkbox" name="trade_step_limit_enabled" {% if cfg.trade_step_limit_enabled %}checked{% endif %}>
+                    <span>启用单次操作上限</span>
+                  </label>
+                </div>
+
+                <div class="settings-subtitle">定投增强补足上限（定投增强策略）</div>
+                <div class="settings-grid nested three-cols">
+                  <label class="field" data-tip="防守档每个检查日最多补多少定投增强仓位。">
+                    <span>防守补仓上限 %</span>
+                    <input type="number" step="0.1" min="0" max="100" name="core_step_defensive_pct" value="{{ cfg.core_step_defensive_pct }}">
+                  </label>
+                  <label class="field" data-tip="均衡档每个检查日最多补多少定投增强仓位。">
+                    <span>均衡补仓上限 %</span>
+                    <input type="number" step="0.1" min="0" max="100" name="core_step_balanced_pct" value="{{ cfg.core_step_balanced_pct }}">
+                  </label>
+                  <label class="field" data-tip="进攻档每个检查日最多补多少定投增强仓位。">
+                    <span>进攻补仓上限 %</span>
+                    <input type="number" step="0.1" min="0" max="100" name="core_step_aggressive_pct" value="{{ cfg.core_step_aggressive_pct }}">
+                  </label>
+                </div>
+
+                <div class="settings-subtitle">纯交易仓买入上限</div>
+                <div class="settings-grid nested three-cols">
+                  <label class="field" data-tip="纯交易仓/普通买入信号的防守档单次买入上限。">
+                    <span>防守买入上限 %</span>
+                    <input type="number" step="0.1" min="0" max="100" name="buy_step_defensive_pct" value="{{ cfg.buy_step_defensive_pct }}">
+                  </label>
+                  <label class="field" data-tip="纯交易仓/普通买入信号的均衡档单次买入上限。">
+                    <span>均衡买入上限 %</span>
+                    <input type="number" step="0.1" min="0" max="100" name="buy_step_balanced_pct" value="{{ cfg.buy_step_balanced_pct }}">
+                  </label>
+                  <label class="field" data-tip="纯交易仓/普通买入信号的进攻档单次买入上限。">
+                    <span>进攻买入上限 %</span>
+                    <input type="number" step="0.1" min="0" max="100" name="buy_step_aggressive_pct" value="{{ cfg.buy_step_aggressive_pct }}">
+                  </label>
+                </div>
+
+                <div class="settings-subtitle">卖出上限</div>
+                <div class="settings-grid nested three-cols">
+                  <label class="field" data-tip="防守档基础单次卖出上限；严重破位时仍会按风险倍数放大。">
+                    <span>防守卖出上限 %</span>
+                    <input type="number" step="0.1" min="0" max="100" name="sell_step_defensive_pct" value="{{ cfg.sell_step_defensive_pct }}">
+                  </label>
+                  <label class="field" data-tip="均衡档基础单次卖出上限；严重破位时仍会按风险倍数放大。">
+                    <span>均衡卖出上限 %</span>
+                    <input type="number" step="0.1" min="0" max="100" name="sell_step_balanced_pct" value="{{ cfg.sell_step_balanced_pct }}">
+                  </label>
+                  <label class="field" data-tip="进攻档基础单次卖出上限；严重破位时仍会按风险倍数放大。">
+                    <span>进攻卖出上限 %</span>
+                    <input type="number" step="0.1" min="0" max="100" name="sell_step_aggressive_pct" value="{{ cfg.sell_step_aggressive_pct }}">
+                  </label>
+                </div>
+
+                <div class="settings-subtitle">目标仓位边界</div>
+                <div class="settings-grid nested four-cols">
+                  <label class="field" data-tip="定投增强策略的最低目标仓位。">
+                    <span>增强最低仓位 %</span>
+                    <input type="number" step="0.1" min="0" max="100" name="core_min_position_pct" value="{{ cfg.core_min_position_pct }}">
+                  </label>
+                  <label class="field" data-tip="定投增强策略的最高目标仓位。想更激进可调高到 95~100。">
+                    <span>增强最高仓位 %</span>
+                    <input type="number" step="0.1" min="0" max="100" name="core_max_position_pct" value="{{ cfg.core_max_position_pct }}">
+                  </label>
+                  <label class="field" data-tip="纯交易仓模式的最低目标仓位。">
+                    <span>交易最低仓位 %</span>
+                    <input type="number" step="0.1" min="0" max="100" name="strict_min_position_pct" value="{{ cfg.strict_min_position_pct }}">
+                  </label>
+                  <label class="field" data-tip="纯交易仓模式的最高目标仓位。">
+                    <span>交易最高仓位 %</span>
+                    <input type="number" step="0.1" min="0" max="100" name="strict_max_position_pct" value="{{ cfg.strict_max_position_pct }}">
+                  </label>
+                </div>
+              </details>
 
               <label class="field wide" data-tip="可选。蛋卷接口有时需要 Cookie；建议从 Apifox/浏览器复制 Cookie，失效后重新粘贴。">
                 <span>蛋卷 Cookie（可选）</span>
@@ -164,10 +267,10 @@
 
         <fieldset class="strategy-box">
           <legend>仓位模式</legend>
-          <label class="strategy-option balanced" data-tip="适合长期看好但也想控回撤：大趋势破坏时降交易仓，防守仓位由系统根据趋势/估值/ROE/破位状态动态计算，行情坏时可以接近0。">
+          <label class="strategy-option balanced" data-tip="适合核心宽基/指数基金：以定投为底盘，按趋势、估值、ROE和风险状态生成目标仓位；行情好时提高仓位，趋势坏时降到防守仓位。">
             <input type="radio" name="position_mode" value="core_satellite" {% if cfg.position_mode == 'core_satellite' %}checked{% endif %}>
-            <span>长期底仓 + 交易仓</span>
-            <em>防守仓位动态计算</em>
+            <span>定投增强策略</span>
+            <em>定投底盘 + 目标仓位</em>
           </label>
           <label class="strategy-option defensive" data-tip="适合完全按交易纪律执行：所有仓位都按趋势/止损处理，破位可以降到0。">
             <input type="radio" name="position_mode" value="strict_trade" {% if cfg.position_mode == 'strict_trade' %}checked{% endif %}>
@@ -176,20 +279,13 @@
           </label>
         </fieldset>
 
-        <fieldset class="strategy-box">
-          <legend>策略配置</legend>
-          {% for key, item in strategies.items() %}
-          <label class="strategy-option {{ key }}" data-tip="{{ item.desc }}">
-            <input type="radio" name="strategy" value="{{ key }}" {% if cfg.strategy == key %}checked{% endif %}>
-            <span>{{ item.name }}</span>
-            <em>{{ item.desc }}</em>
-          </label>
-          {% endfor %}
-        </fieldset>
+        <fieldset id="active-style-picker" class="strategy-box active-style-picker" aria-label="参数风格选择"></fieldset>
 
         <div id="strategy-summary" class="strategy-summary">
-          {{ strategy.name }}：{{ strategy.desc }}<br>
-          仓位模式：{% if cfg.position_mode == 'core_satellite' %}长期底仓 + 交易仓（防守仓位动态计算）{% else %}纯交易仓{% endif %}<br>
+          总体策略：{{ strategy_families[cfg.strategy_family].name }}（{{ strategy_families[cfg.strategy_family].status }}）<br>
+          {{ strategy_families[cfg.strategy_family].desc }}<br>
+          参数风格：{{ strategy.name }}：{{ strategy.desc }}<br>
+          仓位模式：{% if cfg.position_mode == 'core_satellite' %}定投增强策略（目标仓位动态计算）{% else %}纯交易仓{% endif %}<br>
           数据容错：代理 {{ cfg.proxy_mode }} / 超时 {{ cfg.request_timeout_sec }} 秒 / 重试 {{ cfg.retry_count }} 次<br>
           回测估值来源：{{ valuation_method_text(cfg.valuation_method) }}；实时仓位页固定使用蛋卷（雪球）当前估值。<br>
           计划资金=100%上限，不按标的类型封顶。
@@ -231,7 +327,9 @@
         </div>
       </section>
 
-      <section class="card signal-card neutral">
+      <div id="strategy-specific-inputs" class="strategy-specific-inputs" hidden></div>
+
+      <section class="card signal-card neutral" data-section="market-context">
         <div class="card-title">
           <h2>② 大趋势环境</h2>
           <span class="pill neutral">先判断能不能做</span>
@@ -372,7 +470,7 @@
         </label>
         <label class="field">
           <span>结束日期</span>
-          <input type="date" name="end_date" value="{{ '%04d-%02d-%02d'|format(2026, 6, 6) }}">
+          <input type="date" name="end_date" value="{{ today }}">
         </label>
         <label class="field" data-tip="每隔多少个交易日检查并执行一次。1=每天；5≈每周；20≈每月。定投基准也使用这个周期，默认投入100%计划资金，并排除最后一个可观测日，避免最后一天买入看不到收益。">
           <span>操作周期 / 每N个交易日</span>

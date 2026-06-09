@@ -70,14 +70,3 @@ def target_weight(cfg, signals):
 ## 排序
 
 `FAMILY_META["order"]` 越小，顶部卡片越靠前。
-
-## 小因子择时策略
-
-新增文件：
-
-```text
-families/mini_factor_timing.py
-factors/mini_factors.py
-```
-
-`mini_factor_timing.py` 是总体策略入口，`mini_factors.py` 负责计算可解释小因子。后续如果要接 Qlib Alpha158/Alpha360，建议继续放在 `strategies/factors/` 下，不要把大量因子计算塞进 `app.py` 或具体策略文件。
