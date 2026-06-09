@@ -20,8 +20,7 @@
   const VOLUME_SIGNAL_NAMES = ["volume_confirm", "pullback_volume_dry", "upper_shadow", "failed_close", "far_from_ma"];
 
   const strategyFamilyInfo = window.STRATEGY_FAMILIES || {
-    trend_signal_control: {name: "趋势信号风控策略", desc: "以趋势状态为主轴生成目标仓位。"},
-    five_dimension_timing: {name: "五维择时策略", desc: "估值、资金、技术、情绪、基本面五维投票。"}
+    trend_signal_control: {name: "趋势信号风控策略", desc: "以趋势状态为主轴生成目标仓位。"}
   };
 
   const strategyInfo = window.STRATEGY_INFO || {
@@ -263,7 +262,7 @@
   }
 
   function strategyFamilyText(key) {
-    const item = strategyFamilyInfo[key] || strategyFamilyInfo.trend_signal_control || {name: "总体策略", desc: ""};
+    const item = strategyFamilyInfo[key] || strategyFamilyInfo[strategyFamilyKeys[0]] || {name: "总体策略", desc: ""};
     const axes = Array.isArray(item.axes) && item.axes.length ? `；维度：${item.axes.join(" / ")}` : "";
     const status = item.status ? `（${item.status}）` : "";
     return `总体策略：${item.name || key}${status}<br>${item.desc || ""}${axes}`;
@@ -281,6 +280,92 @@
     return Number.isFinite(num) ? num : fallback;
   }
 
+  // 操作幅度字段（执行速度组）
+  const AMPLITUDE_FIELDS = ["buy_step_pct", "sell_step_pct"];
+  // 操作阈值字段（仓位边界 + 执行层控制 + 仓位上限）
+  const THRESHOLD_FIELDS = [
+    "core_min_position_pct", "core_max_position_pct",
+    "strict_min_position_pct", "strict_max_position_pct",
+    "core_step_pct", "buy_step_limit_pct", "sell_step_limit_pct",
+    "bear_cap_pct", "below200_cap_pct", "risk_event_cap_pct",
+    "high_valuation_cap_sideways_pct", "high_valuation_cap_trend_pct",
+    "extreme_valuation_cap_sideways_pct", "extreme_valuation_cap_trend_pct",
+  ];
+
+  // 偏离度 0-100%：进攻向100%推，防守向0%推，天然保证0-100%范围
+  // 进攻 X%: val + (100 - val) * X / 100
+  // 防守 X%: val * (1 - X / 100)
+  function applyDeviation(val, pct, isAggressive) {
+    if (isAggressive) return val + (100 - val) * pct / 100;
+    return val * (1 - pct / 100);
+  }
+
+  function getDeviations(entry) {
+    return {
+      amplitude: numberOr(entry?.amplitude_deviation, 0),
+      threshold: numberOr(entry?.threshold_deviation, 0),
+    };
+  }
+
+  // 全局执行速度默认值
+  const GLOBAL_STYLE_DEFAULTS = {buy_step_pct: 26, sell_step_pct: 48, risk_multiplier: 1.0};
+
+  function getGlobalStyleBase() {
+    const out = {};
+    for (const [key, def] of Object.entries(GLOBAL_STYLE_DEFAULTS)) {
+      const el = document.querySelector(`#global-config-body [data-global-field="${key}"]`);
+      out[key] = el ? numberOr(el.value, def) : (initialConfig[key] ?? def);
+    }
+    return out;
+  }
+
+  function getGlobalPositionBase() {
+    const q = (name, def) => {
+      const el = document.querySelector(`#global-config-body [data-global-field="${name}"]`);
+      return el ? numberOr(el.value, def) : (initialConfig[name] ?? def);
+    };
+    return {
+      core_min_position_pct: q("core_min_position_pct", 5),
+      core_max_position_pct: q("core_max_position_pct", 92),
+      strict_min_position_pct: q("strict_min_position_pct", 0),
+      strict_max_position_pct: q("strict_max_position_pct", 60),
+    };
+  }
+
+  function applyDeviations(familyKey, styleKey, ampDev, thrDev) {
+    const params = getFamilyParams(familyKey);
+    const entry = params.strategy_mix[styleKey];
+    if (!entry) return;
+    entry.amplitude_deviation = ampDev;
+    entry.threshold_deviation = thrDev;
+    const isAgg = styleKey === "aggressive";
+    const globalBase = Object.assign({}, getGlobalStyleBase(), getGlobalPositionBase());
+    for (const field of iterStyleParamFields(familyKey)) {
+      if (!field.name || field.name === "core_base_pct") continue;
+      // 全局字段从全局基准读取，策略专属字段从均衡 entry 读取
+      let bVal;
+      if (Object.prototype.hasOwnProperty.call(globalBase, field.name)) {
+        bVal = globalBase[field.name];
+      } else {
+        const balanced = params.strategy_mix.balanced || {};
+        const bPreset = familyStylePreset(familyKey, "balanced");
+        bVal = numberOr(balanced[field.name], fieldDefaultValue(field, bPreset, 0));
+      }
+      let dev = -1;
+      if (AMPLITUDE_FIELDS.includes(field.name)) dev = ampDev;
+      else if (THRESHOLD_FIELDS.includes(field.name)) dev = thrDev;
+      else { entry[field.name] = normaliseParamValue(bVal, field, bVal); continue; }
+      const computed = applyDeviation(bVal, dev, isAgg);
+      entry[field.name] = normaliseParamValue(Math.round(computed * 10) / 10, field, bVal);
+    }
+    const bCore = balanced.core_base_pct || defaultCoreBasePct("balanced", familyKey);
+    entry.core_base_pct = {};
+    for (const state of Object.keys(strategyMarketStates)) {
+      const bCoreVal = numberOr(bCore[state], defaultCoreBasePct("balanced", familyKey)[state]);
+      entry.core_base_pct[state] = Math.round(applyDeviation(bCoreVal, thrDev, isAgg) * 10) / 10;
+    }
+  }
+
   function collectStrategyMix(data) {
     const familyKey = data?.strategy_family || activeFamilyKeyFromForm();
     const params = getFamilyParams(familyKey);
@@ -296,152 +381,6 @@
   function strategySummaryText(data) {
     const styleKey = strategyKeys.includes(data?.strategy) ? data.strategy : activeStyleKeyFromForm();
     return `参数风格：${strategyText(styleKey)}<br>风格使用方式：左侧选择当前执行风格，且不再跟随总体策略分别记忆；顶部【参数】只负责编辑各风格微调。`;
-  }
-
-  const signalUiProfiles = {
-    trend_signal_control: {
-      sections: {
-        "market-context": {title: "② 大趋势环境", pill: "先判断能不能做"},
-        "entry-setup": {title: "③ 入场信号", pill: "只保留三类"},
-        "volume-confirm": {title: "④ 量价辅助确认", pill: "只加减权重"},
-        "exit-setup": {title: "⑤ 减仓 / 清仓信号", pill: "风险优先"},
-      },
-      options: {
-        "market_state:sideways": {text: "震荡/无趋势", tip: "价格反复穿越均线，假突破较多，仓位要打折。", impact: "wait"},
-        "market_state:bear": {text: "200日线下方且向下", tip: "价格在200日线下方，且200日线向下；原则上不新增买入。", impact: "sell-strong"},
-        "market_state:below_200": {text: "未站上200日线", tip: "价格仍在200日线下方，但已开始反弹；只能小仓验证。", impact: "wait"},
-        "market_state:above_200": {text: "站上200日线", tip: "价格在200日线上方，50日线走平或向上，可以开始做趋势仓。", impact: "buy"},
-        "market_state:strong_bull": {text: "50日线 > 200日线强多头", tip: "价格 > 50日线 > 200日线，且均线向上，是最适合加仓的环境。", impact: "buy-strong"},
-        "market_risk": {text: "大盘/板块同步走弱", tip: "大盘、同类ETF或板块同步跌破关键均线时，单个标的信号要降权。", impact: "sell"},
-        "entry_state:none": {text: "暂无买点", tip: "没有站回、突破、回踩不破或持续新高等明确买点。", impact: "wait"},
-        "entry_state:reversal_50": {text: "站回50日线反转试仓", tip: "下跌后站回50日线，但未完全确认，只能试仓。", impact: "buy"},
-        "entry_state:breakout": {text: "平台/前高突破", tip: "多头环境中突破平台/前高，最好用收盘价确认，而不是盘中刺破。", impact: "buy"},
-        "entry_state:pullback_hold": {text: "回踩20/50日线不破", tip: "多头趋势中回踩20/50日线不破，通常比追高更稳。", impact: "buy-strong"},
-        "entry_state:continuation_high": {text: "强趋势持续创新高", tip: "强多头中持续创新高，适合已有盈利后加仓，不适合亏损加仓。", impact: "buy-strong"},
-        "volume_state:none": {text: "暂无明显量价信号", tip: "没有明显放量突破、回踩缩量、冲高回落、收盘未站稳或远离均线。", impact: "wait"},
-        "volume_confirm": {text: "突破时放量", tip: "突破时放量是加分项，但不能替代趋势和止损。", impact: "buy"},
-        "pullback_volume_dry": {text: "回踩缩量", tip: "回踩缩量说明抛压较小，是辅助确认。", impact: "buy"},
-        "upper_shadow": {text: "放量长上影 / 冲高回落", tip: "长上影/冲高回落代表上方抛压，买入仓位自动降低。", impact: "sell"},
-        "failed_close": {text: "收盘未站稳关键位", tip: "突破后没有收在关键位上方，不视为有效突破。", impact: "sell"},
-        "far_from_ma": {text: "远离均线 / 涨速过快", tip: "价格明显远离20日/50日均线时，追高风险收益比变差。", impact: "sell"},
-        "exit_state:none": {text: "暂无破位", tip: "没有跌破20/50/200日线、突破失败或触发初始止损。", impact: "wait"},
-        "exit_state:below_20": {text: "跌破20日线", tip: "短线趋势弱化，适合先减一部分或收紧止损。", impact: "sell"},
-        "exit_state:failed_breakout": {text: "突破失败", tip: "突破失败是常见亏损来源，优先降风险。", impact: "sell"},
-        "exit_state:below_50": {text: "跌破50日线", tip: "50日线失守代表中期趋势破坏，至少大减仓。", impact: "sell-strong"},
-        "exit_state:below_200": {text: "跌破200日线", tip: "200日线失守代表大趋势破坏，交易仓应退出。", impact: "sell-strong"},
-        "exit_state:hit_stop": {text: "触发初始止损", tip: "初始止损触发后不要犹豫，不补亏损仓。", impact: "sell-strong"},
-      }
-    },
-    five_dimension_timing: {
-      sections: {
-        "market-context": {title: "② 五维市场底色", pill: "先看维度方向"},
-        "entry-setup": {title: "③ 技术维度", pill: "一票输入"},
-        "volume-confirm": {title: "④ 资金 / 情绪维度", pill: "一票输入"},
-        "exit-setup": {title: "⑤ 风控负票", pill: "约束仓位"},
-      },
-      options: {
-        "market_state:sideways": {text: "技术中性：震荡/无趋势", tip: "技术维度不给明显正负票，五维策略会更多依赖估值、资金、情绪和基本面。", impact: "wait"},
-        "market_state:bear": {text: "技术负票：长期下行", tip: "长期趋势处于下行，技术维度给负票，并压低可用仓位上限。", impact: "sell-strong"},
-        "market_state:below_200": {text: "技术偏弱：低于长期线", tip: "价格未站上长期趋势线，技术维度偏谨慎。", impact: "sell"},
-        "market_state:above_200": {text: "技术正票：站上长期趋势", tip: "长期趋势恢复，技术维度给正票，但仍需其他维度交叉验证。", impact: "buy"},
-        "market_state:strong_bull": {text: "技术强正票：多周期共振", tip: "中长期趋势共振，技术维度明显偏多。", impact: "buy-strong"},
-        "market_risk": {text: "资金负票：市场同步走弱", tip: "大盘/板块同步走弱，五维策略把它视为资金/风险维度负票。", impact: "sell"},
-        "entry_state:none": {text: "技术维度无优势", tip: "没有反转、突破、回踩确认或趋势延续，技术维度不加分。", impact: "wait"},
-        "entry_state:reversal_50": {text: "技术修复：站回中期线", tip: "中期趋势修复，技术维度小幅加分。", impact: "buy"},
-        "entry_state:breakout": {text: "技术正票：结构突破", tip: "突破平台/前高，技术维度给正票。", impact: "buy"},
-        "entry_state:pullback_hold": {text: "技术正票：回踩确认", tip: "回踩均线不破，说明趋势结构仍有效。", impact: "buy-strong"},
-        "entry_state:continuation_high": {text: "技术强正票：趋势延续", tip: "趋势持续创新高，技术维度强加分，但情绪过热会抵消。", impact: "buy-strong"},
-        "volume_state:none": {text: "资金/情绪中性", tip: "缺少明显资金或情绪信号，按0票处理。", impact: "wait"},
-        "volume_confirm": {text: "资金正票：放量确认", tip: "上涨或突破伴随放量，资金维度给正票。", impact: "buy"},
-        "pullback_volume_dry": {text: "资金正票：缩量回踩", tip: "回踩时缩量，说明抛压有限，资金维度加分。", impact: "buy"},
-        "upper_shadow": {text: "情绪负票：冲高回落", tip: "冲高回落说明追涨情绪不稳，情绪维度给负票。", impact: "sell"},
-        "failed_close": {text: "确认负票：关键位未站稳", tip: "突破或反弹未能收稳，确认维度扣分。", impact: "sell"},
-        "far_from_ma": {text: "情绪负票：短期过热", tip: "价格远离均线，代表追高风险，情绪维度给负票。", impact: "sell"},
-        "exit_state:none": {text: "无重大风控负票", tip: "没有触发明显风控负票。", impact: "wait"},
-        "exit_state:below_20": {text: "短期风控负票", tip: "短期趋势弱化，但不必直接清仓。", impact: "sell"},
-        "exit_state:failed_breakout": {text: "结构失败负票", tip: "突破失败会削弱技术和情绪维度。", impact: "sell"},
-        "exit_state:below_50": {text: "中期风控负票", tip: "中期趋势失守，五维策略会明显压低目标仓位。", impact: "sell-strong"},
-        "exit_state:below_200": {text: "长期风控负票", tip: "长期趋势破坏，目标仓位上限会被压低。", impact: "sell-strong"},
-        "exit_state:hit_stop": {text: "硬风控负票", tip: "触发止损，优先服从风控，而不是继续投票。", impact: "sell-strong"},
-      }
-    },
-    mini_factor_timing: {
-      sections: {
-        "market-context": {title: "② 趋势 / 动量因子", pill: "因子输入"},
-        "entry-setup": {title: "③ 结构动量因子", pill: "因子输入"},
-        "volume-confirm": {title: "④ 量能 / 过热因子", pill: "因子输入"},
-        "exit-setup": {title: "⑤ 风险因子", pill: "限制上限"},
-      },
-      options: {
-        "market_state:sideways": {text: "动量中性：噪音区", tip: "趋势因子没有明显方向，目标仓位更多由估值、回撤、波动、质量决定。", impact: "wait"},
-        "market_state:bear": {text: "长期趋势因子为负", tip: "长期趋势和动量偏弱，因子策略会降低目标仓位上限。", impact: "sell-strong"},
-        "market_state:below_200": {text: "价格低于长期均线", tip: "长期趋势因子偏弱，但不等于直接清仓。", impact: "sell"},
-        "market_state:above_200": {text: "长期趋势因子为正", tip: "价格站上长期均线，趋势因子加分。", impact: "buy"},
-        "market_state:strong_bull": {text: "多周期动量强", tip: "MA50 > MA200 或多周期动量较强，趋势因子明显加分。", impact: "buy-strong"},
-        "market_risk": {text: "系统风险因子为负", tip: "市场同步走弱，作为风险因子扣分。", impact: "sell"},
-        "entry_state:none": {text: "无结构动量优势", tip: "没有结构突破、趋势修复或回踩确认，结构动量不加分。", impact: "wait"},
-        "entry_state:reversal_50": {text: "修复动量", tip: "价格重新站回中期均线，结构动量小幅加分。", impact: "buy"},
-        "entry_state:breakout": {text: "突破动量", tip: "结构突破，动量因子加分。", impact: "buy"},
-        "entry_state:pullback_hold": {text: "回踩强度保持", tip: "回踩不破说明趋势韧性较好，动量因子加分。", impact: "buy-strong"},
-        "entry_state:continuation_high": {text: "持续新高动量", tip: "持续新高代表动量较强，但若远离均线会被过热因子抵消。", impact: "buy-strong"},
-        "volume_state:none": {text: "量能因子中性", tip: "没有明显量能确认或风险，按中性处理。", impact: "wait"},
-        "volume_confirm": {text: "量能确认因子为正", tip: "放量确认，量能因子加分。", impact: "buy"},
-        "pullback_volume_dry": {text: "缩量回踩因子为正", tip: "缩量回踩说明抛压有限，量能因子加分。", impact: "buy"},
-        "upper_shadow": {text: "冲高回落因子为负", tip: "冲高回落说明短期抛压或情绪不稳，扣分。", impact: "sell"},
-        "failed_close": {text: "确认失败因子为负", tip: "关键位未确认，结构因子扣分。", impact: "sell"},
-        "far_from_ma": {text: "过热因子为负", tip: "价格远离均线，过热风险增加，扣分。", impact: "sell"},
-        "exit_state:none": {text: "风险因子未触发", tip: "没有明显风险因子触发。", impact: "wait"},
-        "exit_state:below_20": {text: "短期风险因子", tip: "短期趋势变弱，降低目标仓位或加仓速度。", impact: "sell"},
-        "exit_state:failed_breakout": {text: "突破失败风险因子", tip: "突破失败会削弱结构动量。", impact: "sell"},
-        "exit_state:below_50": {text: "中期风险因子", tip: "中期趋势破坏，压低目标仓位上限。", impact: "sell-strong"},
-        "exit_state:below_200": {text: "长期风险因子", tip: "长期趋势破坏，因子策略不允许高仓位。", impact: "sell-strong"},
-        "exit_state:hit_stop": {text: "止损风险因子", tip: "触发止损后优先控制风险。", impact: "sell-strong"},
-      }
-    }
-  };
-
-  function setSectionTitle(sectionName, title, pill) {
-    const section = document.querySelector(`[data-section="${sectionName}"]`);
-    if (!section) return;
-    const h2 = section.querySelector(".card-title h2");
-    const badge = section.querySelector(".card-title .pill");
-    if (h2) h2.textContent = title;
-    if (badge) badge.textContent = pill;
-  }
-
-  function inputSelectorFromSignalKey(key) {
-    const [name, value] = String(key || "").split(":");
-    if (!name) return "";
-    if (value === undefined) {
-      return `input[type="checkbox"][name="${CSS.escape(name)}"]`;
-    }
-    return `input[type="checkbox"][name="${CSS.escape(name)}"][value="${CSS.escape(value)}"]`;
-  }
-
-  function relabelSignalOption(key, item) {
-    if (!signalForm || !key || !item) return;
-    const input = signalForm.querySelector(inputSelectorFromSignalKey(key));
-    const label = input?.closest?.("label");
-    if (!input || !label) return;
-    const checked = input.checked;
-    label.dataset.signalKey = key;
-    if (item.impact) label.dataset.impact = item.impact;
-    if (item.tip !== undefined) label.dataset.tip = item.tip;
-    while (label.firstChild) label.removeChild(label.firstChild);
-    label.appendChild(input);
-    input.checked = checked;
-    label.appendChild(document.createTextNode(` ${item.text || ""}`));
-  }
-
-  const sharedSignalSections = ["market-context", "entry-setup", "volume-confirm", "exit-setup"];
-
-  function setSharedSignalSectionsVisible(visible) {
-    for (const sectionName of sharedSignalSections) {
-      const section = document.querySelector(`[data-section="${sectionName}"]`);
-      if (!section) continue;
-      section.hidden = !visible;
-      section.setAttribute("aria-hidden", visible ? "false" : "true");
-    }
   }
 
   function renderSchemaField(field, values) {
@@ -485,10 +424,7 @@
     if (!host || !signalForm) return false;
 
     const schema = strategyFamilyInfo[familyKey]?.input_schema || [];
-    const useCustomSchema = familyKey !== "trend_signal_control" && Array.isArray(schema) && schema.length > 0;
-    setSharedSignalSectionsVisible(!useCustomSchema);
-
-    if (!useCustomSchema) {
+    if (!Array.isArray(schema) || !schema.length) {
       host.hidden = true;
       host.innerHTML = "";
       return false;
@@ -534,20 +470,7 @@
 
   function applyStrategySignalProfile() {
     const familyKey = activeFamilyKeyFromForm();
-    const custom = renderStrategySpecificInputs(familyKey);
-    if (!custom) {
-      const profile = signalUiProfiles[familyKey] || signalUiProfiles.trend_signal_control;
-      const fallback = signalUiProfiles.trend_signal_control;
-      const sections = Object.assign({}, fallback.sections || {}, profile.sections || {});
-      for (const [sectionName, section] of Object.entries(sections)) {
-        setSectionTitle(sectionName, section.title, section.pill);
-      }
-      const options = Object.assign({}, fallback.options || {}, profile.options || {});
-      for (const [key, item] of Object.entries(options)) {
-        relabelSignalOption(key, item);
-      }
-    }
-
+    renderStrategySpecificInputs(familyKey);
     const signalPaneEl = document.getElementById("signal-pane");
     if (signalPaneEl) signalPaneEl.dataset.strategyFamily = familyKey;
   }
@@ -560,6 +483,13 @@
     CN: "A股/国内基金",
     auto: "自动"
   };
+
+  const ADVANCED_CONFIG_KEYS = [
+    "trade_step_limit_enabled",
+    "core_step_pct", "buy_step_limit_pct", "sell_step_limit_pct",
+    "core_min_position_pct", "core_max_position_pct",
+    "strict_min_position_pct", "strict_max_position_pct",
+  ];
 
   function debounce(fn, wait = 220) {
     let timer = null;
@@ -676,6 +606,26 @@
       retry_count: Number(data.retry_count || 2),
       danjuan_cookie: data.danjuan_cookie || ""
     };
+    // 全局仓位边界
+    const gPos = getGlobalPositionBase();
+    payload.core_min_position_pct = gPos.core_min_position_pct;
+    payload.core_max_position_pct = gPos.core_max_position_pct;
+    payload.strict_min_position_pct = gPos.strict_min_position_pct;
+    payload.strict_max_position_pct = gPos.strict_max_position_pct;
+    // 全局执行速度：基准值 + 当前风格偏离度修正
+    const gStyle = getGlobalStyleBase();
+    const activeStyle = data.strategy || activeStyleKeyFromForm();
+    const curEntry = (getFamilyParams(activeFamily).strategy_mix || {})[activeStyle] || {};
+    const devs = getDeviations(curEntry);
+    const isAgg = activeStyle === "aggressive";
+    if (activeStyle !== "balanced" && devs.amplitude > 0) {
+      payload.global_buy_step_pct = Math.round(applyDeviation(gStyle.buy_step_pct, devs.amplitude, isAgg) * 10) / 10;
+      payload.global_sell_step_pct = Math.round(applyDeviation(gStyle.sell_step_pct, devs.amplitude, isAgg) * 10) / 10;
+    } else {
+      payload.global_buy_step_pct = gStyle.buy_step_pct;
+      payload.global_sell_step_pct = gStyle.sell_step_pct;
+    }
+    payload.global_risk_multiplier = gStyle.risk_multiplier;
     return payload;
   }
 
@@ -709,6 +659,218 @@
     el.textContent = text || "";
     parent.appendChild(el);
     return el;
+  }
+
+  // 全局配置字段显示名
+  const ALL_FIELD_LABELS = {
+    buy_step_pct: "买入节奏%", sell_step_pct: "卖出节奏%",
+    core_min_position_pct: "增强最低仓位%", core_max_position_pct: "增强最高仓位%",
+    strict_min_position_pct: "交易最低仓位%", strict_max_position_pct: "交易最高仓位%",
+    core_step_pct: "补仓上限%", buy_step_limit_pct: "买入上限%", sell_step_limit_pct: "卖出上限%",
+    bear_cap_pct: "熊市仓位上限%", below200_cap_pct: "200日线下上限%", risk_event_cap_pct: "风险事件上限%",
+    high_valuation_cap_sideways_pct: "高估值震荡上限%", high_valuation_cap_trend_pct: "高估值趋势上限%",
+    extreme_valuation_cap_sideways_pct: "极端估值震荡上限%", extreme_valuation_cap_trend_pct: "极端估值趋势上限%",
+  };
+
+  // 全局配置弹窗：合并执行速度 + 仓位边界 + 基础仓位表 + 偏离度
+  function openGlobalConfigModal() {
+    const modal = $("#global-config-modal");
+    const title = $("#global-config-title");
+    const subtitle = $("#global-config-subtitle");
+    const body = $("#global-config-body");
+    if (!modal || !body) return;
+    body.innerHTML = "";
+    if (title) title.textContent = "全局配置";
+    if (subtitle) subtitle.textContent = "所有策略共享的执行速度、仓位边界与偏离度。";
+
+    const activeFamily = activeFamilyKeyFromForm();
+    const activeStyle = activeStyleKeyFromForm();
+    const params = getFamilyParams(activeFamily);
+
+    // ① 均衡基准 — 执行速度
+    const speedBox = document.createElement("div");
+    speedBox.className = "family-param-subgroup";
+    const speedHead = document.createElement("div");
+    speedHead.className = "family-param-group-title";
+    appendTextEl(speedHead, "strong", "", "均衡基准 · 执行速度");
+    appendTextEl(speedHead, "em", "", "进攻和防守都从此基准偏离。");
+    speedBox.appendChild(speedHead);
+    const speedGrid = document.createElement("div");
+    speedGrid.className = "global-field-row";
+    const speedFields = [
+      {name: "global_buy_step_pct", label: "买入节奏%", default: 26, tip: "买入/加仓时的单次执行速度。"},
+      {name: "global_sell_step_pct", label: "卖出节奏%", default: 48, tip: "减仓/止盈时的单次执行速度。"},
+      {name: "global_risk_multiplier", label: "风险倍率", default: 1.0, min: 0.1, max: 5, step: 0.05, tip: "风险预算倍率。"},
+    ];
+    for (const f of speedFields) {
+      const label = document.createElement("label");
+      label.className = "mini-field";
+      if (f.tip) label.dataset.tip = f.tip;
+      appendTextEl(label, "span", "", f.label);
+      const input = document.createElement("input");
+      input.type = "number";
+      input.step = String(f.step ?? 0.1);
+      input.min = String(f.min ?? 0);
+      input.max = String(f.max ?? 100);
+      input.value = numberOr(initialConfig[f.name], f.default);
+      input.dataset.globalField = f.name;
+      label.appendChild(input);
+      speedGrid.appendChild(label);
+    }
+    speedBox.appendChild(speedGrid);
+    body.appendChild(speedBox);
+
+    // ② 均衡基准 — 仓位边界
+    const boundBox = document.createElement("div");
+    boundBox.className = "family-param-subgroup";
+    const boundHead = document.createElement("div");
+    boundHead.className = "family-param-group-title";
+    appendTextEl(boundHead, "strong", "", "均衡基准 · 仓位边界");
+    appendTextEl(boundHead, "em", "", "控制目标仓位的上下限。");
+    boundBox.appendChild(boundHead);
+    const boundGrid = document.createElement("div");
+    boundGrid.className = "global-field-row";
+    const boundFields = [
+      {name: "core_min_position_pct", label: "增强最低仓位%", default: 5, tip: "定投增强策略的最低目标仓位。"},
+      {name: "core_max_position_pct", label: "增强最高仓位%", default: 92, tip: "定投增强策略的最高目标仓位。"},
+      {name: "strict_min_position_pct", label: "交易最低仓位%", default: 0, tip: "纯交易仓模式的最低目标仓位。"},
+      {name: "strict_max_position_pct", label: "交易最高仓位%", default: 60, tip: "纯交易仓模式的最高目标仓位。"},
+    ];
+    for (const f of boundFields) {
+      const label = document.createElement("label");
+      label.className = "mini-field";
+      if (f.tip) label.dataset.tip = f.tip;
+      appendTextEl(label, "span", "", f.label);
+      const input = document.createElement("input");
+      input.type = "number"; input.step = "0.1"; input.min = "0"; input.max = "100";
+      input.value = numberOr(initialConfig[f.name], f.default);
+      input.dataset.globalField = f.name;
+      label.appendChild(input);
+      boundGrid.appendChild(label);
+    }
+    boundBox.appendChild(boundGrid);
+    body.appendChild(boundBox);
+
+    // ③ 基础仓位表
+    const entry = (params.strategy_mix || {})[activeStyle] || {};
+    const coreBase = entry.core_base_pct || defaultCoreBasePct(activeStyle, activeFamily);
+    const coreSection = document.createElement("details");
+    coreSection.className = "family-core-tune";
+    coreSection.open = true;
+    appendTextEl(coreSection, "summary", "", `基础目标仓位表（${strategyInfo[activeStyle]?.name || activeStyle}）`);
+    appendTextEl(coreSection, "p", "family-param-help", "不同趋势状态下的基础目标仓位；后续再叠加估值、质量和风控修正。");
+    const coreGrid = document.createElement("div");
+    coreGrid.className = "family-core-grid";
+    for (const [state, stateName] of Object.entries(strategyMarketStates)) {
+      const label = document.createElement("label");
+      label.className = "mini-field";
+      label.dataset.tip = `${stateName}状态下，当前风格的基础目标仓位。`;
+      appendTextEl(label, "span", "", `${stateName}%`);
+      const input = document.createElement("input");
+      input.type = "number"; input.step = "0.1"; input.min = "0"; input.max = "100";
+      input.value = numberOr(coreBase[state], 50);
+      input.dataset.globalCoreBase = state;
+      label.appendChild(input);
+      coreGrid.appendChild(label);
+    }
+    coreSection.appendChild(coreGrid);
+    body.appendChild(coreSection);
+
+    // ④ 进攻/防守偏离度（操作幅度 + 操作阈值）
+    const renderDevGroup = (styleKey, label, tipSuffix) => {
+      const sEntry = (params.strategy_mix || {})[styleKey] || {};
+      const devs = getDeviations(sEntry);
+      const isAgg = styleKey === "aggressive";
+
+      const box = document.createElement("div");
+      box.className = "family-param-subgroup multiplier-section";
+      const head = document.createElement("div");
+      head.className = "family-param-group-title";
+      appendTextEl(head, "strong", "", label);
+      appendTextEl(head, "em", "", tipSuffix);
+      box.appendChild(head);
+
+      // 两个滑块：操作幅度偏离 + 操作阈值偏离
+      const g = document.createElement("div");
+      g.className = "family-param-grid multiplier-grid";
+
+      // 操作幅度滑块
+      const ampLbl = document.createElement("label");
+      ampLbl.className = "mini-field multiplier-field";
+      ampLbl.dataset.tip = isAgg
+        ? "向右拖 = 买入更快、卖出更慢。0%=与均衡一致。"
+        : "向右拖 = 买入更慢、卖出更快。0%=与均衡一致。";
+      appendTextEl(ampLbl, "span", "", "操作幅度偏离");
+      const ampInput = document.createElement("input");
+      ampInput.type = "range"; ampInput.min = "0"; ampInput.max = "100"; ampInput.step = "1";
+      ampInput.value = String(devs.amplitude);
+      ampInput.className = "multiplier-slider";
+      ampInput.dataset.globalAmpDev = styleKey;
+      ampLbl.appendChild(ampInput);
+      const ampVal = document.createElement("span");
+      ampVal.className = "multiplier-value";
+      ampVal.textContent = `${devs.amplitude}%`;
+      ampLbl.appendChild(ampVal);
+      g.appendChild(ampLbl);
+
+      // 操作阈值滑块
+      const thrLbl = document.createElement("label");
+      thrLbl.className = "mini-field multiplier-field";
+      thrLbl.dataset.tip = isAgg
+        ? "向右拖 = 阈值向100%推（更宽松）。0%=与均衡一致。"
+        : "向右拖 = 阈值向0%压（更严格）。0%=与均衡一致。";
+      appendTextEl(thrLbl, "span", "", "操作阈值偏离");
+      const thrInput = document.createElement("input");
+      thrInput.type = "range"; thrInput.min = "0"; thrInput.max = "100"; thrInput.step = "1";
+      thrInput.value = String(devs.threshold);
+      thrInput.className = "multiplier-slider";
+      thrInput.dataset.globalThrDev = styleKey;
+      thrLbl.appendChild(thrInput);
+      const thrVal = document.createElement("span");
+      thrVal.className = "multiplier-value";
+      thrVal.textContent = `${devs.threshold}%`;
+      thrLbl.appendChild(thrVal);
+      g.appendChild(thrLbl);
+
+      box.appendChild(g);
+
+      // 预览：所有受影响字段
+      const globalBase = Object.assign({}, getGlobalStyleBase(), getGlobalPositionBase());
+      const preview = document.createElement("div");
+      preview.className = "multiplier-preview";
+      const previewGrid = document.createElement("div");
+      previewGrid.className = "multiplier-preview-grid";
+      const allPreviewFields = [...AMPLITUDE_FIELDS, ...THRESHOLD_FIELDS];
+      for (const f of allPreviewFields) {
+        let bVal = globalBase[f];
+        if (bVal === undefined) continue;
+        const dev = AMPLITUDE_FIELDS.includes(f) ? devs.amplitude : devs.threshold;
+        const computed = Math.round(applyDeviation(bVal, dev, isAgg) * 10) / 10;
+        const row = document.createElement("div");
+        row.className = "preview-row";
+        appendTextEl(row, "span", "preview-name", ALL_FIELD_LABELS[f] || f);
+        appendTextEl(row, "span", "preview-arrow", `${bVal} →`);
+        appendTextEl(row, "span", "preview-val", String(computed));
+        previewGrid.appendChild(row);
+      }
+      preview.appendChild(previewGrid);
+      box.appendChild(preview);
+      return box;
+    };
+
+    body.appendChild(renderDevGroup("defensive", "防守偏离", "向0%方向压，买入更慢卖出更快；阈值更严格。"));
+    body.appendChild(renderDevGroup("aggressive", "进攻偏离", "向100%方向推，买入更快卖出更慢；阈值更宽松。"));
+
+    modal.hidden = false;
+    modal.setAttribute("aria-hidden", "false");
+  }
+
+  function closeGlobalConfigModal() {
+    const modal = $("#global-config-modal");
+    if (!modal) return;
+    modal.hidden = true;
+    modal.setAttribute("aria-hidden", "true");
+    saveConfigDebounced();
   }
 
   function renderStrategyFamilyTabs() {
@@ -789,6 +951,15 @@
       grid.appendChild(label);
     }
     host.appendChild(grid);
+
+    // 全局执行速度按钮
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "inline-config-btn";
+    btn.dataset.openGlobalConfig = "style";
+    btn.setAttribute("aria-label", "编辑执行速度");
+    btn.textContent = "执行速度";
+    host.appendChild(btn);
   }
 
   function openFamilySettings(familyKey) {
@@ -814,8 +985,8 @@
     const subtitle = $("#family-settings-subtitle");
     const body = $("#family-settings-body");
     if (!body) return;
-    if (title) title.textContent = `${family.name || familyKey} · 参数设置`;
-    if (subtitle) subtitle.textContent = "左侧选择全局执行参数风格；这里仅编辑该总体策略下各风格的具体参数。";
+    if (title) title.textContent = `${family.name || familyKey} · 参数微调`;
+    if (subtitle) subtitle.textContent = "编辑均衡基准参数。非均衡风格的偏离度请在左侧【执行速度】和此处【操作阈值】中调整。";
     body.innerHTML = "";
 
     const intro = document.createElement("section");
@@ -827,42 +998,10 @@
     }
     body.appendChild(intro);
 
-    const picker = document.createElement("fieldset");
-    picker.className = "family-style-picker";
-    appendTextEl(picker, "legend", "", "编辑哪个参数风格");
-    const pickerGrid = document.createElement("div");
-    pickerGrid.className = "family-style-grid";
-    const editStyle = strategyKeys.includes(familyEditStyleState[familyKey])
-      ? familyEditStyleState[familyKey]
-      : activeStyleKeyFromForm();
-    familyEditStyleState[familyKey] = editStyle;
-    for (const styleKey of strategyKeys) {
-      const item = strategyInfo[styleKey] || {};
-      const label = document.createElement("label");
-      label.className = `family-style-option ${styleKey === editStyle ? "is-active" : ""}`;
-      const input = document.createElement("input");
-      input.type = "radio";
-      input.name = `family_edit_style_${familyKey}`;
-      input.value = styleKey;
-      input.checked = styleKey === editStyle;
-      input.dataset.familyEditStyle = familyKey;
-      label.appendChild(input);
-      const text = document.createElement("span");
-      appendTextEl(text, "strong", "", item.name || styleKey);
-      appendTextEl(text, "em", "", styleKey === activeStyleKeyFromForm() ? "当前执行 · " + (item.desc || "") : item.desc || "");
-      label.appendChild(text);
-      pickerGrid.appendChild(label);
-    }
-    picker.appendChild(pickerGrid);
-    body.appendChild(picker);
-
-    const list = document.createElement("div");
-    list.className = "family-param-list";
-
-    // 这里只编辑一个风格的参数；当前执行风格由左侧【参数风格】选择。
-    const styleKey = editStyle;
+    // 始终编辑均衡风格
+    const styleKey = "balanced";
     const styleInfo = familyStylePreset(familyKey, styleKey);
-    const entry = params.strategy_mix[styleKey] || defaultStyleEntry(styleKey, activeStyleKeyFromForm(), familyKey);
+    const entry = params.strategy_mix[styleKey] || defaultStyleEntry(styleKey, "balanced", familyKey);
     const section = document.createElement("section");
     section.className = "family-param-card is-active";
     section.dataset.familyKey = familyKey;
@@ -871,105 +1010,183 @@
     const head = document.createElement("div");
     head.className = "family-param-head";
     const headText = document.createElement("div");
-    appendTextEl(headText, "strong", "", `${styleInfo.name || styleKey}微调`);
+    appendTextEl(headText, "strong", "", "均衡基准参数");
     appendTextEl(headText, "em", "", styleInfo.research_note || styleInfo.desc || "");
     head.appendChild(headText);
-    appendTextEl(head, "span", "family-param-badge", styleKey === activeStyleKeyFromForm() ? "当前执行" : "备用配置");
     section.appendChild(head);
 
-    const renderValueField = (grid, field) => {
-      const name = field.name;
-      const fallback = fieldDefaultValue(field, styleInfo, 0);
-      const label = document.createElement("label");
-      label.className = field.type === "checkbox" ? "mini-field mini-field-check" : "mini-field";
-      label.dataset.tip = field.tip || field.desc || "";
-      appendTextEl(label, "span", "", field.label || name);
+    // 非均衡时：操作阈值偏离度
+    const activeStyle = activeStyleKeyFromForm();
+    if (activeStyle !== "balanced") {
+      const activeEntry = params.strategy_mix[activeStyle] || {};
+      const devs = getDeviations(activeEntry);
+      const isAgg = activeStyle === "aggressive";
+      const devDir = isAgg ? "进攻" : "防守";
+      const devTip = isAgg
+        ? "向右拖动 = 向100%方向推。0%=与均衡一致，100%=所有阈值推到100%。"
+        : "向右拖动 = 向0%方向压。0%=与均衡一致，100%=所有阈值压到0%。";
 
-      let input;
-      if (field.type === "select" || field.type === "choice") {
-        input = document.createElement("select");
-        const options = Array.isArray(field.options) ? field.options : [];
-        for (const item of options) {
-          const value = Array.isArray(item) ? item[0] : item;
-          const text = Array.isArray(item) ? (item[1] || item[0]) : item;
-          const option = document.createElement("option");
-          option.value = String(value);
-          option.textContent = String(text);
-          input.appendChild(option);
-        }
-        input.value = normaliseParamValue(entry[name], field, fallback);
-      } else {
-        input = document.createElement("input");
-        input.type = field.type === "checkbox" ? "checkbox" : "number";
-        if (input.type === "checkbox") {
-          input.checked = Boolean(entry[name] ?? fallback);
-        } else {
-          input.step = String(field.step ?? 0.1);
-          input.min = String(field.min ?? 0);
-          input.max = String(field.max ?? 100);
-          input.value = normaliseParamValue(entry[name], field, fallback);
-        }
+      const thrBox = document.createElement("div");
+      thrBox.className = "family-param-subgroup multiplier-section";
+      const thrHead = document.createElement("div");
+      thrHead.className = "family-param-group-title";
+      appendTextEl(thrHead, "strong", "", `操作阈值（${devDir}偏离度）`);
+      appendTextEl(thrHead, "em", "", "控制单次买入/卖出/补仓上限和仓位上限。");
+      thrBox.appendChild(thrHead);
+
+      const thrGrid = document.createElement("div");
+      thrGrid.className = "family-param-grid multiplier-grid";
+      const thrLabel = document.createElement("label");
+      thrLabel.className = "mini-field multiplier-field";
+      thrLabel.dataset.tip = devTip;
+      appendTextEl(thrLabel, "span", "", `${devDir}偏离度`);
+      const thrInput = document.createElement("input");
+      thrInput.type = "range"; thrInput.min = "0"; thrInput.max = "100"; thrInput.step = "1";
+      thrInput.value = String(devs.threshold);
+      thrInput.className = "multiplier-slider";
+      thrInput.dataset.familyParam = familyKey;
+      thrInput.dataset.styleKey = activeStyle;
+      thrInput.dataset.field = "threshold_deviation";
+      thrLabel.appendChild(thrInput);
+      const thrVal = document.createElement("span");
+      thrVal.className = "multiplier-value";
+      thrVal.textContent = `${devs.threshold}%`;
+      thrLabel.appendChild(thrVal);
+      thrGrid.appendChild(thrLabel);
+      thrBox.appendChild(thrGrid);
+
+      // 预览：全局阈值字段 + 策略专属阈值字段
+      const balanced = params.strategy_mix.balanced || {};
+      const bPreset = familyStylePreset(familyKey, "balanced");
+      const globalPosBase = getGlobalPositionBase();
+      const preview = document.createElement("div");
+      preview.className = "multiplier-preview";
+      const previewGrid = document.createElement("div");
+      previewGrid.className = "multiplier-preview-grid";
+      const shownFields = new Set();
+      // 全局位置字段
+      for (const [fName, bVal] of Object.entries(globalPosBase)) {
+        if (!THRESHOLD_FIELDS.includes(fName)) continue;
+        shownFields.add(fName);
+        const computed = Math.round(applyDeviation(bVal, devs.threshold, isAgg) * 10) / 10;
+        const row = document.createElement("div");
+        row.className = "preview-row";
+        appendTextEl(row, "span", "preview-name", ALL_FIELD_LABELS[fName] || fName);
+        appendTextEl(row, "span", "preview-arrow", `${bVal} →`);
+        appendTextEl(row, "span", "preview-val", String(computed));
+        previewGrid.appendChild(row);
       }
-      input.dataset.familyParam = familyKey;
-      input.dataset.styleKey = styleKey;
-      input.dataset.field = name;
-      label.appendChild(input);
-      grid.appendChild(label);
-    };
-
-    for (const group of styleParamSchema(familyKey)) {
-      if (!group || typeof group !== "object") continue;
-
-      if (group.type === "core_base_table") {
-        const details = document.createElement("details");
-        details.className = "family-core-tune";
-        appendTextEl(details, "summary", "", group.title || "目标仓位表");
-        if (group.desc) appendTextEl(details, "p", "family-param-help", group.desc);
-        const coreGrid = document.createElement("div");
-        coreGrid.className = "family-core-grid";
-        for (const [state, stateName] of Object.entries(strategyMarketStates)) {
-          const label = document.createElement("label");
-          label.className = "mini-field";
-          label.dataset.tip = `${stateName}状态下，该参数风格的基础目标仓位。`;
-          appendTextEl(label, "span", "", `${stateName}%`);
-          const input = document.createElement("input");
-          input.type = "number";
-          input.step = "0.1";
-          input.min = "0";
-          input.max = "100";
-          input.value = entry.core_base_pct?.[state] ?? defaultCoreBasePct(styleKey, familyKey)[state];
-          input.dataset.familyParam = familyKey;
-          input.dataset.styleKey = styleKey;
-          input.dataset.field = "core_base_pct";
-          input.dataset.state = state;
-          label.appendChild(input);
-          coreGrid.appendChild(label);
-        }
-        details.appendChild(coreGrid);
-        section.appendChild(details);
-        continue;
+      // 策略专属阈值字段
+      for (const field of iterStyleParamFields(familyKey)) {
+        if (!THRESHOLD_FIELDS.includes(field.name) || shownFields.has(field.name)) continue;
+        const bVal = numberOr(balanced[field.name], fieldDefaultValue(field, bPreset, 0));
+        const computed = Math.round(applyDeviation(bVal, devs.threshold, isAgg) * 10) / 10;
+        const row = document.createElement("div");
+        row.className = "preview-row";
+        appendTextEl(row, "span", "preview-name", field.label || field.name);
+        appendTextEl(row, "span", "preview-arrow", `${bVal} →`);
+        appendTextEl(row, "span", "preview-val", String(computed));
+        previewGrid.appendChild(row);
       }
-
-      const fields = Array.isArray(group.fields) ? group.fields.filter(field => field && field.name) : [];
-      if (!fields.length) continue;
-      const groupBox = document.createElement("div");
-      groupBox.className = "family-param-subgroup";
-      if (group.title || group.desc) {
-        const groupHead = document.createElement("div");
-        groupHead.className = "family-param-group-title";
-        if (group.title) appendTextEl(groupHead, "strong", "", group.title);
-        if (group.desc) appendTextEl(groupHead, "em", "", group.desc);
-        groupBox.appendChild(groupHead);
-      }
-      const grid = document.createElement("div");
-      grid.className = "family-param-grid";
-      for (const field of fields) renderValueField(grid, field);
-      groupBox.appendChild(grid);
-      section.appendChild(groupBox);
+      preview.appendChild(previewGrid);
+      thrBox.appendChild(preview);
+      section.appendChild(thrBox);
     }
 
-    list.appendChild(section);
-    body.appendChild(list);
+    {
+      const renderValueField = (grid, field) => {
+        const name = field.name;
+        const fallback = fieldDefaultValue(field, styleInfo, 0);
+        const label = document.createElement("label");
+        label.className = field.type === "checkbox" ? "mini-field mini-field-check" : "mini-field";
+        label.dataset.tip = field.tip || field.desc || "";
+        appendTextEl(label, "span", "", field.label || name);
+
+        let input;
+        if (field.type === "select" || field.type === "choice") {
+          input = document.createElement("select");
+          const options = Array.isArray(field.options) ? field.options : [];
+          for (const item of options) {
+            const value = Array.isArray(item) ? item[0] : item;
+            const text = Array.isArray(item) ? (item[1] || item[0]) : item;
+            const option = document.createElement("option");
+            option.value = String(value);
+            option.textContent = String(text);
+            input.appendChild(option);
+          }
+          input.value = normaliseParamValue(entry[name], field, fallback);
+        } else {
+          input = document.createElement("input");
+          input.type = field.type === "checkbox" ? "checkbox" : "number";
+          if (input.type === "checkbox") {
+            input.checked = Boolean(entry[name] ?? fallback);
+          } else {
+            input.step = String(field.step ?? 0.1);
+            input.min = String(field.min ?? 0);
+            input.max = String(field.max ?? 100);
+            input.value = normaliseParamValue(entry[name], field, fallback);
+          }
+        }
+        input.dataset.familyParam = familyKey;
+        input.dataset.styleKey = styleKey;
+        input.dataset.field = name;
+        label.appendChild(input);
+        grid.appendChild(label);
+      };
+
+      for (const group of styleParamSchema(familyKey)) {
+        if (!group || typeof group !== "object") continue;
+
+        if (group.type === "core_base_table") {
+          const details = document.createElement("details");
+          details.className = "family-core-tune";
+          appendTextEl(details, "summary", "", group.title || "目标仓位表");
+          if (group.desc) appendTextEl(details, "p", "family-param-help", group.desc);
+          const coreGrid = document.createElement("div");
+          coreGrid.className = "family-core-grid";
+          for (const [state, stateName] of Object.entries(strategyMarketStates)) {
+            const label = document.createElement("label");
+            label.className = "mini-field";
+            label.dataset.tip = `${stateName}状态下，该参数风格的基础目标仓位。`;
+            appendTextEl(label, "span", "", `${stateName}%`);
+            const input = document.createElement("input");
+            input.type = "number";
+            input.step = "0.1";
+            input.min = "0";
+            input.max = "100";
+            input.value = entry.core_base_pct?.[state] ?? defaultCoreBasePct(styleKey, familyKey)[state];
+            input.dataset.familyParam = familyKey;
+            input.dataset.styleKey = styleKey;
+            input.dataset.field = "core_base_pct";
+            input.dataset.state = state;
+            label.appendChild(input);
+            coreGrid.appendChild(label);
+          }
+          details.appendChild(coreGrid);
+          section.appendChild(details);
+          continue;
+        }
+
+        const fields = Array.isArray(group.fields) ? group.fields.filter(field => field && field.name) : [];
+        if (!fields.length) continue;
+        const groupBox = document.createElement("div");
+        groupBox.className = "family-param-subgroup";
+        if (group.title || group.desc) {
+          const groupHead = document.createElement("div");
+          groupHead.className = "family-param-group-title";
+          if (group.title) appendTextEl(groupHead, "strong", "", group.title);
+          if (group.desc) appendTextEl(groupHead, "em", "", group.desc);
+          groupBox.appendChild(groupHead);
+        }
+        const grid = document.createElement("div");
+        grid.className = "family-param-grid";
+        for (const field of fields) renderValueField(grid, field);
+        groupBox.appendChild(grid);
+        section.appendChild(groupBox);
+      }
+    }
+
+    body.appendChild(section);
   }
 
   function handleFamilySettingsInput(target) {
@@ -987,6 +1204,55 @@
     const styleKey = target.dataset.styleKey;
     const field = target.dataset.field;
     if (!styleKey || !field) return false;
+    // 偏离度滑块：一键基于均衡计算
+    if (field === "amplitude_deviation" || field === "threshold_deviation") {
+      const dev = clampNumber(target.value, 0, 100);
+      const prev = getDeviations(getFamilyParams(familyKey).strategy_mix[styleKey] || {});
+      const ampDev = field === "amplitude_deviation" ? dev : prev.amplitude;
+      const thrDev = field === "threshold_deviation" ? dev : prev.threshold;
+      applyDeviations(familyKey, styleKey, ampDev, thrDev);
+      const valEl = target.parentElement?.querySelector?.(".multiplier-value");
+      if (valEl) valEl.textContent = `${dev}%`;
+      const isAgg = styleKey === "aggressive";
+      const fieldNames = field === "amplitude_deviation" ? AMPLITUDE_FIELDS : THRESHOLD_FIELDS;
+      const balanced = (getFamilyParams(familyKey).strategy_mix || {}).balanced || {};
+      const bPreset = familyStylePreset(familyKey, "balanced");
+      const globalStyleBase = getGlobalStyleBase();
+      const globalPosBase = getGlobalPositionBase();
+      const previewItems = target.closest(".multiplier-section")?.querySelectorAll?.(".preview-row");
+      if (previewItems) {
+        let i = 0;
+        // 全局位置字段（仅阈值偏离时）
+        const posFields = field === "threshold_deviation" ? globalPosBase : {};
+        for (const [fName, bVal] of Object.entries(posFields)) {
+          if (!fieldNames.includes(fName) || !previewItems[i]) { if (fieldNames.includes(fName)) i++; continue; }
+          const arrow = previewItems[i].querySelector(".preview-arrow");
+          const val = previewItems[i].querySelector(".preview-val");
+          if (arrow) arrow.textContent = `${bVal} →`;
+          if (val) val.textContent = String(Math.round(applyDeviation(bVal, dev, isAgg) * 10) / 10);
+          i++;
+        }
+        // 策略专属字段
+        for (const fieldSpec of iterStyleParamFields(familyKey)) {
+          if (!fieldNames.includes(fieldSpec.name) || Object.prototype.hasOwnProperty.call(posFields, fieldSpec.name)) continue;
+          if (previewItems[i]) {
+            let bVal;
+            if (Object.prototype.hasOwnProperty.call(globalStyleBase, fieldSpec.name)) {
+              bVal = globalStyleBase[fieldSpec.name];
+            } else {
+              bVal = numberOr(balanced[fieldSpec.name], fieldDefaultValue(fieldSpec, bPreset, 0));
+            }
+            const arrow = previewItems[i].querySelector(".preview-arrow");
+            const val = previewItems[i].querySelector(".preview-val");
+            if (arrow) arrow.textContent = `${bVal} →`;
+            if (val) val.textContent = String(Math.round(applyDeviation(bVal, dev, isAgg) * 10) / 10);
+          }
+          i++;
+        }
+      }
+      updateStrategySummary();
+      return true;
+    }
     const params = getFamilyParams(familyKey);
     if (!params.strategy_mix[styleKey]) params.strategy_mix[styleKey] = defaultStyleEntry(styleKey, activeStyleKeyFromForm(), familyKey);
     const fieldSpec = iterStyleParamFields(familyKey).find(item => item.name === field) || {name: field, type: target.type === "checkbox" ? "checkbox" : "number", min: target.min, max: target.max};
@@ -1273,9 +1539,7 @@
     const data = toConfigPayload();
     const modeText = data.position_mode === "core_satellite" ? "定投增强策略（目标仓位动态计算）" : "纯交易仓";
     const assetText = data.symbol ? `${data.symbol_name || data.symbol} · ${data.symbol} · ${marketNames[data.market] || data.market} · ${data.asset_kind}` : "未选择标的";
-    const stepText = data.trade_step_limit_enabled === false
-      ? "关闭（检查日直接调到目标仓位）"
-      : `开启（补仓上限 ${data.core_step_pct ?? 22}%）`;
+    const stepText = `补仓上限 ${data.core_step_pct ?? 22}%`;
     summary.innerHTML = `${strategyFamilyText(data.strategy_family)}<br>${strategySummaryText(data)}<br>仓位模式：${modeText}<br>标的：${assetText}<br>数据容错：代理 ${data.proxy_mode || "system"} / 超时 ${data.request_timeout_sec || 12} 秒 / 重试 ${data.retry_count || 0} 次<br>回测无风险收益率：${data.backtest_risk_free_rate_pct ?? 2}%<br>单次操作上限：${stepText}<br>计划资金=100%上限，不按标的类型封顶。`;
     updateStrategyLabState(data);
 
@@ -1888,6 +2152,25 @@
 
     document.addEventListener("change", (event) => {
       const target = event.target;
+      // 全局配置字段（仓位边界、执行速度）
+      if (target?.dataset?.globalField) {
+        saveConfigDebounced();
+        updateStrategySummary();
+        return;
+      }
+      // 基础仓位表（全局弹窗内）
+      if (target?.dataset?.globalCoreBase) {
+        const state = target.dataset.globalCoreBase;
+        const familyKey = activeFamilyKeyFromForm();
+        const styleKey = activeStyleKeyFromForm();
+        const params = getFamilyParams(familyKey);
+        if (!params.strategy_mix[styleKey]) params.strategy_mix[styleKey] = defaultStyleEntry(styleKey, styleKey, familyKey);
+        if (!params.strategy_mix[styleKey].core_base_pct) params.strategy_mix[styleKey].core_base_pct = {};
+        params.strategy_mix[styleKey].core_base_pct[state] = clampNumber(target.value, 0, 100);
+        saveConfigDebounced();
+        updateStrategySummary();
+        return;
+      }
       if (handleFamilySettingsInput(target)) {
         autoApplyInitialStopFromInputs();
         saveConfigDebounced();
@@ -1903,7 +2186,54 @@
     });
 
     document.addEventListener("input", (event) => {
-      if (!handleFamilySettingsInput(event.target)) return;
+      const t = event.target;
+      if (t?.dataset?.globalField || t?.dataset?.globalCoreBase) {
+        saveConfigDebounced();
+        return;
+      }
+      // 偏离度滑块（全局弹窗内：操作幅度 + 操作阈值）
+      if (t?.dataset?.globalAmpDev || t?.dataset?.globalThrDev) {
+        const styleKey = t.dataset.globalAmpDev || t.dataset.globalThrDev;
+        const isAmp = !!t.dataset.globalAmpDev;
+        const dev = clampNumber(t.value, 0, 100);
+        const familyKey = activeFamilyKeyFromForm();
+        const params = getFamilyParams(familyKey);
+        if (!params.strategy_mix[styleKey]) params.strategy_mix[styleKey] = defaultStyleEntry(styleKey, styleKey, familyKey);
+        const entry = params.strategy_mix[styleKey];
+        if (isAmp) entry.amplitude_deviation = dev;
+        else entry.threshold_deviation = dev;
+        applyDeviations(familyKey, styleKey, numberOr(entry.amplitude_deviation, 0), numberOr(entry.threshold_deviation, 0));
+        // 更新当前滑块显示值
+        const parentLabel = t.closest(".multiplier-field");
+        const valEl = parentLabel?.querySelector?.(".multiplier-value");
+        if (valEl) valEl.textContent = `${dev}%`;
+        // 更新预览
+        const section = t.closest(".multiplier-section");
+        const isAgg = styleKey === "aggressive";
+        const globalBase = Object.assign({}, getGlobalStyleBase(), getGlobalPositionBase());
+        const ampDev = numberOr(entry.amplitude_deviation, 0);
+        const thrDev = numberOr(entry.threshold_deviation, 0);
+        const previewItems = section?.querySelectorAll?.(".preview-row");
+        if (previewItems) {
+          let i = 0;
+          const allPreviewFields = [...AMPLITUDE_FIELDS, ...THRESHOLD_FIELDS];
+          for (const f of allPreviewFields) {
+            const bVal = globalBase[f];
+            if (bVal === undefined) continue;
+            if (previewItems[i]) {
+              const fDev = AMPLITUDE_FIELDS.includes(f) ? ampDev : thrDev;
+              const arrow = previewItems[i].querySelector(".preview-arrow");
+              const val = previewItems[i].querySelector(".preview-val");
+              if (arrow) arrow.textContent = `${bVal} →`;
+              if (val) val.textContent = String(Math.round(applyDeviation(bVal, fDev, isAgg) * 10) / 10);
+            }
+            i++;
+          }
+        }
+        saveConfigDebounced();
+        return;
+      }
+      if (!handleFamilySettingsInput(t)) return;
       autoApplyInitialStopFromInputs();
       saveConfigDebounced();
     });
@@ -1921,10 +2251,24 @@
         event.preventDefault();
         closeFamilySettings();
       }
+      // 全局配置弹窗
+      const globalBtn = event.target?.closest?.("[data-open-global-config]");
+      if (globalBtn) {
+        event.preventDefault();
+        openGlobalConfigModal();
+        return;
+      }
+      if (event.target?.closest?.("[data-close-global-config]")) {
+        event.preventDefault();
+        closeGlobalConfigModal();
+      }
     });
 
     document.addEventListener("keydown", (event) => {
-      if (event.key === "Escape") closeFamilySettings();
+      if (event.key === "Escape") {
+        closeFamilySettings();
+        closeGlobalConfigModal();
+      }
     });
   }
 

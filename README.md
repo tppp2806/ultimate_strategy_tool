@@ -11,7 +11,6 @@ strategies/
 ├─ base.py                     # 公共参数风格、工具函数、执行层辅助函数
 └─ families/                   # 每个总体策略一个独立 py
    ├─ trend_signal_control.py  # 趋势信号风控策略
-   ├─ five_dimension_timing.py # 五维择时策略
    └─ _template.py             # 策略模板；以下划线开头，不会自动加载
 ```
 

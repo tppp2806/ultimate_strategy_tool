@@ -461,6 +461,22 @@ def ensure_config() -> Dict[str, Any]:
         merged["valuation_method"] = "system_calc"
     merged["request_timeout_sec"] = clamp(as_float(merged.get("request_timeout_sec"), 12.0), 3.0, 60.0)
     merged["retry_count"] = int(clamp(as_float(merged.get("retry_count"), 2.0), 0.0, 5.0))
+
+    # 全局仓位边界：从顶层读取，缺失时回退到 ADVANCED_PARAM_DEFAULTS。
+    for key, default in [
+        ("core_min_position_pct", 5.0), ("core_max_position_pct", 92.0),
+        ("strict_min_position_pct", 0.0), ("strict_max_position_pct", 60.0),
+    ]:
+        if key not in merged or merged[key] is None or merged[key] == "":
+            merged[key] = default
+
+    # 全局执行速度：从顶层读取，缺失时回退到均衡默认值。
+    for key, default in [
+        ("global_buy_step_pct", 26.0), ("global_sell_step_pct", 48.0), ("global_risk_multiplier", 1.0),
+    ]:
+        if key not in merged or merged[key] is None or merged[key] == "":
+            merged[key] = default
+
     apply_active_family_params(merged)
 
     save_config(merged)
@@ -507,28 +523,40 @@ def apply_active_family_params(cfg: Dict[str, Any]) -> None:
 
 
 def _flatten_active_style_params(cfg: Dict[str, Any]) -> None:
-    """把当前激活风格的执行层参数展平到 cfg 顶层，供 advanced_pct / advanced_bool 读取。"""
+    """把当前激活风格的执行层参数展平到 cfg 顶层，供 advanced_pct / advanced_bool 读取。
+
+    全局字段（仓位边界、执行速度）优先从 cfg 顶层读取，
+    策略专属字段从 strategy_mix entry 中读取。
+    """
     strategy_key = str(cfg.get("strategy", "balanced"))
     mix = cfg.get("strategy_mix") if isinstance(cfg.get("strategy_mix"), dict) else {}
     entry = mix.get(strategy_key) if isinstance(mix.get(strategy_key), dict) else {}
 
-    _ADVANCED_FLAT_KEYS = [
+    # 策略专属字段：从 strategy_mix entry 读取
+    for key, default in [
         ("trade_step_limit_enabled", True),
         ("core_step_pct", 22.0),
         ("buy_step_limit_pct", 28.0),
         ("sell_step_limit_pct", 45.0),
-        ("core_min_position_pct", 5.0),
-        ("core_max_position_pct", 92.0),
-        ("strict_min_position_pct", 0.0),
-        ("strict_max_position_pct", 60.0),
-    ]
-    for key, default in _ADVANCED_FLAT_KEYS:
+    ]:
         if key == "trade_step_limit_enabled":
             cfg[key] = advanced_bool(entry, key, default)
         else:
             cfg[key] = clamp(as_float(entry.get(key), default), 0.0, 100.0)
+
+    # 全局仓位边界：优先从顶层读取（用户在左侧全局配置），回退到 entry
+    for key, default in [
+        ("core_min_position_pct", 5.0), ("core_max_position_pct", 92.0),
+        ("strict_min_position_pct", 0.0), ("strict_max_position_pct", 60.0),
+    ]:
+        cfg[key] = clamp(as_float(cfg.get(key, entry.get(key)), default), 0.0, 100.0)
     cfg["core_min_position_pct"] = min(float(cfg["core_min_position_pct"]), float(cfg["core_max_position_pct"]))
     cfg["strict_min_position_pct"] = min(float(cfg["strict_min_position_pct"]), float(cfg["strict_max_position_pct"]))
+
+    # 全局执行速度：前端已计算偏离度修正后的有效值
+    cfg["buy_step_pct"] = clamp(as_float(cfg.get("global_buy_step_pct"), 26.0), 0.0, 100.0)
+    cfg["sell_step_pct"] = clamp(as_float(cfg.get("global_sell_step_pct"), 48.0), 0.0, 100.0)
+    cfg["global_risk_multiplier"] = clamp(as_float(cfg.get("global_risk_multiplier"), 1.0), 0.1, 5.0)
 
 
 def advanced_pct(cfg: Dict[str, Any], key: str, default: float, min_value: float = 0.0, max_value: float = 100.0) -> float:
@@ -1225,9 +1253,10 @@ def active_strategy_family_key(cfg: Dict[str, Any]) -> str:
         return DEFAULT_STRATEGY_FAMILY
 
 
-def is_trend_signal_family(cfg: Dict[str, Any]) -> bool:
-    """只有趋势信号风控策略才使用入场/破位信号作为硬性交易规则。"""
-    return active_strategy_family_key(cfg) == "trend_signal_control"
+def is_signal_driven_family(cfg: Dict[str, Any]) -> bool:
+    """策略是否声明了信号驱动模式（纯交易仓时使用信号硬规则）。"""
+    key = active_strategy_family_key(cfg)
+    return bool(STRATEGY_FAMILIES.get(key, {}).get("signal_driven", False))
 
 
 def strategy_rule_label(signals: Dict[str, Any], fallback: str = "目标仓位模型") -> str:
@@ -1255,10 +1284,9 @@ def raw_target_by_signal(cfg: Dict[str, Any], signals: Dict[str, Any], cur: floa
     target = cur
     is_core_mode = cfg.get("position_mode") == "core_satellite"
     family_key = active_strategy_family_key(cfg)
-    trend_family = family_key == "trend_signal_control"
-    # 定投增强策略永远使用总体策略目标模型；非趋势类总体策略在纯交易仓模式下也必须使用自己的目标模型，
-    # 否则“五维/小因子”等策略会被旧的趋势交易规则覆盖，看起来像切换不生效。
-    use_target_model = is_core_mode or not trend_family
+    signal_driven = is_signal_driven_family(cfg)
+    # 定投增强策略永远使用总体策略目标模型；非信号驱动类总体策略在纯交易仓模式下也必须使用自己的目标模型。
+    use_target_model = is_core_mode or not signal_driven
 
     # 先生成“总体策略目标仓位”，再由执行层决定是否交易。
     core_target = floor
@@ -1285,7 +1313,7 @@ def raw_target_by_signal(cfg: Dict[str, Any], signals: Dict[str, Any], cur: floa
         reason.append("初始止损被触发，交易失败，先退出交易仓。")
         return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
 
-    if exit_state == "below_200" and trend_family:
+    if exit_state == "below_200" and signal_driven:
         if is_core_mode:
             target = min(cur, core_target)
             action = target_action_from_delta(cur, target, sell_label="减仓")
@@ -1301,7 +1329,7 @@ def raw_target_by_signal(cfg: Dict[str, Any], signals: Dict[str, Any], cur: floa
         reason.append("200日线是大趋势过滤线，跌破后只保留动态防守仓位，严重时可以接近空仓。")
         return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
 
-    if exit_state == "below_50" and trend_family:
+    if exit_state == "below_50" and signal_driven:
         if is_core_mode:
             target = min(cur, core_target)
             action = target_action_from_delta(cur, target, sell_label="减仓")
@@ -1317,7 +1345,7 @@ def raw_target_by_signal(cfg: Dict[str, Any], signals: Dict[str, Any], cur: floa
         reason.append("50日线失守，中期趋势破坏，先把仓位降到防守状态。")
         return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
 
-    if exit_state == "failed_breakout" and trend_family:
+    if exit_state == "failed_breakout" and signal_driven:
         if is_core_mode:
             target = min(cur, core_target)
             action = target_action_from_delta(cur, target, sell_label="减仓")
@@ -1354,7 +1382,7 @@ def raw_target_by_signal(cfg: Dict[str, Any], signals: Dict[str, Any], cur: floa
             reason.extend(core_notes)
         return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
 
-    if exit_state == "below_20" and trend_family:
+    if exit_state == "below_20" and signal_driven:
         if is_core_mode:
             action = target_action_from_delta(cur, core_target, buy_label="加仓", sell_label="减仓")
             # 20日线只是短线信号；如果模型目标低于当前，不主动卖出，只停止追买。
@@ -1395,7 +1423,7 @@ def raw_target_by_signal(cfg: Dict[str, Any], signals: Dict[str, Any], cur: floa
         if action in {"买入", "加仓"}:
             signals["allocation_fill"] = True
             matched = f"{base_rule}：补足目标仓位"
-            if trend_family:
+            if signal_driven:
                 reason.append("定投增强策略模式按目标仓位建设核心仓，不再等短线买点才入场。")
             else:
                 reason.append("当前总体策略直接输出目标仓位；入场/破位信号只作为该策略的输入因子，不再套用趋势策略的硬规则。")

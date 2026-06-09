@@ -29,35 +29,6 @@ FAMILY_META: Dict[str, Any] = {
 # 与趋势信号策略不同，小因子策略的重点不是“入场按钮”，而是六类因子的权重、
 # 手动修正强度和因子失效时的仓位上限。前端会直接读取这些 schema 渲染。
 STYLE_PARAM_PRESETS: Dict[str, Dict[str, Any]] = {
-    "defensive": {
-        "buy_step": 0.14,
-        "sell_step": 0.58,
-        "risk_multiplier": 0.70,
-        "trend_factor_weight_pct": 85.0,
-        "valuation_factor_weight_pct": 125.0,
-        "drawdown_factor_weight_pct": 110.0,
-        "volatility_factor_weight_pct": 130.0,
-        "volume_factor_weight_pct": 60.0,
-        "quality_factor_weight_pct": 108.0,
-        "trend_manual_step_pct": 5.5,
-        "structure_manual_step_pct": 4.5,
-        "volume_manual_step_pct": 2.5,
-        "risk_manual_step_pct": 12.0,
-        "bear_cap_pct": 26.0,
-        "below200_cap_pct": 42.0,
-        "risk_event_cap_pct": 60.0,
-        "high_valuation_cap_sideways_pct": 60.0,
-        "high_valuation_cap_trend_pct": 72.0,
-        "core_base": {"bear": 0.08, "below_200": 0.20, "sideways": 0.42, "above_200": 0.60, "strong_bull": 0.72},
-        "trade_step_limit_enabled": True,
-        "core_step_pct": 13.0,
-        "buy_step_limit_pct": 18.0,
-        "sell_step_limit_pct": 55.0,
-        "core_min_position_pct": 5.0,
-        "core_max_position_pct": 92.0,
-        "strict_min_position_pct": 0.0,
-        "strict_max_position_pct": 60.0,
-    },
     "balanced": {
         "buy_step": 0.22,
         "sell_step": 0.46,
@@ -82,6 +53,35 @@ STYLE_PARAM_PRESETS: Dict[str, Dict[str, Any]] = {
         "core_step_pct": 22.0,
         "buy_step_limit_pct": 28.0,
         "sell_step_limit_pct": 45.0,
+        "core_min_position_pct": 5.0,
+        "core_max_position_pct": 92.0,
+        "strict_min_position_pct": 0.0,
+        "strict_max_position_pct": 60.0,
+    },
+    "defensive": {
+        "buy_step": 0.14,
+        "sell_step": 0.58,
+        "risk_multiplier": 0.70,
+        "trend_factor_weight_pct": 85.0,
+        "valuation_factor_weight_pct": 125.0,
+        "drawdown_factor_weight_pct": 110.0,
+        "volatility_factor_weight_pct": 130.0,
+        "volume_factor_weight_pct": 60.0,
+        "quality_factor_weight_pct": 108.0,
+        "trend_manual_step_pct": 5.5,
+        "structure_manual_step_pct": 4.5,
+        "volume_manual_step_pct": 2.5,
+        "risk_manual_step_pct": 12.0,
+        "bear_cap_pct": 26.0,
+        "below200_cap_pct": 42.0,
+        "risk_event_cap_pct": 60.0,
+        "high_valuation_cap_sideways_pct": 60.0,
+        "high_valuation_cap_trend_pct": 72.0,
+        "core_base": {"bear": 0.08, "below_200": 0.20, "sideways": 0.42, "above_200": 0.60, "strong_bull": 0.72},
+        "trade_step_limit_enabled": True,
+        "core_step_pct": 13.0,
+        "buy_step_limit_pct": 18.0,
+        "sell_step_limit_pct": 55.0,
         "core_min_position_pct": 5.0,
         "core_max_position_pct": 92.0,
         "strict_min_position_pct": 0.0,
@@ -120,15 +120,6 @@ STYLE_PARAM_PRESETS: Dict[str, Dict[str, Any]] = {
 
 STYLE_PARAM_SCHEMA: List[Dict[str, Any]] = [
     {
-        "title": "执行速度",
-        "desc": "控制因子目标仓位的执行速度。小因子策略建议买入更慢、卖出更快，避免因子短期失真。",
-        "fields": [
-            {"name": "buy_step_pct", "label": "买入节奏%", "type": "number", "default": 22.0, "min": 0, "max": 100, "step": 0.1, "tip": "买入/加仓时的单次执行速度。"},
-            {"name": "sell_step_pct", "label": "卖出节奏%", "type": "number", "default": 46.0, "min": 0, "max": 100, "step": 0.1, "tip": "减仓/止盈时的单次执行速度。"},
-            {"name": "risk_multiplier", "label": "风险倍率", "type": "number", "default": 1.0, "min": 0.1, "max": 5, "step": 0.05, "tip": "最终因子目标相对 50% 中轴的放大/压缩倍率。"},
-        ],
-    },
-    {
         "title": "六类因子权重",
         "desc": "小因子策略专属：控制每类因子对目标仓位修正的影响强度。",
         "fields": [
@@ -163,25 +154,13 @@ STYLE_PARAM_SCHEMA: List[Dict[str, Any]] = [
     },
     {
         "title": "执行层控制",
-        "desc": "控制目标仓位和执行节奏。想直接打到目标仓位，可以关闭【启用单次操作上限】，或把对应单次上限调到 100%。",
+        "desc": "控制单次买入/卖出/补仓的操作上限。调到 100% 等于不限制。",
         "fields": [
-            {"name": "trade_step_limit_enabled", "label": "启用单次操作上限", "type": "checkbox", "default": True, "tip": "关闭后，检查日会直接调到策略目标仓位；仍保留操作周期、最小执行变化、手续费和滑点。"},
             {"name": "core_step_pct", "label": "补仓上限%", "type": "number", "default": 22.0, "min": 0, "max": 100, "step": 0.1, "tip": "定投增强策略每个检查日最多补多少定投增强仓位。"},
             {"name": "buy_step_limit_pct", "label": "买入上限%", "type": "number", "default": 28.0, "min": 0, "max": 100, "step": 0.1, "tip": "纯交易仓/普通买入信号的单次买入上限。"},
             {"name": "sell_step_limit_pct", "label": "卖出上限%", "type": "number", "default": 45.0, "min": 0, "max": 100, "step": 0.1, "tip": "基础单次卖出上限；严重破位时仍会按风险倍数放大。"},
         ],
     },
-    {
-        "title": "目标仓位边界",
-        "desc": "控制策略目标仓位的最低和最高边界。",
-        "fields": [
-            {"name": "core_min_position_pct", "label": "增强最低仓位%", "type": "number", "default": 5.0, "min": 0, "max": 100, "step": 0.1, "tip": "定投增强策略的最低目标仓位。"},
-            {"name": "core_max_position_pct", "label": "增强最高仓位%", "type": "number", "default": 92.0, "min": 0, "max": 100, "step": 0.1, "tip": "定投增强策略的最高目标仓位。想更激进可调高到 95~100。"},
-            {"name": "strict_min_position_pct", "label": "交易最低仓位%", "type": "number", "default": 0.0, "min": 0, "max": 100, "step": 0.1, "tip": "纯交易仓模式的最低目标仓位。"},
-            {"name": "strict_max_position_pct", "label": "交易最高仓位%", "type": "number", "default": 60.0, "min": 0, "max": 100, "step": 0.1, "tip": "纯交易仓模式的最高目标仓位。"},
-        ],
-    },
-    {"type": "core_base_table", "name": "core_base_pct", "title": "因子中性仓位表", "desc": "按大趋势状态给小因子策略一个基础仓位背景；最终仍由六类因子修正。"},
 ]
 
 

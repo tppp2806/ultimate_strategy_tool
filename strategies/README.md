@@ -12,7 +12,6 @@ strategies/
 └─ families/                   # 每个总体策略一个独立 py
    ├─ trend_signal_control.py  # 趋势信号风控策略
    ├─ mini_factor_timing.py    # 小因子择时策略
-   ├─ five_dimension_timing.py # 已移除占位，不会注册
    └─ _template.py             # 策略模板；以下划线开头，不会自动加载
 ```
 

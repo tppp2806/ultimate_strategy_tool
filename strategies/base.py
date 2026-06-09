@@ -10,21 +10,6 @@ from typing import Any, Dict, List, Optional, Tuple
 # 真正的总体策略在 STRATEGY_FAMILIES 里注册。
 
 STYLE_PRESETS: Dict[str, Dict[str, Any]] = {
-    "defensive": {
-        "name": "防守",
-        "buy_step": 0.18,
-        "sell_step": 0.55,
-        "risk_multiplier": 0.75,
-        "desc": "买入更慢，卖出更快；适合不想承受大回撤。",
-        "research_note": "核心目标：降低回撤与误买；代价是可能长期低仓。",
-        "core_base": {
-            "bear": 0.10,
-            "below_200": 0.20,
-            "sideways": 0.42,
-            "above_200": 0.58,
-            "strong_bull": 0.70,
-        },
-    },
     "balanced": {
         "name": "均衡",
         "buy_step": 0.28,
@@ -38,6 +23,21 @@ STYLE_PRESETS: Dict[str, Dict[str, Any]] = {
             "sideways": 0.54,
             "above_200": 0.72,
             "strong_bull": 0.84,
+        },
+    },
+    "defensive": {
+        "name": "防守",
+        "buy_step": 0.18,
+        "sell_step": 0.55,
+        "risk_multiplier": 0.75,
+        "desc": "买入更慢，卖出更快；适合不想承受大回撤。",
+        "research_note": "核心目标：降低回撤与误买；代价是可能长期低仓。",
+        "core_base": {
+            "bear": 0.10,
+            "below_200": 0.20,
+            "sideways": 0.42,
+            "above_200": 0.58,
+            "strong_bull": 0.70,
         },
     },
     "aggressive": {
@@ -157,18 +157,7 @@ def _active_family_meta(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
 
 def _fallback_style_param_schema() -> List[Dict[str, Any]]:
     """旧策略文件未声明 STYLE_PARAM_SCHEMA 时的兼容 schema。"""
-    return [
-        {
-            "title": "执行速度",
-            "desc": "通用仓位执行层参数。建议新策略在自己的 Python 文件中显式声明 STYLE_PARAM_SCHEMA。",
-            "fields": [
-                {"name": "buy_step_pct", "label": "买入节奏%", "type": "number", "default": 28.0, "min": 0, "max": 100, "step": 0.1},
-                {"name": "sell_step_pct", "label": "卖出节奏%", "type": "number", "default": 45.0, "min": 0, "max": 100, "step": 0.1},
-                {"name": "risk_multiplier", "label": "风险倍率", "type": "number", "default": 1.0, "min": 0.1, "max": 5, "step": 0.05},
-            ],
-        },
-        {"type": "core_base_table", "name": "core_base_pct", "title": "目标仓位表", "desc": "不同趋势状态下的基础目标仓位。"},
-    ]
+    return []
 
 
 def _style_param_schema(cfg: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:

@@ -27,41 +27,21 @@ STYLE_PARAM_PRESETS: Dict[str, Dict[str, Any]] = {
 
 STYLE_PARAM_SCHEMA: List[Dict[str, Any]] = [
     {
-        "title": "执行速度",
-        "desc": "所有总体策略通常都需要的执行层参数。",
-        "fields": [
-            {"name": "buy_step_pct", "label": "买入节奏%", "type": "number", "default": 26.0, "min": 0, "max": 100, "step": 0.1, "tip": "买入/加仓时的单次执行速度。"},
-            {"name": "sell_step_pct", "label": "卖出节奏%", "type": "number", "default": 46.0, "min": 0, "max": 100, "step": 0.1, "tip": "减仓/止盈时的单次执行速度。"},
-            {"name": "risk_multiplier", "label": "风险倍率", "type": "number", "default": 1.0, "min": 0.1, "max": 5, "step": 0.05, "tip": "风险预算倍率。"},
-        ],
-    },
-    {
         "title": "我的策略专属参数",
+        "desc": "新增策略只需声明专属参数；执行速度、仓位边界等全局参数已移至左侧统一配置。",
         "fields": [
             {"name": "my_signal_weight_pct", "label": "信号权重%", "type": "number", "default": 100.0, "min": 0, "max": 200, "step": 1, "tip": "示例字段：在 target_weight 中通过 get_strategy(cfg) 读取。"},
         ],
     },
     {
         "title": "执行层控制",
-        "desc": "控制目标仓位和执行节奏。想直接打到目标仓位，可以关闭【启用单次操作上限】，或把对应单次上限调到 100%。",
+        "desc": "控制单次买入/卖出/补仓的操作上限。调到 100% 等于不限制。",
         "fields": [
-            {"name": "trade_step_limit_enabled", "label": "启用单次操作上限", "type": "checkbox", "default": True, "tip": "关闭后，检查日会直接调到策略目标仓位；仍保留操作周期、最小执行变化、手续费和滑点。"},
             {"name": "core_step_pct", "label": "补仓上限%", "type": "number", "default": 22.0, "min": 0, "max": 100, "step": 0.1, "tip": "定投增强策略每个检查日最多补多少定投增强仓位。"},
             {"name": "buy_step_limit_pct", "label": "买入上限%", "type": "number", "default": 28.0, "min": 0, "max": 100, "step": 0.1, "tip": "纯交易仓/普通买入信号的单次买入上限。"},
             {"name": "sell_step_limit_pct", "label": "卖出上限%", "type": "number", "default": 45.0, "min": 0, "max": 100, "step": 0.1, "tip": "基础单次卖出上限；严重破位时仍会按风险倍数放大。"},
         ],
     },
-    {
-        "title": "目标仓位边界",
-        "desc": "控制策略目标仓位的最低和最高边界。",
-        "fields": [
-            {"name": "core_min_position_pct", "label": "增强最低仓位%", "type": "number", "default": 5.0, "min": 0, "max": 100, "step": 0.1, "tip": "定投增强策略的最低目标仓位。"},
-            {"name": "core_max_position_pct", "label": "增强最高仓位%", "type": "number", "default": 92.0, "min": 0, "max": 100, "step": 0.1, "tip": "定投增强策略的最高目标仓位。想更激进可调高到 95~100。"},
-            {"name": "strict_min_position_pct", "label": "交易最低仓位%", "type": "number", "default": 0.0, "min": 0, "max": 100, "step": 0.1, "tip": "纯交易仓模式的最低目标仓位。"},
-            {"name": "strict_max_position_pct", "label": "交易最高仓位%", "type": "number", "default": 60.0, "min": 0, "max": 100, "step": 0.1, "tip": "纯交易仓模式的最高目标仓位。"},
-        ],
-    },
-    {"type": "core_base_table", "name": "core_base_pct", "title": "基础仓位表", "desc": "不同趋势状态下的基础目标仓位。"},
 ]
 
 

@@ -43,6 +43,20 @@
     </section>
   </div>
 
+  <div id="global-config-modal" class="family-settings" hidden aria-hidden="true">
+    <div class="family-settings-backdrop" data-close-global-config></div>
+    <section class="family-settings-panel" role="dialog" aria-modal="true" aria-labelledby="global-config-title">
+      <div class="family-settings-head">
+        <div>
+          <h2 id="global-config-title">全局配置</h2>
+          <p id="global-config-subtitle">所有策略共享的参数。</p>
+        </div>
+        <button class="ghost-btn dark" type="button" data-close-global-config>关闭</button>
+      </div>
+      <div id="global-config-body" class="family-settings-body"></div>
+    </section>
+  </div>
+
   <aside class="config-pane">
     <section class="card compact">
       <div class="card-title">
@@ -186,7 +200,7 @@
           <strong id="current-position-text">{{ pct(current_pos) }}</strong>
         </div>
 
-        <fieldset class="strategy-box">
+        <fieldset class="strategy-box has-inline-action">
           <legend>仓位模式</legend>
           <label class="strategy-option balanced" data-tip="适合核心宽基/指数基金：以定投为底盘，按趋势、估值、ROE和风险状态生成目标仓位；行情好时提高仓位，趋势坏时降到防守仓位。">
             <input type="radio" name="position_mode" value="core_satellite" {% if cfg.position_mode == 'core_satellite' %}checked{% endif %}>
@@ -198,9 +212,12 @@
             <span>纯交易仓</span>
             <em>破位可降到0</em>
           </label>
+          <button class="inline-config-btn" type="button" data-open-global-config aria-label="编辑仓位边界与基础仓位表">仓位边界与基础仓位表</button>
         </fieldset>
 
-        <fieldset id="active-style-picker" class="strategy-box active-style-picker" aria-label="参数风格选择"></fieldset>
+        <fieldset id="active-style-picker" class="strategy-box active-style-picker has-inline-action" aria-label="参数风格选择">
+          <button class="inline-config-btn" type="button" data-open-global-config aria-label="编辑执行速度">执行速度</button>
+        </fieldset>
 
         <div id="strategy-summary" class="strategy-summary">
           总体策略：{{ strategy_families[cfg.strategy_family].name }}（{{ strategy_families[cfg.strategy_family].status }}）<br>

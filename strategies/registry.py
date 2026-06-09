@@ -65,6 +65,9 @@ def _family_meta_with_schema(module: ModuleType) -> Dict[str, Any]:
 
     style_param_presets = getattr(module, "STYLE_PARAM_PRESETS", None)
     meta["style_param_presets"] = style_param_presets if isinstance(style_param_presets, dict) else {}
+
+    # 信号驱动模式：纯交易仓时使用信号硬规则而非目标仓位模型
+    meta["signal_driven"] = bool(getattr(module, "SIGNAL_DRIVEN", False))
     return meta
 
 
