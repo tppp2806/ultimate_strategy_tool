@@ -33,15 +33,6 @@ STYLE_PARAM_SCHEMA: List[Dict[str, Any]] = [
             {"name": "my_signal_weight_pct", "label": "信号权重%", "type": "number", "default": 100.0, "min": 0, "max": 200, "step": 1, "tip": "示例字段：在 target_weight 中通过 get_strategy(cfg) 读取。"},
         ],
     },
-    {
-        "title": "执行层控制",
-        "desc": "控制单次买入/卖出/补仓的操作上限。调到 100% 等于不限制。",
-        "fields": [
-            {"name": "core_step_pct", "label": "补仓上限%", "type": "number", "default": 22.0, "min": 0, "max": 100, "step": 0.1, "tip": "定投增强策略每个检查日最多补多少定投增强仓位。"},
-            {"name": "buy_step_limit_pct", "label": "买入上限%", "type": "number", "default": 28.0, "min": 0, "max": 100, "step": 0.1, "tip": "纯交易仓/普通买入信号的单次买入上限。"},
-            {"name": "sell_step_limit_pct", "label": "卖出上限%", "type": "number", "default": 45.0, "min": 0, "max": 100, "step": 0.1, "tip": "基础单次卖出上限；严重破位时仍会按风险倍数放大。"},
-        ],
-    },
 ]
 
 

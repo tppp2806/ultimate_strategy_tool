@@ -42,6 +42,14 @@
   const familyEditStyleState = {};
   let globalStyleState = strategyKeys.includes(initialConfig.strategy) ? initialConfig.strategy : defaultStyleKey();
 
+  // 全局偏离度（全策略家族共享）
+  const _rawDev = initialConfig.deviation && typeof initialConfig.deviation === "object" ? initialConfig.deviation : {};
+  const globalDeviation = {};
+  for (const sk of strategyKeys) {
+    const d = _rawDev[sk] && typeof _rawDev[sk] === "object" ? _rawDev[sk] : {};
+    globalDeviation[sk] = {amplitude: numberOr(d.amplitude, 0), threshold: numberOr(d.threshold, 0)};
+  }
+
   function defaultStyleKey() {
     return strategyKeys.includes("balanced") ? "balanced" : (strategyKeys[0] || "balanced");
   }
@@ -300,11 +308,15 @@
     return val * (1 - pct / 100);
   }
 
-  function getDeviations(entry) {
-    return {
-      amplitude: numberOr(entry?.amplitude_deviation, 0),
-      threshold: numberOr(entry?.threshold_deviation, 0),
-    };
+  function getDeviations(styleKey) {
+    const d = globalDeviation[styleKey] || {amplitude: 0, threshold: 0};
+    return {amplitude: numberOr(d.amplitude, 0), threshold: numberOr(d.threshold, 0)};
+  }
+
+  function setGlobalDeviation(styleKey, amplitude, threshold) {
+    if (!globalDeviation[styleKey]) globalDeviation[styleKey] = {amplitude: 0, threshold: 0};
+    globalDeviation[styleKey].amplitude = amplitude;
+    globalDeviation[styleKey].threshold = threshold;
   }
 
   // 全局执行速度默认值
@@ -332,23 +344,33 @@
     };
   }
 
+  // 获取某风格自身的预设基础值（不带偏离修正）
+  function getStyleBaseValues(familyKey, styleKey) {
+    const params = getFamilyParams(familyKey);
+    const entry = (params.strategy_mix || {})[styleKey] || {};
+    const out = {};
+    for (const f of [...AMPLITUDE_FIELDS, ...THRESHOLD_FIELDS]) {
+      if (entry[f] !== undefined) out[f] = numberOr(entry[f], 0);
+    }
+    return out;
+  }
+
   function applyDeviations(familyKey, styleKey, ampDev, thrDev) {
     const params = getFamilyParams(familyKey);
     const entry = params.strategy_mix[styleKey];
     if (!entry) return;
-    entry.amplitude_deviation = ampDev;
-    entry.threshold_deviation = thrDev;
+    setGlobalDeviation(styleKey, ampDev, thrDev);
     const isAgg = styleKey === "aggressive";
-    const globalBase = Object.assign({}, getGlobalStyleBase(), getGlobalPositionBase());
+    const styleBase = getStyleBaseValues(familyKey, styleKey);
+    const balanced = params.strategy_mix.balanced || {};
+    const bPreset = familyStylePreset(familyKey, "balanced");
     for (const field of iterStyleParamFields(familyKey)) {
       if (!field.name || field.name === "core_base_pct") continue;
-      // 全局字段从全局基准读取，策略专属字段从均衡 entry 读取
+      // 偏离字段从该风格自身预设读取，其他字段从均衡 entry 读取
       let bVal;
-      if (Object.prototype.hasOwnProperty.call(globalBase, field.name)) {
-        bVal = globalBase[field.name];
+      if (Object.prototype.hasOwnProperty.call(styleBase, field.name)) {
+        bVal = styleBase[field.name];
       } else {
-        const balanced = params.strategy_mix.balanced || {};
-        const bPreset = familyStylePreset(familyKey, "balanced");
         bVal = numberOr(balanced[field.name], fieldDefaultValue(field, bPreset, 0));
       }
       let dev = -1;
@@ -612,20 +634,12 @@
     payload.core_max_position_pct = gPos.core_max_position_pct;
     payload.strict_min_position_pct = gPos.strict_min_position_pct;
     payload.strict_max_position_pct = gPos.strict_max_position_pct;
-    // 全局执行速度：基准值 + 当前风格偏离度修正
-    const gStyle = getGlobalStyleBase();
-    const activeStyle = data.strategy || activeStyleKeyFromForm();
-    const curEntry = (getFamilyParams(activeFamily).strategy_mix || {})[activeStyle] || {};
-    const devs = getDeviations(curEntry);
-    const isAgg = activeStyle === "aggressive";
-    if (activeStyle !== "balanced" && devs.amplitude > 0) {
-      payload.global_buy_step_pct = Math.round(applyDeviation(gStyle.buy_step_pct, devs.amplitude, isAgg) * 10) / 10;
-      payload.global_sell_step_pct = Math.round(applyDeviation(gStyle.sell_step_pct, devs.amplitude, isAgg) * 10) / 10;
-    } else {
-      payload.global_buy_step_pct = gStyle.buy_step_pct;
-      payload.global_sell_step_pct = gStyle.sell_step_pct;
+    // 全局偏离度（后端从策略预设+偏离度自行计算有效值）
+    payload.deviation = {};
+    for (const sk of strategyKeys) {
+      const d = globalDeviation[sk] || {amplitude: 0, threshold: 0};
+      payload.deviation[sk] = {amplitude: numberOr(d.amplitude, 0), threshold: numberOr(d.threshold, 0)};
     }
-    payload.global_risk_multiplier = gStyle.risk_multiplier;
     return payload;
   }
 
@@ -751,6 +765,36 @@
     boundBox.appendChild(boundGrid);
     body.appendChild(boundBox);
 
+    // ②b 均衡基准 — 执行层控制
+    const execBox = document.createElement("div");
+    execBox.className = "family-param-subgroup";
+    const execHead = document.createElement("div");
+    execHead.className = "family-param-group-title";
+    appendTextEl(execHead, "strong", "", "均衡基准 · 执行层控制");
+    appendTextEl(execHead, "em", "", "控制单次买入/卖出/补仓的操作上限。");
+    execBox.appendChild(execHead);
+    const execGrid = document.createElement("div");
+    execGrid.className = "global-field-row";
+    const execFields = [
+      {name: "core_step_pct", label: "补仓上限%", default: 22, tip: "定投增强策略每个检查日最多补多少仓位。"},
+      {name: "buy_step_limit_pct", label: "买入上限%", default: 28, tip: "单次买入上限。"},
+      {name: "sell_step_limit_pct", label: "卖出上限%", default: 45, tip: "基础单次卖出上限；严重破位时仍会按风险倍数放大。"},
+    ];
+    for (const f of execFields) {
+      const label = document.createElement("label");
+      label.className = "mini-field";
+      if (f.tip) label.dataset.tip = f.tip;
+      appendTextEl(label, "span", "", f.label);
+      const input = document.createElement("input");
+      input.type = "number"; input.step = "0.1"; input.min = "0"; input.max = "100";
+      input.value = numberOr(initialConfig[f.name], f.default);
+      input.dataset.globalField = f.name;
+      label.appendChild(input);
+      execGrid.appendChild(label);
+    }
+    execBox.appendChild(execGrid);
+    body.appendChild(execBox);
+
     // ③ 基础仓位表
     const entry = (params.strategy_mix || {})[activeStyle] || {};
     const coreBase = entry.core_base_pct || defaultCoreBasePct(activeStyle, activeFamily);
@@ -778,8 +822,7 @@
 
     // ④ 进攻/防守偏离度（操作幅度 + 操作阈值）
     const renderDevGroup = (styleKey, label, tipSuffix) => {
-      const sEntry = (params.strategy_mix || {})[styleKey] || {};
-      const devs = getDeviations(sEntry);
+      const devs = getDeviations(styleKey);
       const isAgg = styleKey === "aggressive";
 
       const box = document.createElement("div");
@@ -798,8 +841,8 @@
       const ampLbl = document.createElement("label");
       ampLbl.className = "mini-field multiplier-field";
       ampLbl.dataset.tip = isAgg
-        ? "向右拖 = 买入更快、卖出更慢。0%=与均衡一致。"
-        : "向右拖 = 买入更慢、卖出更快。0%=与均衡一致。";
+        ? "向右拖 = 买入更快、卖出更慢。0%=风格预设值。"
+        : "向右拖 = 买入更慢、卖出更快。0%=风格预设值。";
       appendTextEl(ampLbl, "span", "", "操作幅度偏离");
       const ampInput = document.createElement("input");
       ampInput.type = "range"; ampInput.min = "0"; ampInput.max = "100"; ampInput.step = "1";
@@ -817,8 +860,8 @@
       const thrLbl = document.createElement("label");
       thrLbl.className = "mini-field multiplier-field";
       thrLbl.dataset.tip = isAgg
-        ? "向右拖 = 阈值向100%推（更宽松）。0%=与均衡一致。"
-        : "向右拖 = 阈值向0%压（更严格）。0%=与均衡一致。";
+        ? "向右拖 = 阈值向100%推（更宽松）。0%=风格预设值。"
+        : "向右拖 = 阈值向0%压（更严格）。0%=风格预设值。";
       appendTextEl(thrLbl, "span", "", "操作阈值偏离");
       const thrInput = document.createElement("input");
       thrInput.type = "range"; thrInput.min = "0"; thrInput.max = "100"; thrInput.step = "1";
@@ -834,15 +877,15 @@
 
       box.appendChild(g);
 
-      // 预览：所有受影响字段
-      const globalBase = Object.assign({}, getGlobalStyleBase(), getGlobalPositionBase());
+      // 预览：所有受影响字段（基础值取自该风格自身的预设）
+      const styleBase = getStyleBaseValues(activeFamilyKeyFromForm(), styleKey);
       const preview = document.createElement("div");
       preview.className = "multiplier-preview";
       const previewGrid = document.createElement("div");
       previewGrid.className = "multiplier-preview-grid";
       const allPreviewFields = [...AMPLITUDE_FIELDS, ...THRESHOLD_FIELDS];
       for (const f of allPreviewFields) {
-        let bVal = globalBase[f];
+        let bVal = styleBase[f];
         if (bVal === undefined) continue;
         const dev = AMPLITUDE_FIELDS.includes(f) ? devs.amplitude : devs.threshold;
         const computed = Math.round(applyDeviation(bVal, dev, isAgg) * 10) / 10;
@@ -1018,8 +1061,7 @@
     // 非均衡时：操作阈值偏离度
     const activeStyle = activeStyleKeyFromForm();
     if (activeStyle !== "balanced") {
-      const activeEntry = params.strategy_mix[activeStyle] || {};
-      const devs = getDeviations(activeEntry);
+      const devs = getDeviations(activeStyle);
       const isAgg = activeStyle === "aggressive";
       const devDir = isAgg ? "进攻" : "防守";
       const devTip = isAgg
@@ -1055,35 +1097,19 @@
       thrGrid.appendChild(thrLabel);
       thrBox.appendChild(thrGrid);
 
-      // 预览：全局阈值字段 + 策略专属阈值字段
-      const balanced = params.strategy_mix.balanced || {};
-      const bPreset = familyStylePreset(familyKey, "balanced");
-      const globalPosBase = getGlobalPositionBase();
+      // 预览：该风格自身的预设基础值 + 阈值偏离
+      const styleBase = getStyleBaseValues(familyKey, activeStyle);
       const preview = document.createElement("div");
       preview.className = "multiplier-preview";
       const previewGrid = document.createElement("div");
       previewGrid.className = "multiplier-preview-grid";
-      const shownFields = new Set();
-      // 全局位置字段
-      for (const [fName, bVal] of Object.entries(globalPosBase)) {
-        if (!THRESHOLD_FIELDS.includes(fName)) continue;
-        shownFields.add(fName);
+      for (const f of THRESHOLD_FIELDS) {
+        const bVal = styleBase[f];
+        if (bVal === undefined) continue;
         const computed = Math.round(applyDeviation(bVal, devs.threshold, isAgg) * 10) / 10;
         const row = document.createElement("div");
         row.className = "preview-row";
-        appendTextEl(row, "span", "preview-name", ALL_FIELD_LABELS[fName] || fName);
-        appendTextEl(row, "span", "preview-arrow", `${bVal} →`);
-        appendTextEl(row, "span", "preview-val", String(computed));
-        previewGrid.appendChild(row);
-      }
-      // 策略专属阈值字段
-      for (const field of iterStyleParamFields(familyKey)) {
-        if (!THRESHOLD_FIELDS.includes(field.name) || shownFields.has(field.name)) continue;
-        const bVal = numberOr(balanced[field.name], fieldDefaultValue(field, bPreset, 0));
-        const computed = Math.round(applyDeviation(bVal, devs.threshold, isAgg) * 10) / 10;
-        const row = document.createElement("div");
-        row.className = "preview-row";
-        appendTextEl(row, "span", "preview-name", field.label || field.name);
+        appendTextEl(row, "span", "preview-name", ALL_FIELD_LABELS[f] || f);
         appendTextEl(row, "span", "preview-arrow", `${bVal} →`);
         appendTextEl(row, "span", "preview-val", String(computed));
         previewGrid.appendChild(row);
@@ -1207,41 +1233,23 @@
     // 偏离度滑块：一键基于均衡计算
     if (field === "amplitude_deviation" || field === "threshold_deviation") {
       const dev = clampNumber(target.value, 0, 100);
-      const prev = getDeviations(getFamilyParams(familyKey).strategy_mix[styleKey] || {});
+      const prev = getDeviations(styleKey);
       const ampDev = field === "amplitude_deviation" ? dev : prev.amplitude;
       const thrDev = field === "threshold_deviation" ? dev : prev.threshold;
+      setGlobalDeviation(styleKey, ampDev, thrDev);
       applyDeviations(familyKey, styleKey, ampDev, thrDev);
       const valEl = target.parentElement?.querySelector?.(".multiplier-value");
       if (valEl) valEl.textContent = `${dev}%`;
       const isAgg = styleKey === "aggressive";
       const fieldNames = field === "amplitude_deviation" ? AMPLITUDE_FIELDS : THRESHOLD_FIELDS;
-      const balanced = (getFamilyParams(familyKey).strategy_mix || {}).balanced || {};
-      const bPreset = familyStylePreset(familyKey, "balanced");
-      const globalStyleBase = getGlobalStyleBase();
-      const globalPosBase = getGlobalPositionBase();
+      const styleBase = getStyleBaseValues(familyKey, styleKey);
       const previewItems = target.closest(".multiplier-section")?.querySelectorAll?.(".preview-row");
       if (previewItems) {
         let i = 0;
-        // 全局位置字段（仅阈值偏离时）
-        const posFields = field === "threshold_deviation" ? globalPosBase : {};
-        for (const [fName, bVal] of Object.entries(posFields)) {
-          if (!fieldNames.includes(fName) || !previewItems[i]) { if (fieldNames.includes(fName)) i++; continue; }
-          const arrow = previewItems[i].querySelector(".preview-arrow");
-          const val = previewItems[i].querySelector(".preview-val");
-          if (arrow) arrow.textContent = `${bVal} →`;
-          if (val) val.textContent = String(Math.round(applyDeviation(bVal, dev, isAgg) * 10) / 10);
-          i++;
-        }
-        // 策略专属字段
-        for (const fieldSpec of iterStyleParamFields(familyKey)) {
-          if (!fieldNames.includes(fieldSpec.name) || Object.prototype.hasOwnProperty.call(posFields, fieldSpec.name)) continue;
+        for (const f of fieldNames) {
+          const bVal = styleBase[f];
+          if (bVal === undefined) { if (previewItems[i]) i++; continue; }
           if (previewItems[i]) {
-            let bVal;
-            if (Object.prototype.hasOwnProperty.call(globalStyleBase, fieldSpec.name)) {
-              bVal = globalStyleBase[fieldSpec.name];
-            } else {
-              bVal = numberOr(balanced[fieldSpec.name], fieldDefaultValue(fieldSpec, bPreset, 0));
-            }
             const arrow = previewItems[i].querySelector(".preview-arrow");
             const val = previewItems[i].querySelector(".preview-val");
             if (arrow) arrow.textContent = `${bVal} →`;
@@ -2196,13 +2204,11 @@
         const styleKey = t.dataset.globalAmpDev || t.dataset.globalThrDev;
         const isAmp = !!t.dataset.globalAmpDev;
         const dev = clampNumber(t.value, 0, 100);
-        const familyKey = activeFamilyKeyFromForm();
-        const params = getFamilyParams(familyKey);
-        if (!params.strategy_mix[styleKey]) params.strategy_mix[styleKey] = defaultStyleEntry(styleKey, styleKey, familyKey);
-        const entry = params.strategy_mix[styleKey];
-        if (isAmp) entry.amplitude_deviation = dev;
-        else entry.threshold_deviation = dev;
-        applyDeviations(familyKey, styleKey, numberOr(entry.amplitude_deviation, 0), numberOr(entry.threshold_deviation, 0));
+        const cur = getDeviations(styleKey);
+        if (isAmp) setGlobalDeviation(styleKey, dev, cur.threshold);
+        else setGlobalDeviation(styleKey, cur.amplitude, dev);
+        const updated = getDeviations(styleKey);
+        applyDeviations(activeFamilyKeyFromForm(), styleKey, updated.amplitude, updated.threshold);
         // 更新当前滑块显示值
         const parentLabel = t.closest(".multiplier-field");
         const valEl = parentLabel?.querySelector?.(".multiplier-value");
@@ -2210,15 +2216,15 @@
         // 更新预览
         const section = t.closest(".multiplier-section");
         const isAgg = styleKey === "aggressive";
-        const globalBase = Object.assign({}, getGlobalStyleBase(), getGlobalPositionBase());
-        const ampDev = numberOr(entry.amplitude_deviation, 0);
-        const thrDev = numberOr(entry.threshold_deviation, 0);
+        const styleBase = getStyleBaseValues(activeFamilyKeyFromForm(), styleKey);
+        const ampDev = updated.amplitude;
+        const thrDev = updated.threshold;
         const previewItems = section?.querySelectorAll?.(".preview-row");
         if (previewItems) {
           let i = 0;
           const allPreviewFields = [...AMPLITUDE_FIELDS, ...THRESHOLD_FIELDS];
           for (const f of allPreviewFields) {
-            const bVal = globalBase[f];
+            const bVal = styleBase[f];
             if (bVal === undefined) continue;
             if (previewItems[i]) {
               const fDev = AMPLITUDE_FIELDS.includes(f) ? ampDev : thrDev;

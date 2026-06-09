@@ -86,15 +86,6 @@ STYLE_PARAM_SCHEMA: List[Dict[str, Any]] = [
             {"name": "trend_boost_pct", "label": "趋势增强%", "type": "number", "default": 100.0, "min": 0, "max": 200, "step": 1, "tip": "整体买入/卖出信号强度倍率。"},
         ],
     },
-    {
-        "title": "执行层控制",
-        "desc": "控制单次买入/卖出/补仓的操作上限。调到 100% 等于不限制。",
-        "fields": [
-            {"name": "core_step_pct", "label": "补仓上限%", "type": "number", "default": 22.0, "min": 0, "max": 100, "step": 0.1, "tip": "定投增强策略每个检查日最多补多少定投增强仓位。"},
-            {"name": "buy_step_limit_pct", "label": "买入上限%", "type": "number", "default": 28.0, "min": 0, "max": 100, "step": 0.1, "tip": "单次买入上限。"},
-            {"name": "sell_step_limit_pct", "label": "卖出上限%", "type": "number", "default": 45.0, "min": 0, "max": 100, "step": 0.1, "tip": "基础单次卖出上限。"},
-        ],
-    },
 ]
 
 INPUT_SCHEMA = [

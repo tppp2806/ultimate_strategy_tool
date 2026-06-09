@@ -525,38 +525,49 @@ def apply_active_family_params(cfg: Dict[str, Any]) -> None:
 def _flatten_active_style_params(cfg: Dict[str, Any]) -> None:
     """把当前激活风格的执行层参数展平到 cfg 顶层，供 advanced_pct / advanced_bool 读取。
 
-    全局字段（仓位边界、执行速度）优先从 cfg 顶层读取，
-    策略专属字段从 strategy_mix entry 中读取。
+    每个风格有自己的预设值（buy_step_pct/sell_step_pct 等），
+    偏离度（deviation）在此基础上叠加修正。
     """
     strategy_key = str(cfg.get("strategy", "balanced"))
     mix = cfg.get("strategy_mix") if isinstance(cfg.get("strategy_mix"), dict) else {}
     entry = mix.get(strategy_key) if isinstance(mix.get(strategy_key), dict) else {}
 
-    # 策略专属字段：从 strategy_mix entry 读取
+    deviation = cfg.get("deviation") or {}
+    style_dev = deviation.get(strategy_key) if isinstance(deviation.get(strategy_key), dict) else {}
+    amp_dev = clamp(as_float(style_dev.get("amplitude"), 0.0), 0.0, 100.0)
+    thr_dev = clamp(as_float(style_dev.get("threshold"), 0.0), 0.0, 100.0)
+    is_agg = strategy_key == "aggressive"
+
+    def _deviate(base: float, dev_pct: float) -> float:
+        """进攻向100%推，防守向0%推。"""
+        if dev_pct <= 0:
+            return base
+        if is_agg:
+            return round(base + (100.0 - base) * dev_pct / 100.0, 1)
+        return round(base * (1.0 - dev_pct / 100.0), 1)
+
+    # 执行速度：从当前风格预设读取，叠加幅度偏离
+    cfg["buy_step_pct"] = clamp(_deviate(float(entry.get("buy_step_pct", 26.0)), amp_dev), 0.0, 100.0)
+    cfg["sell_step_pct"] = clamp(_deviate(float(entry.get("sell_step_pct", 48.0)), amp_dev), 0.0, 100.0)
+    cfg["global_risk_multiplier"] = clamp(float(entry.get("risk_multiplier", 1.0)), 0.1, 5.0)
+
+    cfg["trade_step_limit_enabled"] = advanced_bool(entry, "trade_step_limit_enabled", True)
+
+    # 执行层控制 + 仓位边界：从 entry 读取，叠加阈值偏离
     for key, default in [
-        ("trade_step_limit_enabled", True),
         ("core_step_pct", 22.0),
         ("buy_step_limit_pct", 28.0),
         ("sell_step_limit_pct", 45.0),
     ]:
-        if key == "trade_step_limit_enabled":
-            cfg[key] = advanced_bool(entry, key, default)
-        else:
-            cfg[key] = clamp(as_float(entry.get(key), default), 0.0, 100.0)
+        cfg[key] = clamp(_deviate(float(entry.get(key, default)), thr_dev), 0.0, 100.0)
 
-    # 全局仓位边界：优先从顶层读取（用户在左侧全局配置），回退到 entry
     for key, default in [
         ("core_min_position_pct", 5.0), ("core_max_position_pct", 92.0),
         ("strict_min_position_pct", 0.0), ("strict_max_position_pct", 60.0),
     ]:
-        cfg[key] = clamp(as_float(cfg.get(key, entry.get(key)), default), 0.0, 100.0)
+        cfg[key] = clamp(_deviate(float(entry.get(key, default)), thr_dev), 0.0, 100.0)
     cfg["core_min_position_pct"] = min(float(cfg["core_min_position_pct"]), float(cfg["core_max_position_pct"]))
     cfg["strict_min_position_pct"] = min(float(cfg["strict_min_position_pct"]), float(cfg["strict_max_position_pct"]))
-
-    # 全局执行速度：前端已计算偏离度修正后的有效值
-    cfg["buy_step_pct"] = clamp(as_float(cfg.get("global_buy_step_pct"), 26.0), 0.0, 100.0)
-    cfg["sell_step_pct"] = clamp(as_float(cfg.get("global_sell_step_pct"), 48.0), 0.0, 100.0)
-    cfg["global_risk_multiplier"] = clamp(as_float(cfg.get("global_risk_multiplier"), 1.0), 0.1, 5.0)
 
 
 def advanced_pct(cfg: Dict[str, Any], key: str, default: float, min_value: float = 0.0, max_value: float = 100.0) -> float:
@@ -6631,6 +6642,9 @@ def api_config():
     cfg["strategy_mode"] = "single"
     if "strategy_family_params" in data and isinstance(data.get("strategy_family_params"), dict):
         cfg["strategy_family_params"] = data.get("strategy_family_params") or {}
+    # 全局偏离度（全策略家族共享）
+    if "deviation" in data and isinstance(data.get("deviation"), dict):
+        cfg["deviation"] = data.get("deviation") or {}
     if "strategy_mix" in data and isinstance(data.get("strategy_mix"), dict):
         cfg["strategy_mix"] = data.get("strategy_mix") or {}
         # 兼容旧前端：如果没有传 family_params，就把根级 strategy_mix 作为当前总体策略参数。
