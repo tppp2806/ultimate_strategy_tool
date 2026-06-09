@@ -54,7 +54,7 @@ app.secret_key = "local-trend-risk-position-tool"
 
 # 进程内轻量缓存：同一轮本地使用中，参数完全相同的搜索、拉取、回测、连通性测试不重复执行。
 # 不落盘，不保存原始参数；只用参数摘要作为 key，避免把 Cookie/代理等敏感配置写进缓存索引。
-RUNTIME_CACHE_VERSION = 21
+RUNTIME_CACHE_VERSION = 23
 RUNTIME_CACHE_MAX_ITEMS = 160
 RUNTIME_CACHE_TTL_SEC: Dict[str, int] = {
     "search": 6 * 60 * 60,
@@ -584,6 +584,9 @@ def parse_signals(form: Dict[str, Any]) -> Dict[str, Any]:
         "volume_ratio_20d", "return_20d", "return_60d", "return_120d",
         "volatility_20d", "volatility_60d", "drawdown_252d",
         "ma50_slope_20d", "ma200_slope_20d", "distance_ma50_pct", "distance_ma200_pct",
+        "macd_dif", "macd_dea", "macd_bar", "macd_dif_pct", "macd_dea_pct", "macd_bar_pct",
+        "rsi6", "rsi14",
+        "boll_mid", "boll_upper", "boll_lower", "boll_width_pct", "boll_percent_b",
     )
     for key in optional_numeric_keys:
         raw = form.get(key)
@@ -4098,6 +4101,76 @@ def compute_indicators(records: List[Dict[str, float]], fundamentals: Dict[str, 
         var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
         return math.sqrt(max(var, 0.0)) * math.sqrt(252.0)
 
+    def ema_series(values: List[float], n: int) -> List[Optional[float]]:
+        if not values or n <= 0:
+            return []
+        alpha = 2.0 / (n + 1.0)
+        out: List[Optional[float]] = []
+        ema: Optional[float] = None
+        for idx, value in enumerate(values):
+            if idx + 1 < n:
+                out.append(None)
+                continue
+            if idx + 1 == n:
+                ema = sum(values[:n]) / n
+            else:
+                ema = value * alpha + float(ema) * (1.0 - alpha)
+            out.append(ema)
+        return out
+
+    def macd_last(values: List[float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        if len(values) < 35:
+            return None, None, None
+        ema12 = ema_series(values, 12)
+        ema26 = ema_series(values, 26)
+        dif_series: List[Optional[float]] = []
+        dif_values: List[float] = []
+        for a, b in zip(ema12, ema26):
+            if a is None or b is None:
+                dif_series.append(None)
+                continue
+            dif = a - b
+            dif_series.append(dif)
+            dif_values.append(dif)
+        dea_values = ema_series(dif_values, 9)
+        if not dif_values or not dea_values or dea_values[-1] is None:
+            return None, None, None
+        dif = dif_values[-1]
+        dea = float(dea_values[-1])
+        # 按中文行情软件常用口径：MACD柱 = (DIF - DEA) * 2。
+        bar = (dif - dea) * 2.0
+        return dif, dea, bar
+
+    def rsi_last(values: List[float], n: int) -> Optional[float]:
+        if len(values) <= n:
+            return None
+        gains: List[float] = []
+        losses: List[float] = []
+        window = values[-(n + 1):]
+        for idx in range(1, len(window)):
+            diff = window[idx] - window[idx - 1]
+            gains.append(max(diff, 0.0))
+            losses.append(max(-diff, 0.0))
+        avg_gain = sum(gains) / n
+        avg_loss = sum(losses) / n
+        if avg_loss <= 0:
+            return 100.0 if avg_gain > 0 else 50.0
+        rs = avg_gain / avg_loss
+        return 100.0 - 100.0 / (1.0 + rs)
+
+    def boll_last(values: List[float], n: int = 20, k: float = 2.0) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
+        if len(values) < n:
+            return None, None, None, None, None
+        window = values[-n:]
+        mid = sum(window) / n
+        var = sum((v - mid) ** 2 for v in window) / n
+        std = math.sqrt(max(var, 0.0))
+        upper = mid + k * std
+        lower = mid - k * std
+        width_pct = (upper - lower) / mid * 100.0 if mid else None
+        percent_b = (values[-1] - lower) / (upper - lower) * 100.0 if upper > lower else 50.0
+        return mid, upper, lower, width_pct, percent_b
+
     def slope_pct(current: Optional[float], previous: Optional[float]) -> Optional[float]:
         if current is None or previous is None or previous <= 0:
             return None
@@ -4117,6 +4190,11 @@ def compute_indicators(records: List[Dict[str, float]], fundamentals: Dict[str, 
 
     vol20 = sum(vols[-20:]) / 20 if len(vols) >= 20 and any(vols[-20:]) else None
     volume_ratio = vols[-1] / vol20 if vol20 else None
+
+    macd_dif, macd_dea, macd_bar = macd_last(closes)
+    rsi6 = rsi_last(closes, 6)
+    rsi14 = rsi_last(closes, 14)
+    boll_mid, boll_upper, boll_lower, boll_width_pct, boll_percent_b = boll_last(closes, 20, 2.0)
 
     # 自动趋势状态。
     market_state = "sideways"
@@ -4182,6 +4260,19 @@ def compute_indicators(records: List[Dict[str, float]], fundamentals: Dict[str, 
         "atr_pct": round((atr14 / close * 100.0), 2) if atr14 and close else None,
         "stop_loss_pct": round(clamp(stop_loss_pct, 1.0, 80.0), 2),
         "volume_ratio_20d": round(volume_ratio, 2) if volume_ratio else None,
+        "macd_dif": round(macd_dif, 6) if macd_dif is not None else None,
+        "macd_dea": round(macd_dea, 6) if macd_dea is not None else None,
+        "macd_bar": round(macd_bar, 6) if macd_bar is not None else None,
+        "macd_dif_pct": round(macd_dif / close * 100.0, 4) if macd_dif is not None and close else None,
+        "macd_dea_pct": round(macd_dea / close * 100.0, 4) if macd_dea is not None and close else None,
+        "macd_bar_pct": round(macd_bar / close * 100.0, 4) if macd_bar is not None and close else None,
+        "rsi6": round(rsi6, 2) if rsi6 is not None else None,
+        "rsi14": round(rsi14, 2) if rsi14 is not None else None,
+        "boll_mid": round(boll_mid, 4) if boll_mid is not None else None,
+        "boll_upper": round(boll_upper, 4) if boll_upper is not None else None,
+        "boll_lower": round(boll_lower, 4) if boll_lower is not None else None,
+        "boll_width_pct": round(boll_width_pct, 2) if boll_width_pct is not None else None,
+        "boll_percent_b": round(boll_percent_b, 2) if boll_percent_b is not None else None,
         "return_20d": round(period_return(20) * 100.0, 2) if period_return(20) is not None else None,
         "return_60d": round(period_return(60) * 100.0, 2) if period_return(60) is not None else None,
         "return_120d": round(period_return(120) * 100.0, 2) if period_return(120) is not None else None,
@@ -4547,6 +4638,8 @@ HISTORY_PRICE_DERIVED_COLUMNS = [
     "ma20", "ma50", "ma200", "atr14", "atr_pct", "return_20d", "return_60d", "return_120d",
     "volatility_20d", "volatility_60d", "drawdown_252d", "ma50_slope_20d", "ma200_slope_20d",
     "distance_ma50_pct", "distance_ma200_pct", "volume_ratio_20d",
+    "macd_dif", "macd_dea", "macd_bar", "macd_dif_pct", "macd_dea_pct", "macd_bar_pct",
+    "rsi6", "rsi14", "boll_mid", "boll_upper", "boll_lower", "boll_width_pct", "boll_percent_b",
 ]
 HISTORY_VALUATION_COLUMNS = [
     "date", "current_pe", "pe_percentile", "current_pb", "pb_percentile", "roe_pct",
@@ -4772,6 +4865,69 @@ def enrich_history_records_for_cache(records: List[Dict[str, Any]]) -> List[Dict
         var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
         return math.sqrt(max(var, 0.0)) * math.sqrt(252.0)
 
+    def ema_values(values: List[float], n: int) -> List[Optional[float]]:
+        if not values or n <= 0:
+            return []
+        alpha = 2.0 / (n + 1.0)
+        out: List[Optional[float]] = []
+        ema: Optional[float] = None
+        for idx, value in enumerate(values):
+            if idx + 1 < n:
+                out.append(None)
+                continue
+            if idx + 1 == n:
+                ema = sum(values[:n]) / n
+            else:
+                ema = value * alpha + float(ema) * (1.0 - alpha)
+            out.append(ema)
+        return out
+
+    def macd_at(idx: int) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        if idx < 34:
+            return None, None, None
+        window = closes[:idx + 1]
+        ema12 = ema_values(window, 12)
+        ema26 = ema_values(window, 26)
+        dif_values: List[float] = []
+        for a, b in zip(ema12, ema26):
+            if a is not None and b is not None:
+                dif_values.append(a - b)
+        dea_values = ema_values(dif_values, 9)
+        if not dif_values or not dea_values or dea_values[-1] is None:
+            return None, None, None
+        dif = dif_values[-1]
+        dea = float(dea_values[-1])
+        return dif, dea, (dif - dea) * 2.0
+
+    def rsi_at(idx: int, n: int) -> Optional[float]:
+        if idx < n:
+            return None
+        gains: List[float] = []
+        losses: List[float] = []
+        for j in range(idx - n + 1, idx + 1):
+            diff = closes[j] - closes[j - 1]
+            gains.append(max(diff, 0.0))
+            losses.append(max(-diff, 0.0))
+        avg_gain = sum(gains) / n
+        avg_loss = sum(losses) / n
+        if avg_loss <= 0:
+            return 100.0 if avg_gain > 0 else 50.0
+        rs = avg_gain / avg_loss
+        return 100.0 - 100.0 / (1.0 + rs)
+
+    def boll_at(idx: int, n: int = 20, k: float = 2.0) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
+        if idx + 1 < n:
+            return None, None, None, None, None
+        window = closes[idx - n + 1: idx + 1]
+        mid = sum(window) / n
+        var = sum((v - mid) ** 2 for v in window) / n
+        std = math.sqrt(max(var, 0.0))
+        upper = mid + k * std
+        lower = mid - k * std
+        width_pct = (upper - lower) / mid * 100.0 if mid else None
+        percent_b = (closes[idx] - lower) / (upper - lower) * 100.0 if upper > lower else 50.0
+        return mid, upper, lower, width_pct, percent_b
+
     trs: List[float] = [0.0]
     for idx in range(1, len(base)):
         prev_close = closes[idx - 1]
@@ -4788,6 +4944,10 @@ def enrich_history_records_for_cache(records: List[Dict[str, Any]]) -> List[Dict
         atr14 = sum(trs[idx - 13: idx + 1]) / 14 if idx >= 14 else None
         high_252 = max(closes[max(0, idx - 251): idx + 1]) if idx >= 0 else None
         vol20 = sum(vols[idx - 19: idx + 1]) / 20 if idx >= 19 and any(vols[idx - 19: idx + 1]) else None
+        macd_dif, macd_dea, macd_bar = macd_at(idx)
+        rsi6 = rsi_at(idx, 6)
+        rsi14 = rsi_at(idx, 14)
+        boll_mid, boll_upper, boll_lower, boll_width_pct, boll_percent_b = boll_at(idx, 20, 2.0)
 
         enriched = dict(row)
         enriched.update({
@@ -4807,6 +4967,19 @@ def enrich_history_records_for_cache(records: List[Dict[str, Any]]) -> List[Dict
             "distance_ma50_pct": _as_optional_float_cell((close / ma50 - 1.0) * 100.0 if ma50 else None),
             "distance_ma200_pct": _as_optional_float_cell((close / ma200 - 1.0) * 100.0 if ma200 else None),
             "volume_ratio_20d": _as_optional_float_cell((vols[idx] / vol20) if vol20 else None),
+            "macd_dif": _as_optional_float_cell(macd_dif),
+            "macd_dea": _as_optional_float_cell(macd_dea),
+            "macd_bar": _as_optional_float_cell(macd_bar),
+            "macd_dif_pct": _as_optional_float_cell((macd_dif / close * 100.0) if macd_dif is not None and close else None),
+            "macd_dea_pct": _as_optional_float_cell((macd_dea / close * 100.0) if macd_dea is not None and close else None),
+            "macd_bar_pct": _as_optional_float_cell((macd_bar / close * 100.0) if macd_bar is not None and close else None),
+            "rsi6": _as_optional_float_cell(rsi6),
+            "rsi14": _as_optional_float_cell(rsi14),
+            "boll_mid": _as_optional_float_cell(boll_mid),
+            "boll_upper": _as_optional_float_cell(boll_upper),
+            "boll_lower": _as_optional_float_cell(boll_lower),
+            "boll_width_pct": _as_optional_float_cell(boll_width_pct),
+            "boll_percent_b": _as_optional_float_cell(boll_percent_b),
         })
         out.append(enriched)
     return out

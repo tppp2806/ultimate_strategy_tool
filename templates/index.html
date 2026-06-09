@@ -306,8 +306,22 @@
           <button id="fetch-data-btn" class="btn mini" type="button">拉取所选标的数据</button>
           <span id="fetch-status" class="small">自动数据失败时，仍可手动填写。</span>
         </div>
-        <div id="auto-data-list" class="auto-data-list"></div>
-        <div class="data-grid">
+        <div id="auto-data-list" class="auto-data-list" hidden aria-hidden="true"></div>
+
+        <div class="strategy-summary auto-data-summary">
+          <div class="auto-data-summary-head">
+            <div>
+              自动数据会在拉取后动态写入；外部只展示关键项，全部字段点右侧按钮用只读表格预览。
+              需要手动覆盖时，优先修改外部关键项；场外基金使用单位净值/累计净值计算技术指标，不能代表真实分时量价。
+            </div>
+            <button id="open-auto-data-modal-btn" class="btn mini light" type="button">查看全部自动数据</button>
+          </div>
+          <div id="auto-data-key-metrics" class="auto-data-key-metrics">
+            <div class="empty compact-empty">拉取标的数据后显示关键自动数据。</div>
+          </div>
+        </div>
+
+        <div class="data-grid auto-manual-core-grid">
           <label class="field" data-tip="自动获取失败时可手填。PE百分位越高越贵，计算使用连续曲线，不用硬分段。">
             <span>历史 PE 百分位 %</span>
             <input type="number" step="0.1" min="0" max="100" name="pe_percentile" placeholder="例如 85">
@@ -608,6 +622,438 @@
     <div id="table-preview-body" class="table-preview-body"></div>
   </section>
 </div>
+
+<div id="auto-data-modal" class="auto-data-modal" hidden>
+  <div class="auto-data-modal-backdrop" data-close-auto-data></div>
+  <section class="auto-data-dialog" role="dialog" aria-modal="true" aria-labelledby="auto-data-modal-title">
+    <header class="auto-data-modal-head">
+      <div>
+        <div class="auto-data-modal-kicker">自动数据预览 · 只读</div>
+        <h2 id="auto-data-modal-title">全部获取与计算数据</h2>
+      </div>
+      <button class="ghost-btn auto-data-close-btn" type="button" data-close-auto-data>关闭</button>
+    </header>
+    <div class="auto-data-modal-tools">
+      <input id="auto-data-filter" type="search" placeholder="过滤字段：MACD / RSI / 回撤 / 估值 / MA">
+      <span id="auto-data-modal-count" class="small">--</span>
+    </div>
+    <div id="auto-data-modal-body" class="auto-data-modal-body"></div>
+  </section>
+</div>
+
+<style>
+/* 自动数据区域：只保留一套外部表单。原 app.js 会把全部自动数据渲染到 #auto-data-list，
+   这里隐藏它，避免和新的“关键摘要 + 全量弹窗表单”重复显示。 */
+#auto-data-list { display: none !important; }
+.auto-data-summary { margin-top: 10px; margin-bottom: 10px; }
+.auto-data-summary-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.auto-data-summary-head > div { min-width: 0; line-height: 1.55; }
+.auto-data-key-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
+.auto-data-key-item { border: 1px solid var(--line); border-radius: 12px; background: rgba(255,255,255,.58); padding: 9px 10px; min-width: 0; }
+.auto-data-key-item span { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.auto-data-key-item strong { display: block; color: #3d3026; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.auto-manual-core-grid { margin-top: 10px; }
+
+/* 全量自动数据弹窗：完全独立于 table-preview 预览弹窗，避免继承表格预览样式导致字段被压扁。 */
+#auto-data-modal[hidden] { display: none !important; }
+#auto-data-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 3000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+}
+#auto-data-modal .auto-data-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(36, 25, 16, .55);
+  backdrop-filter: blur(2px);
+}
+#auto-data-modal .auto-data-dialog {
+  position: relative;
+  z-index: 1;
+  width: min(1120px, calc(100vw - 28px));
+  max-height: calc(100dvh - 36px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: #fffaf2;
+  box-shadow: 0 22px 70px rgba(43, 30, 19, .30);
+}
+#auto-data-modal .auto-data-modal-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  background: #2f241d;
+  color: #fff6e8;
+}
+#auto-data-modal .auto-data-modal-head h2 { margin: 2px 0 0; font-size: 18px; }
+#auto-data-modal .auto-data-modal-kicker { color: #d9c6ad; font-size: 12px; }
+#auto-data-modal .auto-data-close-btn {
+  flex: 0 0 auto;
+  border-color: rgba(255,255,255,.28);
+  background: rgba(255,255,255,.08);
+  color: #fff6e8;
+}
+#auto-data-modal .auto-data-modal-tools {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line);
+  background: #fffaf2;
+}
+#auto-data-modal .auto-data-modal-tools input { max-width: 380px; height: 38px; }
+#auto-data-modal .auto-data-modal-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px 16px 16px;
+  background: #fffaf2;
+}
+#auto-data-modal .auto-data-section {
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(255,255,255,.62);
+  overflow: visible;
+}
+#auto-data-modal .auto-data-section h3 {
+  margin: 0;
+  padding: 10px 12px;
+  font-size: 14px;
+  background: #f3e7d5;
+  color: #4a382a;
+  border-radius: 14px 14px 0 0;
+}
+#auto-data-modal .auto-data-table-wrap {
+  overflow-x: auto;
+  border-top: 1px solid var(--line);
+}
+#auto-data-modal .auto-data-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 12px;
+}
+#auto-data-modal .auto-data-table th,
+#auto-data-modal .auto-data-table td {
+  padding: 7px 9px;
+  border-bottom: 1px solid rgba(225, 216, 203, .82);
+  vertical-align: top;
+  text-align: left;
+}
+#auto-data-modal .auto-data-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: #fff4e2;
+  color: #5b4432;
+  font-weight: 900;
+  white-space: nowrap;
+}
+#auto-data-modal .auto-data-table tr:nth-child(even) td { background: rgba(255,255,255,.36); }
+#auto-data-modal .auto-data-table tr:hover td { background: #fff7ea; }
+#auto-data-modal .auto-data-table .col-label { width: 20%; }
+#auto-data-modal .auto-data-table .col-value { width: 20%; }
+#auto-data-modal .auto-data-table .col-key { width: 22%; }
+#auto-data-modal .auto-data-table .col-tip { width: 38%; }
+#auto-data-modal .auto-data-row-label { font-weight: 900; color: #3f3025; word-break: break-word; }
+#auto-data-modal .auto-data-row-value { font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; font-weight: 800; color: #2f241d; word-break: break-word; }
+#auto-data-modal .auto-data-row-key { font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; color: #76563b; word-break: break-all; }
+#auto-data-modal .auto-data-row-tip { color: var(--muted); line-height: 1.45; word-break: break-word; }
+#auto-data-modal [data-auto-field-wrap][hidden],
+#auto-data-modal .auto-data-section[hidden] { display: none !important; }
+@media (max-width: 1100px) { .auto-data-key-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 700px) { .auto-data-summary-head, #auto-data-modal .auto-data-modal-tools { flex-direction: column; align-items: stretch; } .auto-data-key-metrics { grid-template-columns: 1fr; } #auto-data-modal { padding: 8px; } #auto-data-modal .auto-data-dialog { width: calc(100vw - 16px); max-height: calc(100dvh - 16px); } #auto-data-modal .auto-data-table { min-width: 760px; } }
+
+</style>
+
+<script>
+(() => {
+  const AUTO_DATA_FIELDS = [
+    ["估值 / 基本面", "pe_percentile", "历史 PE 百分位 %", "PE百分位越高越贵；用于估值仓位修正。"],
+    ["估值 / 基本面", "pb_percentile", "历史 PB 百分位 %", "PB百分位；金融、周期、指数可辅助 PE。"],
+    ["估值 / 基本面", "roe_pct", "ROE %", "盈利质量修正字段。"],
+    ["行情 / 净值", "close", "最新净值 / 收盘", "场外基金为最新单位净值或净值序列末值。"],
+    ["行情 / 净值", "prev_close", "前一日净值", "用于日涨跌计算。"],
+    ["行情 / 净值", "return_20d", "20日收益 %", "近20个交易日收益。"],
+    ["行情 / 净值", "return_60d", "60日收益 %", "近60个交易日收益。"],
+    ["行情 / 净值", "return_120d", "120日收益 %", "近120个交易日收益。"],
+    ["趋势 / 均线", "ma20", "MA20", "20日净值均线。"],
+    ["趋势 / 均线", "ma50", "MA50", "50日净值均线。"],
+    ["趋势 / 均线", "ma200", "MA200", "200日净值均线。"],
+    ["趋势 / 均线", "ma50_slope_20d", "MA50斜率 %", "MA50相对20日前变化。"],
+    ["趋势 / 均线", "ma200_slope_20d", "MA200斜率 %", "MA200相对20日前变化。"],
+    ["趋势 / 均线", "distance_ma50_pct", "距MA50 %", "当前净值相对MA50距离。"],
+    ["趋势 / 均线", "distance_ma200_pct", "距MA200 %", "当前净值相对MA200距离。"],
+    ["MACD", "macd_dif", "MACD DIF", "EMA12 - EMA26。"],
+    ["MACD", "macd_dea", "MACD DEA", "DIF 的 EMA9。"],
+    ["MACD", "macd_bar", "MACD 柱", "常见中文行情软件口径：(DIF - DEA) × 2。"],
+    ["MACD", "macd_dif_pct", "MACD DIF %", "DIF / 当前净值 × 100，更适合基金净值比较。"],
+    ["MACD", "macd_dea_pct", "MACD DEA %", "DEA / 当前净值 × 100。"],
+    ["MACD", "macd_bar_pct", "MACD 柱 %", "MACD柱 / 当前净值 × 100；小因子策略优先使用。"],
+    ["RSI", "rsi6", "RSI 6", "短周期 RSI，偏短线。"],
+    ["RSI", "rsi14", "RSI 14", "常用 RSI，辅助判断过热/偏弱。"],
+    ["BOLL", "boll_mid", "BOLL 中轨", "默认20日均线。"],
+    ["BOLL", "boll_upper", "BOLL 上轨", "中轨 + 2倍标准差。"],
+    ["BOLL", "boll_lower", "BOLL 下轨", "中轨 - 2倍标准差。"],
+    ["BOLL", "boll_width_pct", "BOLL 带宽 %", "(上轨-下轨)/中轨×100，衡量波动区间。"],
+    ["BOLL", "boll_percent_b", "BOLL %B", "当前净值在上下轨之间的位置：50≈中轨。"],
+    ["波动 / 回撤", "atr14", "ATR14", "场外基金为净值近似口径；无真实日内高低价。"],
+    ["波动 / 回撤", "atr_pct", "ATR %", "ATR14 / 当前净值 × 100。"],
+    ["波动 / 回撤", "volatility_20d", "20日波动 %", "近20日年化或策略内部波动口径。"],
+    ["波动 / 回撤", "volatility_60d", "60日波动 %", "近60日波动。"],
+    ["波动 / 回撤", "drawdown_252d", "252日回撤 %", "相对近252日高点的当前回撤。"],
+    ["量能 / 交易", "volume_ratio_20d", "20日量比", "场外基金通常缺真实成交量，可能为空或仅作场内ETF参考。"],
+    ["持仓 / 执行", "current_position_pct", "当前仓位 %", "由当前持仓 / 计划资金计算。"],
+    ["持仓 / 执行", "current_profit_pct", "当前盈亏 %", "来自你的手动输入或配置。"],
+    ["数据源", "source_used", "实际数据源", "本次成功返回的数据源。"],
+    ["数据源", "proxy_mode", "代理模式", "本次请求使用的代理配置。"]
+  ];
+  const KEY_METRICS = [
+    ["close", "最新净值"], ["pe_percentile", "PE%"], ["pb_percentile", "PB%"],
+    ["drawdown_252d", "252日回撤"], ["macd_bar_pct", "MACD柱%"], ["rsi14", "RSI14"],
+    ["boll_percent_b", "BOLL%B"], ["return_60d", "60日收益"], ["distance_ma200_pct", "距MA200"]
+  ];
+  const FIELD_MAP = new Map(AUTO_DATA_FIELDS.map(([group, key, label, tip]) => [key, {group, key, label, tip}]));
+  // 弹窗默认只展示“实际获取/实际计算到值”的字段，避免出现一堆空表单。
+  // 少数核心手动覆盖项即使为空也保留，方便用户直接补录。
+  const AUTO_DATA_KEEP_EMPTY_KEYS = new Set([
+    "pe_percentile", "pb_percentile", "roe_pct", "stop_loss_pct", "current_profit_pct"
+  ]);
+  let lastIndicators = {};
+
+  const $ = (sel, root = document) => root.querySelector(sel);
+  const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+  const cssEscape = (value) => (window.CSS && typeof CSS.escape === "function")
+    ? CSS.escape(String(value))
+    : String(value).replace(/[^a-zA-Z0-9_-]/g, "\\$&");
+
+  function escapeHtml(value) {
+    return String(value ?? "").replace(/[&<>\"]/g, ch => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[ch]));
+  }
+  function isBlank(value) {
+    return value === undefined || value === null || value === "" || (typeof value === "number" && !Number.isFinite(value));
+  }
+  function normaliseDisplayValue(value) {
+    if (value && typeof value === "object") {
+      try { return JSON.stringify(value, null, 0); } catch (_) { return String(value); }
+    }
+    return value;
+  }
+  function fmt(value, key = "") {
+    value = normaliseDisplayValue(value);
+    if (isBlank(value)) return "--";
+    if (typeof value === "boolean") return value ? "是" : "否";
+    const n = Number(value);
+    if (Number.isFinite(n) && String(value).trim() !== "") {
+      if (/percentile|pct|return|drawdown|volatility|slope|distance|width|profit/i.test(key)) return `${n.toFixed(Math.abs(n) >= 100 ? 1 : 2)}%`;
+      if (/rsi|percent_b/i.test(key)) return n.toFixed(2);
+      if (Math.abs(n) >= 100) return n.toFixed(2);
+      if (Math.abs(n) >= 1) return n.toFixed(4);
+      return n.toFixed(6);
+    }
+    return String(value);
+  }
+  function stepFor(key) {
+    if (/percentile|pct|return|drawdown|volatility|slope|distance|width|rsi|percent_b/i.test(key)) return "0.01";
+    if (/volume_ratio/i.test(key)) return "0.001";
+    return "0.000001";
+  }
+  function isNumericValue(value) {
+    return value === "" || value === null || value === undefined || Number.isFinite(Number(value));
+  }
+  function externalInputFor(key) {
+    return $(`#signal-form [name="${cssEscape(key)}"]`);
+  }
+  function fieldHasUsableValue(key, indicators = {}) {
+    const raw = normaliseDisplayValue(indicators[key]);
+    const ext = externalInputFor(key);
+    if (!isBlank(raw)) return true;
+    if (ext && !isBlank(ext.value)) return true;
+    return AUTO_DATA_KEEP_EMPTY_KEYS.has(key);
+  }
+  function ensureFieldList(indicators = {}) {
+    const known = new Set(AUTO_DATA_FIELDS.map(item => item[1]));
+    const baseRows = AUTO_DATA_FIELDS.filter(([, key]) => fieldHasUsableValue(key, indicators));
+    const extra = Object.keys(indicators || {})
+      .filter(key => !known.has(key) && !["fetch_trace", "trace"].includes(key))
+      .filter(key => !isBlank(normaliseDisplayValue(indicators[key])));
+    return baseRows.concat(extra.sort().map(key => ["其他", key, key, "接口返回的额外字段。"]));
+  }
+  function buildModalFields(indicators = {}) {
+    const body = $("#auto-data-modal-body");
+    if (!body) return;
+    const rowsAll = ensureFieldList(indicators);
+    if (!rowsAll.length) {
+      body.innerHTML = `<div class="empty compact-empty">暂无已获取/已计算的数据。请先点击“拉取所选标的数据”。</div>`;
+      updateModalCount();
+      return;
+    }
+    const groups = new Map();
+    for (const [group, key, label, tip] of rowsAll) {
+      if (!groups.has(group)) groups.set(group, []);
+      groups.get(group).push({group, key, label, tip});
+    }
+    body.innerHTML = Array.from(groups.entries()).map(([group, rows]) => `
+      <section class="auto-data-section" data-auto-section="${escapeHtml(group)}">
+        <h3>${escapeHtml(group)}</h3>
+        <div class="auto-data-table-wrap">
+          <table class="auto-data-table" aria-label="${escapeHtml(group)}">
+            <thead>
+              <tr>
+                <th class="col-label">字段</th>
+                <th class="col-value">值</th>
+                <th class="col-key">Key</th>
+                <th class="col-tip">说明</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rows.map(row => {
+                const ext = externalInputFor(row.key);
+                const rawValue = indicators[row.key];
+                const fallbackValue = ext ? ext.value : "";
+                const value = normaliseDisplayValue(isBlank(rawValue) ? fallbackValue : rawValue);
+                const shown = isBlank(value) ? "--" : fmt(value, row.key);
+                return `
+                  <tr data-auto-field-wrap="${escapeHtml(row.key)}" data-search-text="${escapeHtml(`${row.key} ${row.label} ${row.group} ${shown}`.toLowerCase())}">
+                    <td class="auto-data-row-label">${escapeHtml(row.label)}</td>
+                    <td class="auto-data-row-value" title="${escapeHtml(isBlank(value) ? "" : value)}">${escapeHtml(shown)}</td>
+                    <td class="auto-data-row-key">${escapeHtml(row.key)}</td>
+                    <td class="auto-data-row-tip">${escapeHtml(row.tip || "")}</td>
+                  </tr>`;
+              }).join("")}
+            </tbody>
+          </table>
+        </div>
+      </section>`).join("");
+    updateModalCount();
+  }
+  function ensureAutoHiddenInput(key) {
+    const form = $("#signal-form");
+    if (!form) return null;
+    let input = $(`#signal-form input[type="hidden"][data-auto-hidden="1"][name="${cssEscape(key)}"]`);
+    if (!input) {
+      input = document.createElement("input");
+      input.type = "hidden";
+      input.name = key;
+      input.dataset.autoHidden = "1";
+      input.dataset.autoField = key;
+      form.appendChild(input);
+    }
+    return input;
+  }
+  function syncInputValue(key, value, {overwriteUser = true} = {}) {
+    const targetValue = isBlank(value) ? "" : String(value);
+    const existing = externalInputFor(key);
+    const ext = existing || ensureAutoHiddenInput(key);
+    if (ext && (overwriteUser || !ext.value)) {
+      ext.value = targetValue;
+      ext.dispatchEvent(new Event("input", {bubbles: true}));
+      ext.dispatchEvent(new Event("change", {bubbles: true}));
+    }
+  }
+  function syncIndicators(indicators = {}) {
+    lastIndicators = Object.assign({}, lastIndicators, indicators || {});
+    buildModalFields(lastIndicators);
+    for (const [key, value] of Object.entries(lastIndicators)) syncInputValue(key, value);
+    renderSummary(lastIndicators);
+    window.__AUTO_INDICATORS = Object.assign({}, lastIndicators);
+  }
+  function renderSummary(indicators = {}) {
+    const host = $("#auto-data-key-metrics");
+    if (!host) return;
+    host.innerHTML = KEY_METRICS.map(([key, label]) => `
+      <div class="auto-data-key-item" title="${escapeHtml(key)}">
+        <span>${escapeHtml(label)}</span>
+        <strong>${escapeHtml(fmt(indicators[key], key))}</strong>
+      </div>`).join("");
+  }
+  function updateModalCount() {
+    const fields = $$("[data-auto-field-wrap]");
+    const visible = fields.filter(el => !el.hidden).length;
+    const count = $("#auto-data-modal-count");
+    if (count) count.textContent = `${visible}/${fields.length} 项`;
+  }
+  function filterModal(query) {
+    const q = String(query || "").trim().toLowerCase();
+    $$("[data-auto-field-wrap]").forEach(el => {
+      el.hidden = !!q && !String(el.dataset.searchText || "").includes(q);
+    });
+    $$(".auto-data-section").forEach(section => {
+      const hasVisible = $$('[data-auto-field-wrap]', section).some(el => !el.hidden);
+      section.hidden = !hasVisible;
+    });
+    updateModalCount();
+  }
+  function openModal() {
+    buildModalFields(lastIndicators);
+    const modal = $("#auto-data-modal");
+    if (modal) modal.hidden = false;
+    const filter = $("#auto-data-filter");
+    if (filter) { filter.value = ""; filter.focus(); filterModal(""); }
+  }
+  function closeModal() {
+    const modal = $("#auto-data-modal");
+    if (modal) modal.hidden = true;
+  }
+  function notifyFormChanged() {
+    const form = $("#signal-form");
+    if (form) {
+      form.dispatchEvent(new Event("input", {bubbles: true}));
+      form.dispatchEvent(new Event("change", {bubbles: true}));
+    }
+  }
+  function initAutoDataModal() {
+    buildModalFields({});
+    renderSummary({});
+    document.addEventListener("click", event => {
+      if (event.target.closest("#open-auto-data-modal-btn")) openModal();
+      if (event.target.closest("[data-close-auto-data]")) closeModal();
+    });
+    document.addEventListener("input", event => {
+      if (event.target.closest("#auto-data-filter")) filterModal(event.target.value);
+    });
+    document.addEventListener("keydown", event => {
+      if (event.key === "Escape" && !$("#auto-data-modal")?.hidden) closeModal();
+    });
+  }
+
+  const nativeFetch = window.fetch.bind(window);
+  window.fetch = async (...args) => {
+    const response = await nativeFetch(...args);
+    try {
+      const url = typeof args[0] === "string" ? args[0] : (args[0]?.url || "");
+      if (String(url).includes("/api/fetch")) {
+        response.clone().json().then(data => {
+          if (data && data.ok !== false && data.indicators) {
+            [0, 80, 240].forEach(delay => setTimeout(() => syncIndicators(data.indicators), delay));
+          }
+        }).catch(() => {});
+      }
+    } catch (_) {}
+    return response;
+  };
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initAutoDataModal);
+  } else {
+    initAutoDataModal();
+  }
+})();
+</script>
 
 <div id="hover-popover" class="hover-popover" hidden></div>
 </body>

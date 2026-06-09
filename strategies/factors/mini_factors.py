@@ -49,6 +49,11 @@ def _trend_factor(signals: Dict[str, Any]) -> Tuple[float, List[str]]:
     ret120 = _num(signals, "return_120d")
     ma50_slope = _num(signals, "ma50_slope_20d")
     ma200_slope = _num(signals, "ma200_slope_20d")
+    macd_bar_pct = _num(signals, "macd_bar_pct")
+    macd_dif_pct = _num(signals, "macd_dif_pct")
+    macd_dea_pct = _num(signals, "macd_dea_pct")
+    rsi14 = _num(signals, "rsi14")
+    boll_percent_b = _num(signals, "boll_percent_b")
 
     score = {
         "bear": -0.85,
@@ -76,6 +81,44 @@ def _trend_factor(signals: Dict[str, Any]) -> Tuple[float, List[str]]:
             notes.append(f"趋势因子：{label} {value:.2f}% -> {part:+.2f}。")
     if slope_parts:
         score += sum(slope_parts) / len(slope_parts)
+
+    tech_parts = []
+    if macd_bar_pct is not None:
+        part = clamp(macd_bar_pct / 0.90, -0.25, 0.25)
+        if macd_dif_pct is not None and macd_dea_pct is not None:
+            cross_note = "DIF在DEA上方" if macd_dif_pct >= macd_dea_pct else "DIF在DEA下方"
+            notes.append(f"趋势因子：MACD柱 {macd_bar_pct:.3f}%（{cross_note}）-> {part:+.2f}。")
+        else:
+            notes.append(f"趋势因子：MACD柱 {macd_bar_pct:.3f}% -> {part:+.2f}。")
+        tech_parts.append(part)
+    if rsi14 is not None:
+        if rsi14 >= 75:
+            part = -0.18
+        elif rsi14 >= 55:
+            part = 0.12
+        elif rsi14 >= 45:
+            part = 0.02
+        elif rsi14 >= 30:
+            part = -0.08
+        else:
+            part = -0.15
+        notes.append(f"趋势因子：RSI14 {rsi14:.2f} -> {part:+.2f}。")
+        tech_parts.append(part)
+    if boll_percent_b is not None:
+        if boll_percent_b >= 110:
+            part = -0.14
+        elif boll_percent_b >= 60:
+            part = 0.10
+        elif boll_percent_b <= -10:
+            part = -0.14
+        elif boll_percent_b <= 20:
+            part = -0.06
+        else:
+            part = 0.0
+        notes.append(f"趋势因子：BOLL %B {boll_percent_b:.2f} -> {part:+.2f}。")
+        tech_parts.append(part)
+    if tech_parts:
+        score += sum(tech_parts) / len(tech_parts)
 
     return clamp(score, -1.0, 1.0), notes
 
@@ -121,6 +164,7 @@ def _volatility_factor(signals: Dict[str, Any]) -> Tuple[float, List[str]]:
     vol20 = _num(signals, "volatility_20d")
     vol60 = _num(signals, "volatility_60d")
     atr_pct = _num(signals, "atr_pct")
+    boll_width_pct = _num(signals, "boll_width_pct")
     values = []
     notes: List[str] = []
     if vol60 is not None:
@@ -137,6 +181,11 @@ def _volatility_factor(signals: Dict[str, Any]) -> Tuple[float, List[str]]:
         score = -clamp((atr_pct - 2.2) / 4.0, 0.0, 0.5)
         values.append(score)
         notes.append(f"波动因子：ATR占比 {atr_pct:.2f}% -> {score:+.2f}。")
+    if boll_width_pct is not None:
+        # BOLL宽度越大，说明净值波动区间越宽；低频基金仓位系统对高波动略降权。
+        score = -clamp((boll_width_pct - 12.0) / 18.0, 0.0, 0.45)
+        values.append(score)
+        notes.append(f"波动因子：BOLL带宽 {boll_width_pct:.2f}% -> {score:+.2f}。")
     if not values:
         return 0.0, ["波动因子：缺少波动/ATR数据，按中性处理。"]
     return clamp(sum(values) / len(values), -1.0, 1.0), notes
