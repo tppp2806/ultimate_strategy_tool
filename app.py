@@ -134,6 +134,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "position_mode": "core_satellite",  # core_satellite / strict_trade
     "risk_per_trade_pct": 1.0,
     "backtest_risk_free_rate_pct": 2.0,
+    "dca_base_buy_pct": 25.0,
     **ADVANCED_PARAM_DEFAULTS,
     "symbol": "",
     "symbol_name": "",
@@ -473,6 +474,7 @@ def ensure_config() -> Dict[str, Any]:
     # 全局执行速度：从顶层读取，缺失时回退到均衡默认值。
     for key, default in [
         ("global_buy_step_pct", 26.0), ("global_sell_step_pct", 48.0), ("global_risk_multiplier", 1.0),
+        ("dca_base_buy_pct", 25.0),
     ]:
         if key not in merged or merged[key] is None or merged[key] == "":
             merged[key] = default
@@ -597,7 +599,8 @@ def _flatten_active_style_params(cfg: Dict[str, Any]) -> None:
 
     # 执行层控制 + 仓位边界：也统一从均衡基准出发。
     for key, default in [
-        ("core_step_pct", 22.0),
+        ("dca_base_buy_pct", 25.0),
+        ("core_step_pct", 22.0),  # 兼容旧配置；前端不再展示。
         ("buy_step_limit_pct", 28.0),
         ("sell_step_limit_pct", 45.0),
     ]:
@@ -1304,11 +1307,13 @@ def buy_opportunity_multiplier(signal_quality: int, expected_r: float, frequency
 
 
 def active_strategy_family_key(cfg: Dict[str, Any]) -> str:
-    """当前总体策略 key。用于把"总体策略方法论"和"参数风格"彻底分开。"""
-    try:
-        return normalise_strategy_family_key(cfg.get("strategy_family"))
-    except Exception:
-        return DEFAULT_STRATEGY_FAMILY
+    """当前总体策略 key。用于把"总体策略方法论"和"参数风格"彻底分开。
+
+    注意：这里不能调用未导入的 normalise_strategy_family_key；旧版因此异常回退到默认
+    trend_signal_control，导致 UI 选了简易均线，后端仍执行趋势策略。
+    """
+    key = str((cfg or {}).get("strategy_family") or DEFAULT_STRATEGY_FAMILY)
+    return key if key in STRATEGY_FAMILIES else DEFAULT_STRATEGY_FAMILY
 
 
 def is_signal_driven_family(cfg: Dict[str, Any]) -> bool:
@@ -1351,6 +1356,32 @@ def raw_target_by_signal(cfg: Dict[str, Any], signals: Dict[str, Any], cur: floa
     if use_target_model:
         signals["core_target_model"] = True
         signals["strategy_model_driven"] = not signal_driven
+
+    # 定投增强策略 = 固定定投底盘 + 当前总体策略在【交易模式】下给出的偏移。
+    # 这样定投模式不会把一套“核心仓目标表”混进具体策略，策略判断仍保持纯净。
+    if is_core_mode:
+        strict_cfg = copy.deepcopy(cfg)
+        strict_cfg["position_mode"] = "strict_trade"
+        strict_signals = copy.deepcopy(signals)
+        strategy_action, strategy_target, strategy_matched, strategy_reasons, strategy_confidence = raw_target_by_signal(strict_cfg, strict_signals, cur)
+        strategy_delta = strategy_target - cur
+        dca_delta = advanced_pct(cfg, "dca_base_buy_pct", 25.0)
+        low, high = core_asset_floor_bounds("core", cfg)
+        target = clamp(cur + dca_delta + strategy_delta, low, high)
+        action = target_action_from_delta(cur, target, buy_label="买入", sell_label="减仓")
+        matched = f"定投增强：固定买入{pct2(dca_delta)} + {strategy_matched}"
+        confidence = strategy_confidence
+        signals["core_target_model"] = True
+        signals["strategy_model_driven"] = True
+        signals["pure_strategy_target"] = True
+        signals["dca_composed_target"] = True
+        reason.append(f"定投增强底盘：先给出总资金 {pct2(dca_delta)} 的固定买入建议。")
+        if abs(strategy_delta) >= 0.0001:
+            reason.append(f"策略偏移：{strategy_matched}，策略目标相对当前仓位 {pct2(strategy_delta)}。")
+        else:
+            reason.append(f"策略偏移：{strategy_matched}，策略本身建议维持当前仓位。")
+        reason.extend(strategy_reasons)
+        return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
 
     # 先生成"总体策略目标仓位"，再由执行层决定是否交易。
     core_target = floor
@@ -1481,22 +1512,19 @@ def raw_target_by_signal(cfg: Dict[str, Any], signals: Dict[str, Any], cur: floa
     # 3. 总体策略目标仓位模型。
     if use_target_model:
         target = core_target
-        action = target_action_from_delta(cur, target, buy_label="加仓", sell_label="减仓")
+        action = target_action_from_delta(cur, target, buy_label="买入", sell_label="减仓")
         base_rule = strategy_rule_label(signals, "目标仓位模型")
         confidence = strategy_confidence_hint(signals, 68 if action in {"买入", "加仓"} else 62)
+        signals["pure_strategy_target"] = True
         if action in {"买入", "加仓"}:
-            signals["allocation_fill"] = True
-            matched = f"{base_rule}：补足目标仓位"
-            if signal_driven:
-                reason.append("定投增强策略模式按目标仓位建设核心仓，不再等短线买点才入场。")
-            else:
-                reason.append("当前总体策略直接输出目标仓位；入场/破位信号只作为该策略的输入因子，不再套用趋势策略的硬规则。")
+            matched = f"{base_rule}：策略买入"
+            reason.append("当前总体策略直接输出交易目标；不再套用趋势策略的震荡/突破/回踩硬规则。")
         elif action in {"减仓", "清仓"}:
-            matched = f"{base_rule}：降低到目标仓位"
-            reason.append("目标仓位低于当前仓位，按当前总体策略降低交易仓。")
+            matched = f"{base_rule}：策略卖出"
+            reason.append("当前总体策略直接输出交易目标；执行层不再用其他策略条件改写方向。")
         else:
-            matched = f"{base_rule}：维持区间"
-            reason.append("当前仓位已经接近当前总体策略目标仓位，不做机械再平衡。")
+            matched = f"{base_rule}：策略维持"
+            reason.append("当前仓位已经接近当前总体策略目标。")
         reason.extend(core_notes)
         return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
 
@@ -1625,15 +1653,17 @@ def compute_decision(cfg: Dict[str, Any], form: Dict[str, Any]) -> Decision:
     r_cap, cap_warnings = risk_position_cap(cfg, signals, strategy)
 
     action, raw_target, matched, reasons, confidence = raw_target_by_signal(cfg, signals, cur)
+    pure_strategy_target = bool(signals.get("pure_strategy_target"))
     signal_quality, quality_notes2 = signal_quality_score(signals, action)
     expected_r, opportunity_grade, odds_notes = expected_reward_r(signals, action)
     trade_frequency, frequency_mult, frequency_notes = trade_frequency_profile(signals, action)
-    warnings: List[str] = risk_notes + cap_warnings
+    warnings: List[str] = [] if pure_strategy_target else (risk_notes + cap_warnings)
 
-    # 信号质量/赔率/频率是交易系统层面的三道过滤：不直接替代主信号，但会限制新增仓位。
-    warnings.extend(quality_notes2)
-    warnings.extend(odds_notes)
-    warnings.extend(frequency_notes)
+    # 信号质量/赔率/频率是趋势交易系统层面的过滤；纯目标策略已经在自己的 Python 文件中完成判断。
+    if not pure_strategy_target:
+        warnings.extend(quality_notes2)
+        warnings.extend(odds_notes)
+        warnings.extend(frequency_notes)
 
     # 量价只做确认，不主导。
     # 目标仓位模型类策略（定投增强、五维、小因子）已经在各自策略文件中处理量价/情绪/风险，
@@ -1669,14 +1699,9 @@ def compute_decision(cfg: Dict[str, Any], form: Dict[str, Any]) -> Decision:
     applied_q_adj = 0.0
 
     if signals.get("core_target_model"):
-        # 目标仓位模型已经在 core_target_weight() 中连续纳入 PE/PB/ROE，
-        # 这里不再二次叠加估值/质量修正，避免核心配置仓被重复压低。
-        if val_notes:
-            warnings.append("估值已纳入目标仓位模型，本次不再二次修正目标仓位。")
-        warnings.extend(val_notes)
-        if q_notes:
-            warnings.append("质量指标已纳入目标仓位模型，本次不再二次修正目标仓位。")
-            warnings.extend(q_notes)
+        # 纯目标策略的估值/质量处理只能发生在对应策略 Python 文件内部。
+        # 这里不再追加任何估值/ROE提示，避免简易均线等策略被全局信息污染。
+        pass
     elif action in buy_actions:
         applied_val_adj = val_adj_raw
         applied_q_adj = q_adj_raw
@@ -1697,14 +1722,20 @@ def compute_decision(cfg: Dict[str, Any], form: Dict[str, Any]) -> Decision:
             warnings.append("ROE仅作为买入质量修正；当前不是新增仓位信号，因此不改变目标仓位。")
 
     is_allocation_fill = bool(signals.get("allocation_fill"))
-    if is_allocation_fill:
+    if pure_strategy_target:
+        # 交易模式：策略给出什么就是什么；定投模式：固定买入 + 策略偏移已经在 raw_target_by_signal 中合成。
+        # 这里不再用止损风险预算、赔率过滤、估值刹车或单次补仓上限改写方向/幅度。
+        base_buy_step_limit = 1.0
+    elif is_allocation_fill:
         base_buy_step_limit, allocation_step_notes = core_allocation_step_limit(cfg, signals, strategy)
         warnings.extend(allocation_step_notes)
     else:
         base_buy_step_limit = 1.0 if not advanced_bool(cfg, "trade_step_limit_enabled", True) else min(float(strategy["buy_step"]), r_cap)
     buy_step_limit = base_buy_step_limit
     if action in buy_actions:
-        if not advanced_bool(cfg, "trade_step_limit_enabled", True):
+        if pure_strategy_target:
+            buy_step_limit = 1.0
+        elif not advanced_bool(cfg, "trade_step_limit_enabled", True):
             buy_step_limit = 1.0
             reject_for_odds = False
             warnings.append("单次操作上限已关闭：买入允许直接调到目标仓位。")
@@ -1726,12 +1757,16 @@ def compute_decision(cfg: Dict[str, Any], form: Dict[str, Any]) -> Decision:
             if reject_for_odds:
                 raw_target = cur
                 reasons.append("信号质量/赔率过滤未通过，本次不新增交易仓。")
-    sell_step_limit, sell_limit_notes = dynamic_sell_step_limit(cfg, strategy, signals, action)
-    warnings.extend(sell_limit_notes)
+    if pure_strategy_target:
+        sell_step_limit = 1.0
+        sell_limit_notes = []
+    else:
+        sell_step_limit, sell_limit_notes = dynamic_sell_step_limit(cfg, strategy, signals, action)
+        warnings.extend(sell_limit_notes)
 
     target = raw_target
     if action in {"试仓", "买入", "加仓", "重仓"}:
-        if r_cap <= 0 and not is_allocation_fill and advanced_bool(cfg, "trade_step_limit_enabled", True):
+        if r_cap <= 0 and not is_allocation_fill and not pure_strategy_target and advanced_bool(cfg, "trade_step_limit_enabled", True):
             target = cur
             action = "观望" if cur <= 0 else "持有"
             confidence = min(confidence, 54)
@@ -1793,12 +1828,13 @@ def compute_decision(cfg: Dict[str, Any], form: Dict[str, Any]) -> Decision:
         elif action == "观望" and cur > 0:
             action = "持有"
 
-    if risk >= 85 and action in {"清仓", "大减仓"}:
-        confidence = max(confidence, 88)
-    elif risk >= 60 and action in {"买入", "加仓", "重仓"}:
-        confidence = min(confidence, 58)
-    elif t_score >= 60 and action in {"加仓", "重仓"}:
-        confidence = min(92, confidence + 5)
+    if not pure_strategy_target:
+        if risk >= 85 and action in {"清仓", "大减仓"}:
+            confidence = max(confidence, 88)
+        elif risk >= 60 and action in {"买入", "加仓", "重仓"}:
+            confidence = min(confidence, 58)
+        elif t_score >= 60 and action in {"加仓", "重仓"}:
+            confidence = min(92, confidence + 5)
     confidence = int(clamp(confidence, 1, 99))
 
     return Decision(
@@ -6727,8 +6763,9 @@ def api_config():
     for key, default, low, high in [
         ("global_buy_step_pct", 26.0, 0.0, 100.0),
         ("global_sell_step_pct", 48.0, 0.0, 100.0),
-        ("global_risk_multiplier", 1.0, 0.1, 5.0),
-        ("core_step_pct", 22.0, 0.0, 100.0),
+        ("global_risk_multiplier", 1.0, 0.1, 5.0),  # 兼容旧配置；前端不再展示。
+        ("dca_base_buy_pct", 25.0, 0.0, 100.0),
+        ("core_step_pct", 22.0, 0.0, 100.0),  # 兼容旧配置；前端不再展示。
         ("buy_step_limit_pct", 28.0, 0.0, 100.0),
         ("sell_step_limit_pct", 45.0, 0.0, 100.0),
         ("core_min_position_pct", 5.0, 0.0, 100.0),
@@ -6753,21 +6790,57 @@ def api_config():
 
     save_config(cfg)
     strategy_obj = get_strategy(cfg)
-    mode_text = "定投增强策略（目标仓位动态计算）" if cfg.get("position_mode") == "core_satellite" else "纯交易仓"
+    mode_text = "定投增强策略（固定买入 + 策略偏移）" if cfg.get("position_mode") == "core_satellite" else "纯交易仓"
     symbol_text = f"{cfg.get('symbol_name') or '未选择'} {cfg.get('symbol') or ''}".strip()
     return jsonify({
         "ok": True,
         "message": "配置已保存",
         "current_pos_text": pct(current_position(cfg)),
-        "strategy_text": f"{full_strategy_summary(cfg)}<br>仓位模式：{mode_text}<br>标的：{symbol_text}<br>数据容错：代理 {cfg.get('proxy_mode')} / 超时 {cfg.get('request_timeout_sec')} 秒 / 重试 {cfg.get('retry_count')} 次<br>估值来源：{valuation_method_text(cfg.get('valuation_method'))}<br>回测无风险收益率：{cfg.get('backtest_risk_free_rate_pct', 2.0)}%<br>单次操作上限：{'开启' if cfg.get('trade_step_limit_enabled') else '关闭，直接调到目标仓位'}<br>计划资金=100%上限，不按标的类型封顶。",
+        "strategy_text": f"{full_strategy_summary(cfg)}<br>仓位模式：{mode_text}<br>标的：{symbol_text}<br>数据容错：代理 {cfg.get('proxy_mode')} / 超时 {cfg.get('request_timeout_sec')} 秒 / 重试 {cfg.get('retry_count')} 次<br>估值来源：{valuation_method_text(cfg.get('valuation_method'))}<br>回测无风险收益率：{cfg.get('backtest_risk_free_rate_pct', 2.0)}%<br>定投基准买入：{cfg.get('dca_base_buy_pct', 25.0)}%<br>计划资金=100%上限，不按标的类型封顶。",
         "config": cfg,
     })
 
 
+def _cfg_for_decision_payload(saved_cfg: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+    """决策接口允许前端把当前未落盘配置一起传入，避免防抖保存未完成时仍按旧策略计算。"""
+    cfg = copy.deepcopy(saved_cfg)
+    if "strategy_family" in payload:
+        strategy_family = str(payload.get("strategy_family") or cfg.get("strategy_family") or DEFAULT_STRATEGY_FAMILY)
+        cfg["strategy_family"] = strategy_family if strategy_family in STRATEGY_FAMILIES else DEFAULT_STRATEGY_FAMILY
+    if "strategy" in payload:
+        strategy = str(payload.get("strategy") or cfg.get("strategy") or "balanced")
+        cfg["strategy"] = strategy if strategy in STRATEGY_PRESETS else "balanced"
+    if "position_mode" in payload:
+        mode = str(payload.get("position_mode") or cfg.get("position_mode") or "core_satellite")
+        cfg["position_mode"] = mode if mode in {"core_satellite", "strict_trade"} else "core_satellite"
+    for key in [
+        "plan_amount", "current_position_amount", "current_profit_pct",
+        "risk_per_trade_pct", "dca_base_buy_pct",
+        "global_buy_step_pct", "global_sell_step_pct", "global_risk_multiplier",
+        "core_step_pct", "buy_step_limit_pct", "sell_step_limit_pct",
+        "core_min_position_pct", "core_max_position_pct",
+        "strict_min_position_pct", "strict_max_position_pct",
+    ]:
+        if key in payload:
+            cfg[key] = payload.get(key)
+    if isinstance(payload.get("strategy_mix"), dict):
+        cfg["strategy_mix"] = payload.get("strategy_mix") or {}
+    if isinstance(payload.get("strategy_family_params"), dict):
+        cfg["strategy_family_params"] = payload.get("strategy_family_params") or {}
+    if isinstance(payload.get("deviation"), dict):
+        cfg["deviation"] = payload.get("deviation") or {}
+    for key in ["symbol", "symbol_name", "market", "asset_kind", "data_source"]:
+        if key in payload:
+            cfg[key] = payload.get(key)
+    apply_active_family_params(cfg)
+    return cfg
+
+
 @app.post("/api/decision")
 def api_decision():
-    cfg = ensure_config()
+    saved_cfg = ensure_config()
     form = request.get_json(silent=True) or request.form.to_dict()
+    cfg = _cfg_for_decision_payload(saved_cfg, form if isinstance(form, dict) else {})
     result = compute_decision(cfg, form)
     return jsonify({"ok": True, "result": decision_to_payload(cfg, result)})
 
@@ -6912,7 +6985,7 @@ def api_backtest():
             "data": data,
             "cfg": {key: cfg.get(key) for key in [
                 "plan_amount", "strategy_family", "strategy", "strategy_mix", "strategy_family_params", "deviation", "position_mode", "risk_per_trade_pct", "backtest_risk_free_rate_pct",
-                "global_buy_step_pct", "global_sell_step_pct", "global_risk_multiplier",
+                "global_buy_step_pct", "global_sell_step_pct", "global_risk_multiplier", "dca_base_buy_pct",
                 "symbol", "symbol_name", "market", "asset_kind", "data_source",
                 "proxy_mode", "proxy_url", "request_timeout_sec", "retry_count",
                 "danjuan_cookie", "valuation_method",

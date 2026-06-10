@@ -53,8 +53,9 @@
   const globalConfigState = {
     global_buy_step_pct: numberOr(initialConfig.global_buy_step_pct, 26),
     global_sell_step_pct: numberOr(initialConfig.global_sell_step_pct, 48),
-    global_risk_multiplier: numberOr(initialConfig.global_risk_multiplier, 1.0),
-    core_step_pct: numberOr(initialConfig.core_step_pct, 22),
+    global_risk_multiplier: numberOr(initialConfig.global_risk_multiplier, 1.0), // 兼容旧配置；前端不再展示
+    dca_base_buy_pct: numberOr(initialConfig.dca_base_buy_pct, 25),
+    core_step_pct: numberOr(initialConfig.core_step_pct, 22), // 兼容旧配置；前端不再展示
     buy_step_limit_pct: numberOr(initialConfig.buy_step_limit_pct, 28),
     sell_step_limit_pct: numberOr(initialConfig.sell_step_limit_pct, 45),
     core_min_position_pct: numberOr(initialConfig.core_min_position_pct, 5),
@@ -88,11 +89,9 @@
         desc: "兼容旧策略文件的默认参数。新策略应在 Python 中声明 STYLE_PARAM_SCHEMA。",
         fields: [
           {name: "buy_step_pct", label: "买入节奏%", type: "number", default: 28, min: 0, max: 100, step: 0.1, tip: "买入/加仓时的单次执行速度。"},
-          {name: "sell_step_pct", label: "卖出节奏%", type: "number", default: 45, min: 0, max: 100, step: 0.1, tip: "减仓/止盈时的单次执行速度。"},
-          {name: "risk_multiplier", label: "风险倍率", type: "number", default: 1, min: 0.1, max: 5, step: 0.05, tip: "风险预算倍率。"}
+          {name: "sell_step_pct", label: "卖出节奏%", type: "number", default: 45, min: 0, max: 100, step: 0.1, tip: "减仓/止盈时的单次执行速度。"}
         ]
-      },
-      {type: "core_base_table", name: "core_base_pct", title: "目标仓位表", desc: "不同趋势状态下的基础目标仓位。"}
+      }
     ];
   }
 
@@ -316,7 +315,7 @@
   const THRESHOLD_FIELDS = [
     "core_min_position_pct", "core_max_position_pct",
     "strict_min_position_pct", "strict_max_position_pct",
-    "core_step_pct", "buy_step_limit_pct", "sell_step_limit_pct",
+    "dca_base_buy_pct", "core_step_pct", "buy_step_limit_pct", "sell_step_limit_pct",
     "bear_cap_pct", "below200_cap_pct", "risk_event_cap_pct",
     "high_valuation_cap_sideways_pct", "high_valuation_cap_trend_pct",
     "extreme_valuation_cap_sideways_pct", "extreme_valuation_cap_trend_pct",
@@ -351,7 +350,7 @@
       name.includes("cap") || name.includes("limit") || name.includes("threshold") ||
       name.includes("above") || name.includes("below") || name.includes("stop") ||
       name.includes("floor") || name.includes("min_") || name.includes("max_") ||
-      name.includes("core_step") || name.includes("core_base")
+      name.includes("dca_base_buy") || name.includes("core_step") || name.includes("core_base")
     ) return "threshold";
     return "amplitude";
   }
@@ -363,7 +362,7 @@
 
   // 偏离展示/执行的基准：始终只以【均衡基准】为源；配置保存时只保存 balanced + deviation。
   const GLOBAL_STYLE_DEFAULTS = {global_buy_step_pct: 26, global_sell_step_pct: 48, global_risk_multiplier: 1.0};
-  const GLOBAL_EXECUTION_DEFAULTS = {core_step_pct: 22, buy_step_limit_pct: 28, sell_step_limit_pct: 45};
+  const GLOBAL_EXECUTION_DEFAULTS = {dca_base_buy_pct: 25, core_step_pct: 22, buy_step_limit_pct: 28, sell_step_limit_pct: 45};
   const GLOBAL_POSITION_DEFAULTS = {core_min_position_pct: 5, core_max_position_pct: 92, strict_min_position_pct: 0, strict_max_position_pct: 60};
 
   function readGlobalField(name, fallback) {
@@ -614,7 +613,7 @@
 
   const ADVANCED_CONFIG_KEYS = [
     "trade_step_limit_enabled",
-    "core_step_pct", "buy_step_limit_pct", "sell_step_limit_pct",
+    "dca_base_buy_pct", "core_step_pct", "buy_step_limit_pct", "sell_step_limit_pct",
     "core_min_position_pct", "core_max_position_pct",
     "strict_min_position_pct", "strict_max_position_pct",
   ];
@@ -740,6 +739,7 @@
     payload.global_sell_step_pct = gStyle.global_sell_step_pct;
     payload.global_risk_multiplier = gStyle.global_risk_multiplier;
     const gExec = getGlobalExecutionBase();
+    payload.dca_base_buy_pct = gExec.dca_base_buy_pct;
     payload.core_step_pct = gExec.core_step_pct;
     payload.buy_step_limit_pct = gExec.buy_step_limit_pct;
     payload.sell_step_limit_pct = gExec.sell_step_limit_pct;
@@ -794,7 +794,7 @@
     buy_step_pct: "买入节奏%", sell_step_pct: "卖出节奏%",
     core_min_position_pct: "增强最低仓位%", core_max_position_pct: "增强最高仓位%",
     strict_min_position_pct: "交易最低仓位%", strict_max_position_pct: "交易最高仓位%",
-    core_step_pct: "补仓上限%", buy_step_limit_pct: "买入上限%", sell_step_limit_pct: "卖出上限%",
+    dca_base_buy_pct: "定投基准买入%", core_step_pct: "补仓上限%", buy_step_limit_pct: "买入上限%", sell_step_limit_pct: "卖出上限%",
     bear_cap_pct: "熊市仓位上限%", below200_cap_pct: "200日线下上限%", risk_event_cap_pct: "风险事件上限%",
     high_valuation_cap_sideways_pct: "高估值震荡上限%", high_valuation_cap_trend_pct: "高估值趋势上限%",
     extreme_valuation_cap_sideways_pct: "极端估值震荡上限%", extreme_valuation_cap_trend_pct: "极端估值趋势上限%",
@@ -828,7 +828,6 @@
     const speedFields = [
       {name: "global_buy_step_pct", label: "买入节奏%", default: 26, tip: "买入/加仓时的单次执行速度。"},
       {name: "global_sell_step_pct", label: "卖出节奏%", default: 48, tip: "减仓/止盈时的单次执行速度。"},
-      {name: "global_risk_multiplier", label: "风险倍率", default: 1.0, min: 0.1, max: 5, step: 0.05, tip: "风险预算倍率。"},
     ];
     for (const f of speedFields) {
       const label = document.createElement("label");
@@ -885,13 +884,13 @@
     const execHead = document.createElement("div");
     execHead.className = "family-param-group-title";
     appendTextEl(execHead, "strong", "", "均衡基准 · 执行层控制");
-    appendTextEl(execHead, "em", "", "控制单次买入/卖出/补仓的操作上限。");
+    appendTextEl(execHead, "em", "", "交易模式按策略本身执行；定投模式使用固定买入 + 策略偏移。");
     execBox.appendChild(execHead);
     const execGrid = document.createElement("div");
     execGrid.className = "global-field-row";
     const execFields = [
-      {name: "core_step_pct", label: "补仓上限%", default: 22, tip: "定投增强策略每个检查日最多补多少仓位。"},
-      {name: "buy_step_limit_pct", label: "买入上限%", default: 28, tip: "单次买入上限。"},
+      {name: "dca_base_buy_pct", label: "定投基准买入%", default: 25, tip: "定投模式每次先给出的固定买入比例；再叠加当前策略的买卖偏移。"},
+      {name: "buy_step_limit_pct", label: "买入上限%", default: 28, tip: "兼容趋势交易策略的单次买入参考。纯目标策略不会被它改写方向。"},
       {name: "sell_step_limit_pct", label: "卖出上限%", default: 45, tip: "基础单次卖出上限；严重破位时仍会按风险倍数放大。"},
     ];
     for (const f of execFields) {
@@ -909,30 +908,7 @@
     execBox.appendChild(execGrid);
     body.appendChild(execBox);
 
-    // ③ 基础仓位表
-    const entry = (params.strategy_mix || {}).balanced || defaultStyleEntry("balanced", "balanced", activeFamily);
-    const coreBase = entry.core_base_pct || defaultCoreBasePct("balanced", activeFamily);
-    const coreSection = document.createElement("details");
-    coreSection.className = "family-core-tune";
-    coreSection.open = true;
-    appendTextEl(coreSection, "summary", "", `基础目标仓位表（均衡基准）`);
-    appendTextEl(coreSection, "p", "family-param-help", "不同趋势状态下的基础目标仓位；后续再叠加估值、质量和风控修正。");
-    const coreGrid = document.createElement("div");
-    coreGrid.className = "family-core-grid";
-    for (const [state, stateName] of Object.entries(strategyMarketStates)) {
-      const label = document.createElement("label");
-      label.className = "mini-field";
-      label.dataset.tip = `${stateName}状态下，均衡基准的基础目标仓位。`;
-      appendTextEl(label, "span", "", `${stateName}%`);
-      const input = document.createElement("input");
-      input.type = "number"; input.step = "0.1"; input.min = "0"; input.max = "100";
-      input.value = numberOr(coreBase[state], 50);
-      input.dataset.globalCoreBase = state;
-      label.appendChild(input);
-      coreGrid.appendChild(label);
-    }
-    coreSection.appendChild(coreGrid);
-    body.appendChild(coreSection);
+    // ③ 基础目标仓位表已移除：策略仓位逻辑只在各自 Python 策略中声明。
 
     // ④ 进攻/防守偏离度（操作幅度 + 操作阈值）
     const renderDevGroup = (styleKey, label, tipSuffix) => {
@@ -1610,10 +1586,10 @@
     const summary = $("#strategy-summary");
     if (!summary || !configForm) return;
     const data = toConfigPayload();
-    const modeText = data.position_mode === "core_satellite" ? "定投增强策略（目标仓位动态计算）" : "纯交易仓";
+    const modeText = data.position_mode === "core_satellite" ? "定投增强策略（固定买入 + 策略偏移）" : "纯交易仓";
     const assetText = data.symbol ? `${data.symbol_name || data.symbol} · ${data.symbol} · ${marketNames[data.market] || data.market} · ${data.asset_kind}` : "未选择标的";
-    const stepText = `补仓上限 ${data.core_step_pct ?? 22}%`;
-    summary.innerHTML = `${strategyFamilyText(data.strategy_family)}<br>${strategySummaryText(data)}<br>仓位模式：${modeText}<br>标的：${assetText}<br>数据容错：代理 ${data.proxy_mode || "system"} / 超时 ${data.request_timeout_sec || 12} 秒 / 重试 ${data.retry_count || 0} 次<br>回测无风险收益率：${data.backtest_risk_free_rate_pct ?? 2}%<br>单次操作上限：${stepText}<br>计划资金=100%上限，不按标的类型封顶。`;
+    const dcaText = `定投基准买入 ${data.dca_base_buy_pct ?? 25}%`;
+    summary.innerHTML = `${strategyFamilyText(data.strategy_family)}<br>${strategySummaryText(data)}<br>仓位模式：${modeText}<br>标的：${assetText}<br>数据容错：代理 ${data.proxy_mode || "system"} / 超时 ${data.request_timeout_sec || 12} 秒 / 重试 ${data.retry_count || 0} 次<br>回测无风险收益率：${data.backtest_risk_free_rate_pct ?? 2}%<br>${dcaText}<br>计划资金=100%上限，不按标的类型封顶。`;
     updateStrategyLabState(data);
 
     const selected = $("#selected-asset");
@@ -1629,7 +1605,7 @@
     saveScrollState();
 
     try {
-      const payload = formToObject(signalForm);
+      const payload = Object.assign({}, formToObject(signalForm), toConfigPayload());
       const data = await postJSON("/api/decision", payload);
       renderDecision(data);
       restoreScrollState();

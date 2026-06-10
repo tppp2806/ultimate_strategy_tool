@@ -75,7 +75,8 @@ STRATEGY_MARKET_STATES: Dict[str, str] = {
 # 在 apply_active_family_params 中展平到 cfg 顶层供 advanced_pct / advanced_bool 读取。
 ADVANCED_PARAM_DEFAULTS: Dict[str, Any] = {
     "trade_step_limit_enabled": True,
-    "core_step_pct": 22.0,
+    "dca_base_buy_pct": 25.0,
+    "core_step_pct": 22.0,  # 兼容旧配置；前端不再展示。
     "buy_step_limit_pct": 28.0,
     "sell_step_limit_pct": 45.0,
     "core_min_position_pct": 5.0,
@@ -304,7 +305,7 @@ DEVIATION_AMPLITUDE_FIELDS = {"buy_step_pct", "sell_step_pct"}
 DEVIATION_THRESHOLD_FIELDS = {
     "core_min_position_pct", "core_max_position_pct",
     "strict_min_position_pct", "strict_max_position_pct",
-    "core_step_pct", "buy_step_limit_pct", "sell_step_limit_pct",
+    "dca_base_buy_pct", "core_step_pct", "buy_step_limit_pct", "sell_step_limit_pct",
     "bear_cap_pct", "below200_cap_pct", "risk_event_cap_pct",
     "high_valuation_cap_sideways_pct", "high_valuation_cap_trend_pct",
     "extreme_valuation_cap_sideways_pct", "extreme_valuation_cap_trend_pct",
@@ -332,7 +333,7 @@ def _deviation_group_for_field(name: str) -> Optional[str]:
         "cap" in low or "limit" in low or "threshold" in low or
         "above" in low or "below" in low or "stop" in low or
         "floor" in low or "min_" in low or "max_" in low or
-        "core_step" in low or "core_base" in low
+        "dca_base_buy" in low or "core_step" in low or "core_base" in low
     ):
         return "threshold"
     return "amplitude"
