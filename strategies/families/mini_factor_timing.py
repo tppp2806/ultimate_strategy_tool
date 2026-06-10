@@ -13,6 +13,7 @@ from ..base import (
 from ..factors import build_mini_factor_result
 
 FAMILY_KEY = "mini_factor_timing"
+SIGNAL_DRIVEN = False
 FAMILY_META: Dict[str, Any] = {
     "order": 30,
     "name": "小因子择时策略",

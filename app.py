@@ -1344,7 +1344,13 @@ def raw_target_by_signal(cfg: Dict[str, Any], signals: Dict[str, Any], cur: floa
     family_key = active_strategy_family_key(cfg)
     signal_driven = is_signal_driven_family(cfg)
     # 定投增强策略永远使用总体策略目标模型；非信号驱动类总体策略在纯交易仓模式下也必须使用自己的目标模型。
-    use_target_model = is_core_mode or not signal_driven
+    # strategy_isolation_v3_model_branch
+    # 非信号驱动总体策略，例如 simple_ma / mini_factor_timing，
+    # 在纯交易仓下也必须使用自己的 target_weight()，不能回落到趋势信号硬规则。
+    use_target_model = is_core_mode or (not signal_driven)
+    if use_target_model:
+        signals["core_target_model"] = True
+        signals["strategy_model_driven"] = not signal_driven
 
     # 先生成"总体策略目标仓位"，再由执行层决定是否交易。
     core_target = floor
@@ -1938,6 +1944,17 @@ def decision_to_payload(cfg: Dict[str, Any], result: Decision) -> Dict[str, Any]
         {"label": "仓位模式", "value": "定投增强策略" if cfg.get("position_mode") == "core_satellite" else "纯交易仓", "wide": True},
         {"label": "命中规则", "value": result.matched_rule, "wide": True},
     ]
+
+    # strategy_isolation_v3_metrics_filter
+    # 模型型总体策略不显示趋势信号风控策略专属指标。
+    family_key_for_metrics = str(cfg.get("strategy_family") or "")
+    if family_key_for_metrics in {"simple_ma", "mini_factor_timing"}:
+        trend_only_metric_labels = {
+            "预期赔率", "操作频率", "止损距离", "风险仓位上限",
+            "本次买入上限", "本次卖出上限", "估值修正", "ROE修正", "系统防守仓位",
+        }
+        metrics = [item for item in metrics if item.get("label") not in trend_only_metric_labels]
+
 
     return {
         "action": result.action,
