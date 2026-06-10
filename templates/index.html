@@ -899,17 +899,10 @@ input[type="range"]::-moz-range-thumb {
     const visibleItems = $$(`#signal-form [name="${cssEscape(key)}"]`).filter(el => el.dataset.autoHidden !== "1");
     if (visibleItems.length) {
       const first = visibleItems[0];
-      const isStrategyChoice = !!first.closest("#strategy-specific-inputs");
-      if ((first.type === "radio" || first.type === "checkbox") && isStrategyChoice) {
-        // 自动数据不点亮策略选项；用户没点时使用隐藏字段，用户点了则以可视选项优先。
-        const ext = ensureAutoHiddenInput(key);
-        if (ext && (overwriteUser || !ext.value)) {
-          ext.value = targetValue;
-          ext.dispatchEvent(new Event("input", {bubbles: true}));
-          ext.dispatchEvent(new Event("change", {bubbles: true}));
-        }
-        return;
-      }
+      // 只要同名可视策略控件存在，就绝不能再用隐藏 input 覆盖它。
+      // 自动拉取到的 ma_position 等策略字段应直接点亮当前选项，保证“看到的选择”和后端计算一致。
+      const oldHidden = $(`#signal-form input[type="hidden"][data-auto-hidden="1"][name="${cssEscape(key)}"]`);
+      if (oldHidden) oldHidden.remove();
       if (first.type === "radio") {
         let changed = false;
         visibleItems.forEach(el => {
@@ -1194,15 +1187,13 @@ input[type="range"]::-moz-range-thumb {
         const explicit = preserved[name];
         const hasExplicit = hasExplicitValue(explicit);
         const autoValue = lastIndicators && Object.prototype.hasOwnProperty.call(lastIndicators, name) ? lastIndicators[name] : undefined;
-        const value = hasExplicit ? explicit : (!isBlank(autoValue) ? autoValue : field.default);
-        if (!hasExplicit && isBlank(value)) continue;
+        const hasAuto = !isBlank(autoValue);
+        // 初始不默认选中；只有用户手动选择或自动拉取到了真实策略字段时才点亮。
+        const value = hasExplicit ? explicit : (hasAuto ? autoValue : undefined);
+        if (!hasExplicit && !hasAuto) continue;
         const items = $$(`#signal-form [name="${cssEscape(name)}"]`).filter(el => el.dataset.autoHidden !== "1");
         if (!items.length) continue;
         if (items[0].type === "radio") {
-          if (!hasExplicit) {
-            // 保持策略信号初始未选择；自动/默认值只通过隐藏字段参与计算，不点亮可视选项。
-            continue;
-          }
           items.forEach(el => {
             const shouldCheck = String(el.value) === String(value);
             if (el.checked !== shouldCheck) changed = true;
@@ -1211,7 +1202,6 @@ input[type="range"]::-moz-range-thumb {
           continue;
         }
         if (items[0].type === "checkbox") {
-          if (!hasExplicit) continue;
           const values = new Set((Array.isArray(value) ? value : [value]).map(item => String(item)));
           items.forEach(el => {
             const shouldCheck = values.has(String(el.value));

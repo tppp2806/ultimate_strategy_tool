@@ -617,8 +617,16 @@
   function formToObject(form) {
     const data = {};
     const elements = Array.from(form.elements).filter(el => el.name && !el.disabled);
+    // 自动数据弹窗会为“没有可视控件”的字段创建隐藏 input。
+    // 如果同名可视策略控件已经存在，隐藏 input 不能覆盖用户点击结果。
+    const visibleNames = new Set(
+      elements
+        .filter(el => el.dataset?.autoHidden !== "1")
+        .map(el => el.name)
+    );
 
     for (const el of elements) {
+      if (el.dataset?.autoHidden === "1" && visibleNames.has(el.name)) continue;
       if (el.type === "checkbox") {
         if (isChoiceCheckbox(el)) {
           if (el.checked) data[el.name] = el.value;
@@ -1372,14 +1380,17 @@
 
   function setChoice(name, value) {
     if (!signalForm) return;
-    const fields = $$(`input[type="checkbox"][name="${CSS.escape(name)}"]`, signalForm);
+    const fields = $$(
+      `input[type="checkbox"][name="${CSS.escape(name)}"], input[type="radio"][name="${CSS.escape(name)}"]`,
+      signalForm
+    ).filter(el => el.dataset?.autoHidden !== "1");
     if (value === "__clear__") {
       fields.forEach(el => { el.checked = false; });
       return;
     }
     const normalized = value || "none";
     fields.forEach(el => {
-      el.checked = el.value === normalized;
+      el.checked = String(el.value) === String(normalized);
     });
   }
 
@@ -1414,7 +1425,11 @@
 
   function markChoiceAuto(name, value) {
     if (!signalForm || !value) return;
-    const input = signalForm.querySelector(`input[type="checkbox"][name="${CSS.escape(name)}"][value="${CSS.escape(value)}"]`);
+    const safeName = CSS.escape(name);
+    const safeValue = CSS.escape(value);
+    const input = signalForm.querySelector(
+      `input[type="checkbox"][name="${safeName}"][value="${safeValue}"], input[type="radio"][name="${safeName}"][value="${safeValue}"]`
+    );
     if (input && input.checked) fieldLabel(input)?.classList.add("is-auto-filled");
   }
 
@@ -1443,6 +1458,7 @@
     setChoice("exit_state", "none");
     setChoice("profit_state", "none");
     setChoice("volume_state", "none");
+    setChoice("ma_position", "__clear__");
 
     VOLUME_SIGNAL_NAMES.forEach(name => setCheck(name, false));
 
