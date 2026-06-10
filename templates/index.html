@@ -97,6 +97,7 @@
                 <span>数据源顺序</span>
                 <select name="data_source">
                   <option value="auto" {% if cfg.data_source == 'auto' %}selected{% endif %}>自动多链路</option>
+                  <option value="danjuan_only" {% if cfg.data_source == 'danjuan_only' %}selected{% endif %}>只使用蛋卷</option>
                   <option value="akshare" {% if cfg.data_source == 'akshare' %}selected{% endif %}>优先 AKShare</option>
                   <option value="yfinance" {% if cfg.data_source == 'yfinance' %}selected{% endif %}>优先 yfinance / Yahoo</option>
                   <option value="stooq" {% if cfg.data_source == 'stooq' %}selected{% endif %}>Stooq 兜底</option>
@@ -180,20 +181,16 @@
           <input type="number" step="0.01" min="0" name="plan_amount" value="{{ cfg.plan_amount }}">
         </label>
 
-        <label class="field" data-hide-in-backtest data-tip="当前实际持仓市值或投入金额，用来计算当前仓位和本次买卖金额。">
-          <span>当前持仓</span>
+        <label class="field" data-hide-in-backtest data-tip="填写账户里当前持仓的市值，不是成本。系统会结合右侧持仓盈亏率反推已投入本金：已投入本金=当前持仓市值/(1+盈亏率)。">
+          <span>当前持仓市值</span>
           <input type="number" step="0.01" min="0" name="current_position_amount" value="{{ cfg.current_position_amount }}">
         </label>
 
-        <label class="field" data-hide-in-backtest data-tip="可选。填写你当前持仓相对成本的涨跌幅/盈亏率，例如盈利12%填12，亏损5%填-5。系统会用 当前涨跌幅 ÷ 止损距离 自动判断盈利≥1R/2R/3R。">
+        <label class="field" data-hide-in-backtest data-tip="可选。填写你当前持仓相对成本的涨跌幅/盈亏率，例如盈利100%填100，亏损5%填-5。系统会用它反推已投入本金和剩余计划资金；同时用于止损/盈利阶段判断。">
           <span>当前涨跌幅 / 持仓盈亏 %</span>
           <input type="number" step="0.01" name="current_profit_pct" value="{{ cfg.current_profit_pct }}" placeholder="可空，亏损可填负数">
         </label>
 
-        <label class="field" data-tip="单笔交易最多允许亏掉总计划资金的多少。你可以自行调高；系统不再按标的类型封顶。">
-          <span>单笔风险预算 %</span>
-          <input type="number" step="0.1" min="0.1" max="100" name="risk_per_trade_pct" value="{{ cfg.risk_per_trade_pct }}">
-        </label>
 
         <div class="position-tile" data-hide-in-backtest>
           <span>当前仓位</span>
@@ -270,7 +267,7 @@
       </div>
 
       <div class="strategy-summary backtest-current-source">
-        回测会直接使用左侧【标的与资金】和顶部【设置】里的配置：当前标的、计划资金、仓位模式、策略档位、单笔风险预算、数据源、代理、超时和重试都不再重复填写。
+        回测会直接使用左侧【标的与资金】、当前总体策略参数和顶部【设置】里的配置：当前标的、计划资金、仓位模式、策略档位、数据源、代理、超时和重试都不再重复填写。
       </div>
 
       <form id="backtest-form" class="backtest-form">
@@ -761,7 +758,7 @@ input[type="range"]::-moz-range-thumb {
     ["波动 / 回撤", "volatility_60d", "60日波动 %", "近60日波动。"],
     ["波动 / 回撤", "drawdown_252d", "252日回撤 %", "相对近252日高点的当前回撤。"],
     ["量能 / 交易", "volume_ratio_20d", "20日量比", "场外基金通常缺真实成交量，可能为空或仅作场内ETF参考。"],
-    ["持仓 / 执行", "current_position_pct", "当前仓位 %", "由当前持仓 / 计划资金计算。"],
+    ["持仓 / 执行", "current_position_pct", "当前仓位 %", "由当前持仓市值和持仓盈亏率反推已投入本金后计算。"],
     ["持仓 / 执行", "current_profit_pct", "当前盈亏 %", "来自你的手动输入或配置。"],
     ["数据源", "source_used", "实际数据源", "本次成功返回的数据源。"],
     ["数据源", "proxy_mode", "代理模式", "本次请求使用的代理配置。"]

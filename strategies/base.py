@@ -6,14 +6,12 @@ from typing import Any, Dict, List, Optional, Tuple
 # 参数风格注册区
 # -----------------------------------------------------------------------------
 # 这里不是“总体策略”，而是同一个总体策略里的执行性格/风险风格。
-# 例如：防守、均衡、进攻。它们只控制目标仓位表、买卖速度、风险倍率。
+# 例如：防守、均衡、进攻。它们只控制策略参数、仓位边界与执行上限。
 # 真正的总体策略在 STRATEGY_FAMILIES 里注册。
 
 STYLE_PRESETS: Dict[str, Dict[str, Any]] = {
     "balanced": {
         "name": "均衡",
-        "buy_step": 0.28,
-        "sell_step": 0.45,
         "risk_multiplier": 1.00,
         "desc": "默认档；趋势、止损、仓位三者平衡。",
         "research_note": "核心目标：在长期持有和趋势风控之间折中。",
@@ -27,8 +25,6 @@ STYLE_PRESETS: Dict[str, Dict[str, Any]] = {
     },
     "defensive": {
         "name": "防守",
-        "buy_step": 0.18,
-        "sell_step": 0.55,
         "risk_multiplier": 0.75,
         "desc": "买入更慢，卖出更快；适合不想承受大回撤。",
         "research_note": "核心目标：降低回撤与误买；代价是可能长期低仓。",
@@ -42,8 +38,6 @@ STYLE_PRESETS: Dict[str, Dict[str, Any]] = {
     },
     "aggressive": {
         "name": "进攻",
-        "buy_step": 0.38,
-        "sell_step": 0.35,
         "risk_multiplier": 1.25,
         "desc": "盈利后加仓更快，但破位清仓不打折。",
         "research_note": "核心目标：尽快吃到趋势；代价是震荡区更容易回撤。",
@@ -193,8 +187,9 @@ def _family_style_preset(cfg: Optional[Dict[str, Any]], key: str) -> Dict[str, A
     global_preset = STRATEGY_PRESETS[key]
     for info_key in ("name", "desc", "research_note"):
         preset.setdefault(info_key, global_preset.get(info_key))
-    preset.setdefault("buy_step", global_preset.get("buy_step", 0.28))
-    preset.setdefault("sell_step", global_preset.get("sell_step", 0.45))
+    # 兼容旧执行函数：内部 buy_step/sell_step 等同于执行层买/卖上限，不再作为单独 UI 参数。
+    preset.setdefault("buy_step", _as_float(preset.get("buy_step_limit_pct"), _as_float(global_preset.get("buy_step_limit_pct"), 28.0)) / 100.0)
+    preset.setdefault("sell_step", _as_float(preset.get("sell_step_limit_pct"), _as_float(global_preset.get("sell_step_limit_pct"), 45.0)) / 100.0)
     preset.setdefault("risk_multiplier", global_preset.get("risk_multiplier", 1.0))
     preset.setdefault("core_base", global_preset.get("core_base", STRATEGY_PRESETS["balanced"]["core_base"]))
     return preset
@@ -205,9 +200,9 @@ def _field_default_value(field: Dict[str, Any], preset: Dict[str, Any], fallback
     if name in preset:
         return preset.get(name)
     if name == "buy_step_pct":
-        return float(preset.get("buy_step", 0.28)) * 100.0
+        return _as_float(preset.get("buy_step_limit_pct"), float(preset.get("buy_step", 0.28)) * 100.0)
     if name == "sell_step_pct":
-        return float(preset.get("sell_step", 0.45)) * 100.0
+        return _as_float(preset.get("sell_step_limit_pct"), float(preset.get("sell_step", 0.45)) * 100.0)
     if name == "risk_multiplier":
         return preset.get("risk_multiplier", 1.0)
     return field.get("default", fallback)
@@ -301,11 +296,12 @@ def normalise_strategy_lab_config(cfg: Dict[str, Any]) -> None:
 
 # 偏离参数只是一层“均衡基准 -> 当前风格展示/运行值”的计算。
 # 保存层只保留 balanced 基准；defensive/aggressive 由 deviation 临时计算。
-DEVIATION_AMPLITUDE_FIELDS = {"buy_step_pct", "sell_step_pct"}
+DEVIATION_AMPLITUDE_FIELDS = set()
 DEVIATION_THRESHOLD_FIELDS = {
     "core_min_position_pct", "core_max_position_pct",
     "strict_min_position_pct", "strict_max_position_pct",
-    "dca_base_buy_pct", "core_step_pct", "buy_step_limit_pct", "sell_step_limit_pct",
+    "dca_base_buy_pct", "buy_step_limit_pct", "sell_step_limit_pct",
+    "risk_per_trade_pct",
     "bear_cap_pct", "below200_cap_pct", "risk_event_cap_pct",
     "high_valuation_cap_sideways_pct", "high_valuation_cap_trend_pct",
     "extreme_valuation_cap_sideways_pct", "extreme_valuation_cap_trend_pct",
@@ -318,6 +314,7 @@ def _deviation_group_for_field(name: str) -> Optional[str]:
     - 幅度组：信号强度、因子权重、手动修正强度等。
     - 阈值组：仓位上限、买卖上限、均线阈值、仓位边界等。
     - 非百分数字段（如 risk_multiplier、checkbox、select）不套 0~100 偏离公式。
+    - risk_per_trade_pct 属于趋势策略自己的风险阈值，不再作为全局左侧配置。
     """
     key = str(name or "")
     low = key.lower()
@@ -379,12 +376,6 @@ def _effective_entry_for_style(key: str, mix: Dict[str, Any], cfg: Optional[Dict
     amp_dev, thr_dev = _style_deviation(cfg, key)
     effective = dict(raw_entry)
 
-    # 操作幅度：优先使用全局均衡基准；缺失再回退到均衡 entry / 均衡 preset。
-    balanced_preset = _family_style_preset(cfg, "balanced")
-    base_buy = _as_float((cfg or {}).get("global_buy_step_pct"), _as_float(balanced.get("buy_step_pct"), float(balanced_preset.get("buy_step", 0.26)) * 100.0))
-    base_sell = _as_float((cfg or {}).get("global_sell_step_pct"), _as_float(balanced.get("sell_step_pct"), float(balanced_preset.get("sell_step", 0.48)) * 100.0))
-    effective["buy_step_pct"] = _apply_deviation_pct(base_buy, amp_dev, key)
-    effective["sell_step_pct"] = _apply_deviation_pct(base_sell, amp_dev, key)
     effective["risk_multiplier"] = clamp(_as_float((cfg or {}).get("global_risk_multiplier"), _as_float(balanced.get("risk_multiplier"), 1.0)), 0.1, 5.0)
 
     # 策略 Python schema 中声明的参数：以均衡为源；阈值类再叠加 threshold deviation。
@@ -412,8 +403,8 @@ def _effective_entry_for_style(key: str, mix: Dict[str, Any], cfg: Optional[Dict
 def _entry_to_strategy(key: str, entry: Dict[str, Any], cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     preset = _family_style_preset(cfg, key)
     preset["key"] = key
-    preset["buy_step"] = float(entry.get("buy_step_pct", float(preset.get("buy_step", 0.28)) * 100.0)) / 100.0
-    preset["sell_step"] = float(entry.get("sell_step_pct", float(preset.get("sell_step", 0.45)) * 100.0)) / 100.0
+    preset["buy_step"] = _as_float(entry.get("buy_step_limit_pct", (cfg or {}).get("buy_step_limit_pct")), 28.0) / 100.0
+    preset["sell_step"] = _as_float(entry.get("sell_step_limit_pct", (cfg or {}).get("sell_step_limit_pct")), 45.0) / 100.0
     preset["risk_multiplier"] = clamp(_as_float(entry.get("risk_multiplier"), preset.get("risk_multiplier", 1.0)), 0.1, 5.0)
     preset["core_base"] = {state: float(entry.get("core_base_pct", {}).get(state, 0.0)) / 100.0 for state in STRATEGY_MARKET_STATES}
 

@@ -51,8 +51,6 @@
   }
 
   const globalConfigState = {
-    global_buy_step_pct: numberOr(initialConfig.global_buy_step_pct, 26),
-    global_sell_step_pct: numberOr(initialConfig.global_sell_step_pct, 48),
     global_risk_multiplier: numberOr(initialConfig.global_risk_multiplier, 1.0), // 兼容旧配置；前端不再展示
     dca_base_buy_pct: numberOr(initialConfig.dca_base_buy_pct, 25),
     core_step_pct: numberOr(initialConfig.core_step_pct, 22), // 兼容旧配置；前端不再展示
@@ -83,16 +81,9 @@
   }
 
   function fallbackStyleParamSchema() {
-    return [
-      {
-        title: "执行速度",
-        desc: "兼容旧策略文件的默认参数。新策略应在 Python 中声明 STYLE_PARAM_SCHEMA。",
-        fields: [
-          {name: "buy_step_pct", label: "买入节奏%", type: "number", default: 28, min: 0, max: 100, step: 0.1, tip: "买入/加仓时的单次执行速度。"},
-          {name: "sell_step_pct", label: "卖出节奏%", type: "number", default: 45, min: 0, max: 100, step: 0.1, tip: "减仓/止盈时的单次执行速度。"}
-        ]
-      }
-    ];
+    // 没有声明策略参数的旧策略不再自动补出旧版节奏字段。
+    // 执行层只保留全局“买入上限/卖出上限”。
+    return [];
   }
 
   function styleParamSchema(familyKey) {
@@ -143,8 +134,8 @@
   function fieldDefaultValue(field, preset, fallback = 0) {
     const name = field?.name || "";
     if (Object.prototype.hasOwnProperty.call(preset, name)) return preset[name];
-    if (name === "buy_step_pct") return numberOr(preset.buy_step, 0.28) * 100;
-    if (name === "sell_step_pct") return numberOr(preset.sell_step, 0.45) * 100;
+    if (name === "buy_step_pct") return numberOr(preset.buy_step_limit_pct, numberOr(preset.buy_step, 0.28) * 100);
+    if (name === "sell_step_pct") return numberOr(preset.sell_step_limit_pct, numberOr(preset.sell_step, 0.45) * 100);
     if (name === "risk_multiplier") return numberOr(preset.risk_multiplier, 1);
     return field?.default ?? fallback;
   }
@@ -309,13 +300,13 @@
     return Number.isFinite(num) ? num : fallback;
   }
 
-  // 操作幅度字段（执行速度组）
-  const AMPLITUDE_FIELDS = ["buy_step_pct", "sell_step_pct"];
+  // 信号强度字段（不再包含旧版节奏字段；买卖只由“买入上限/卖出上限”控制）
+  const AMPLITUDE_FIELDS = [];
   // 操作阈值字段（仓位边界 + 执行层控制 + 仓位上限）
   const THRESHOLD_FIELDS = [
     "core_min_position_pct", "core_max_position_pct",
     "strict_min_position_pct", "strict_max_position_pct",
-    "dca_base_buy_pct", "core_step_pct", "buy_step_limit_pct", "sell_step_limit_pct",
+    "dca_base_buy_pct", "buy_step_limit_pct", "sell_step_limit_pct",
     "bear_cap_pct", "below200_cap_pct", "risk_event_cap_pct",
     "high_valuation_cap_sideways_pct", "high_valuation_cap_trend_pct",
     "extreme_valuation_cap_sideways_pct", "extreme_valuation_cap_trend_pct",
@@ -361,8 +352,8 @@
   }
 
   // 偏离展示/执行的基准：始终只以【均衡基准】为源；配置保存时只保存 balanced + deviation。
-  const GLOBAL_STYLE_DEFAULTS = {global_buy_step_pct: 26, global_sell_step_pct: 48, global_risk_multiplier: 1.0};
-  const GLOBAL_EXECUTION_DEFAULTS = {dca_base_buy_pct: 25, core_step_pct: 22, buy_step_limit_pct: 28, sell_step_limit_pct: 45};
+  const GLOBAL_STYLE_DEFAULTS = {global_risk_multiplier: 1.0};
+  const GLOBAL_EXECUTION_DEFAULTS = {dca_base_buy_pct: 25, buy_step_limit_pct: 28, sell_step_limit_pct: 45};
   const GLOBAL_POSITION_DEFAULTS = {core_min_position_pct: 5, core_max_position_pct: 92, strict_min_position_pct: 0, strict_max_position_pct: 60};
 
   function readGlobalField(name, fallback) {
@@ -372,16 +363,9 @@
   }
 
   function getGlobalStyleBase() {
-    const buy = readGlobalField("global_buy_step_pct", GLOBAL_STYLE_DEFAULTS.global_buy_step_pct);
-    const sell = readGlobalField("global_sell_step_pct", GLOBAL_STYLE_DEFAULTS.global_sell_step_pct);
     const risk = readGlobalField("global_risk_multiplier", GLOBAL_STYLE_DEFAULTS.global_risk_multiplier);
     return {
-      global_buy_step_pct: buy,
-      global_sell_step_pct: sell,
       global_risk_multiplier: risk,
-      // 供偏离预览统一使用：操作幅度字段仍沿用 buy_step_pct / sell_step_pct。
-      buy_step_pct: buy,
-      sell_step_pct: sell,
       risk_multiplier: risk,
     };
   }
@@ -613,7 +597,7 @@
 
   const ADVANCED_CONFIG_KEYS = [
     "trade_step_limit_enabled",
-    "dca_base_buy_pct", "core_step_pct", "buy_step_limit_pct", "sell_step_limit_pct",
+    "dca_base_buy_pct", "buy_step_limit_pct", "sell_step_limit_pct",
     "core_min_position_pct", "core_max_position_pct",
     "strict_min_position_pct", "strict_max_position_pct",
   ];
@@ -713,7 +697,6 @@
       plan_amount: Number(data.plan_amount || 0),
       current_position_amount: Number(data.current_position_amount || 0),
       current_profit_pct: Number(data.current_profit_pct || 0),
-      risk_per_trade_pct: Number(data.risk_per_trade_pct || 1),
       backtest_risk_free_rate_pct: riskFreeRaw === undefined || riskFreeRaw === "" ? 2 : Number(riskFreeRaw),
       strategy_family: activeFamily,
       strategy: data.strategy,
@@ -735,12 +718,9 @@
     };
     // 只保存均衡基准；防守/进攻的有效值由 deviation 临时计算。
     const gStyle = getGlobalStyleBase();
-    payload.global_buy_step_pct = gStyle.global_buy_step_pct;
-    payload.global_sell_step_pct = gStyle.global_sell_step_pct;
     payload.global_risk_multiplier = gStyle.global_risk_multiplier;
     const gExec = getGlobalExecutionBase();
     payload.dca_base_buy_pct = gExec.dca_base_buy_pct;
-    payload.core_step_pct = gExec.core_step_pct;
     payload.buy_step_limit_pct = gExec.buy_step_limit_pct;
     payload.sell_step_limit_pct = gExec.sell_step_limit_pct;
     const gPos = getGlobalPositionBase();
@@ -791,16 +771,15 @@
 
   // 全局配置字段显示名
   const ALL_FIELD_LABELS = {
-    buy_step_pct: "买入节奏%", sell_step_pct: "卖出节奏%",
     core_min_position_pct: "增强最低仓位%", core_max_position_pct: "增强最高仓位%",
     strict_min_position_pct: "交易最低仓位%", strict_max_position_pct: "交易最高仓位%",
-    dca_base_buy_pct: "定投基准买入%", core_step_pct: "补仓上限%", buy_step_limit_pct: "买入上限%", sell_step_limit_pct: "卖出上限%",
+    dca_base_buy_pct: "定投基准买入%", buy_step_limit_pct: "买入上限%", sell_step_limit_pct: "卖出上限%",
     bear_cap_pct: "熊市仓位上限%", below200_cap_pct: "200日线下上限%", risk_event_cap_pct: "风险事件上限%",
     high_valuation_cap_sideways_pct: "高估值震荡上限%", high_valuation_cap_trend_pct: "高估值趋势上限%",
     extreme_valuation_cap_sideways_pct: "极端估值震荡上限%", extreme_valuation_cap_trend_pct: "极端估值趋势上限%",
   };
 
-  // 全局配置弹窗：合并执行速度 + 仓位边界 + 基础仓位表 + 偏离度
+  // 全局配置弹窗：仓位边界 + 执行层控制 + 偏离度
   function openGlobalConfigModal() {
     const modal = $("#global-config-modal");
     const title = $("#global-config-title");
@@ -809,45 +788,13 @@
     if (!modal || !body) return;
     body.innerHTML = "";
     if (title) title.textContent = "全局配置";
-    if (subtitle) subtitle.textContent = "所有策略共享的执行速度、仓位边界与偏离度。";
+    if (subtitle) subtitle.textContent = "所有策略共享的仓位边界、执行层控制与偏离度。";
 
     const activeFamily = activeFamilyKeyFromForm();
     const activeStyle = activeStyleKeyFromForm();
     const params = getFamilyParams(activeFamily);
 
-    // ① 均衡基准 — 执行速度
-    const speedBox = document.createElement("div");
-    speedBox.className = "family-param-subgroup";
-    const speedHead = document.createElement("div");
-    speedHead.className = "family-param-group-title";
-    appendTextEl(speedHead, "strong", "", "均衡基准 · 执行速度");
-    appendTextEl(speedHead, "em", "", "防守/进攻都从这个均衡基准 + 偏离值计算，不单独保存。");
-    speedBox.appendChild(speedHead);
-    const speedGrid = document.createElement("div");
-    speedGrid.className = "global-field-row";
-    const speedFields = [
-      {name: "global_buy_step_pct", label: "买入节奏%", default: 26, tip: "买入/加仓时的单次执行速度。"},
-      {name: "global_sell_step_pct", label: "卖出节奏%", default: 48, tip: "减仓/止盈时的单次执行速度。"},
-    ];
-    for (const f of speedFields) {
-      const label = document.createElement("label");
-      label.className = "mini-field";
-      if (f.tip) label.dataset.tip = f.tip;
-      appendTextEl(label, "span", "", f.label);
-      const input = document.createElement("input");
-      input.type = "number";
-      input.step = String(f.step ?? 0.1);
-      input.min = String(f.min ?? 0);
-      input.max = String(f.max ?? 100);
-      input.value = numberOr(globalConfigState[f.name], f.default);
-      input.dataset.globalField = f.name;
-      label.appendChild(input);
-      speedGrid.appendChild(label);
-    }
-    speedBox.appendChild(speedGrid);
-    body.appendChild(speedBox);
-
-    // ② 均衡基准 — 仓位边界
+    // ① 均衡基准 — 仓位边界
     const boundBox = document.createElement("div");
     boundBox.className = "family-param-subgroup";
     const boundHead = document.createElement("div");
@@ -878,7 +825,7 @@
     boundBox.appendChild(boundGrid);
     body.appendChild(boundBox);
 
-    // ②b 均衡基准 — 执行层控制
+    // ② 均衡基准 — 执行层控制
     const execBox = document.createElement("div");
     execBox.className = "family-param-subgroup";
     const execHead = document.createElement("div");
@@ -908,9 +855,7 @@
     execBox.appendChild(execGrid);
     body.appendChild(execBox);
 
-    // ③ 基础目标仓位表已移除：策略仓位逻辑只在各自 Python 策略中声明。
-
-    // ④ 进攻/防守偏离度（操作幅度 + 操作阈值）
+    // ③ 进攻/防守偏离度（信号强度 + 操作阈值）
     const renderDevGroup = (styleKey, label, tipSuffix) => {
       const devs = getDeviations(styleKey);
       const isAgg = styleKey === "aggressive";
@@ -923,17 +868,17 @@
       appendTextEl(head, "em", "", tipSuffix);
       box.appendChild(head);
 
-      // 两个滑块：操作幅度偏离 + 操作阈值偏离
+      // 两个滑块：信号强度偏离 + 操作阈值偏离
       const g = document.createElement("div");
       g.className = "family-param-grid multiplier-grid";
 
-      // 操作幅度滑块
+      // 信号强度滑块
       const ampLbl = document.createElement("label");
       ampLbl.className = "mini-field multiplier-field";
       ampLbl.dataset.tip = isAgg
-        ? "向右拖 = 买入更快、卖出更慢。0%=与均衡基准一致。"
-        : "向右拖 = 买入更慢、卖出更快。0%=与均衡基准一致。";
-      appendTextEl(ampLbl, "span", "", "操作幅度偏离");
+        ? "向右拖 = 策略自有的信号强度/因子权重更偏进攻。0%=与均衡基准一致。"
+        : "向右拖 = 策略自有的信号强度/因子权重更偏防守。0%=与均衡基准一致。";
+      appendTextEl(ampLbl, "span", "", "信号强度偏离");
       const ampInput = document.createElement("input");
       ampInput.type = "range"; ampInput.min = "0"; ampInput.max = "100"; ampInput.step = "1";
       ampInput.value = String(devs.amplitude);
@@ -971,8 +916,8 @@
       return box;
     };
 
-    body.appendChild(renderDevGroup("defensive", "防守偏离", "向0%方向压，买入更慢卖出更快；阈值更严格。"));
-    body.appendChild(renderDevGroup("aggressive", "进攻偏离", "向100%方向推，买入更快卖出更慢；阈值更宽松。"));
+    body.appendChild(renderDevGroup("defensive", "防守偏离", "信号强度向0%方向压；阈值更严格。"));
+    body.appendChild(renderDevGroup("aggressive", "进攻偏离", "信号强度向100%方向推；阈值更宽松。"));
 
     modal.hidden = false;
     modal.setAttribute("aria-hidden", "false");
@@ -1065,13 +1010,13 @@
     }
     host.appendChild(grid);
 
-    // 全局执行速度按钮
+    // 全局配置按钮
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "inline-config-btn";
     btn.dataset.openGlobalConfig = "style";
-    btn.setAttribute("aria-label", "编辑执行速度");
-    btn.textContent = "执行速度";
+    btn.setAttribute("aria-label", "编辑全局配置");
+    btn.textContent = "全局配置";
     host.appendChild(btn);
   }
 
@@ -1222,32 +1167,7 @@
         if (!group || typeof group !== "object") continue;
 
         if (group.type === "core_base_table") {
-          const details = document.createElement("details");
-          details.className = "family-core-tune";
-          appendTextEl(details, "summary", "", group.title || "目标仓位表");
-          if (group.desc) appendTextEl(details, "p", "family-param-help", group.desc);
-          const coreGrid = document.createElement("div");
-          coreGrid.className = "family-core-grid";
-          for (const [state, stateName] of Object.entries(strategyMarketStates)) {
-            const label = document.createElement("label");
-            label.className = "mini-field";
-            label.dataset.tip = `${stateName}状态下，该参数风格的基础目标仓位。`;
-            appendTextEl(label, "span", "", `${stateName}%`);
-            const input = document.createElement("input");
-            input.type = "number";
-            input.step = "0.1";
-            input.min = "0";
-            input.max = "100";
-            input.value = entry.core_base_pct?.[state] ?? defaultCoreBasePct(styleKey, familyKey)[state];
-            input.dataset.familyParam = familyKey;
-            input.dataset.styleKey = styleKey;
-            input.dataset.field = "core_base_pct";
-            input.dataset.state = state;
-            label.appendChild(input);
-            coreGrid.appendChild(label);
-          }
-          details.appendChild(coreGrid);
-          section.appendChild(details);
+          // 仓位表 UI 已移除；策略仓位逻辑只保留在各自 Python 策略中。
           continue;
         }
 
@@ -1582,6 +1502,17 @@
   }
 
 
+  function dataSourceText(value) {
+    const key = String(value || "auto");
+    return {
+      auto: "自动多链路",
+      danjuan_only: "只使用蛋卷",
+      akshare: "AKShare",
+      yfinance: "yfinance/Yahoo",
+      stooq: "Stooq"
+    }[key] || key;
+  }
+
   function updateStrategySummary() {
     const summary = $("#strategy-summary");
     if (!summary || !configForm) return;
@@ -1595,7 +1526,7 @@
     const selected = $("#selected-asset");
     if (selected) {
       selected.querySelector("strong").textContent = data.symbol ? `${data.symbol_name || data.symbol} · ${data.symbol}` : "未选择";
-      selected.querySelector("em").textContent = `${data.market || "auto"} / ${data.asset_kind || "auto"} / ${data.data_source || "auto"}`;
+      selected.querySelector("em").textContent = `${data.market || "auto"} / ${data.asset_kind || "auto"} / ${dataSourceText(data.data_source)}`;
     }
   }
 
@@ -1658,7 +1589,7 @@
       btn.innerHTML = `<strong></strong><span></span><em></em>`;
       btn.querySelector("strong").textContent = item.symbol;
       btn.querySelector("span").textContent = item.name || item.symbol;
-      btn.querySelector("em").textContent = `${item.market || "auto"} / ${item.asset_kind || "auto"} / ${item.source || "auto"}`;
+      btn.querySelector("em").textContent = `${item.market || "auto"} / ${item.asset_kind || "auto"} / ${dataSourceText(item.source || item.data_source || "auto")}`;
       btn.addEventListener("click", async () => {
         chooseAsset(item);
         clearSearchResults();
@@ -1673,12 +1604,13 @@
 
   function chooseAsset(item) {
     if (!configForm) return;
+    const currentDataSource = configForm.querySelector('[name="data_source"]')?.value || "auto";
     const mapping = {
       symbol: item.symbol || "",
       symbol_name: item.name || item.symbol || "",
       market: item.market || "auto",
       asset_kind: item.asset_kind || "auto",
-      data_source: item.source || item.data_source || "auto"
+      data_source: currentDataSource === "danjuan_only" ? "danjuan_only" : (item.source || item.data_source || "auto")
     };
     for (const [name, value] of Object.entries(mapping)) {
       const el = configForm.querySelector(`[name="${CSS.escape(name)}"]`);
@@ -1824,7 +1756,8 @@
     const btn = $("#asset-search-btn");
     const restore = setBusy(btn, "搜索中…");
     try {
-      const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
+      const currentDataSource = configForm?.querySelector('[name="data_source"]')?.value || "auto";
+      const res = await fetch(`/api/search?q=${encodeURIComponent(q)}&data_source=${encodeURIComponent(currentDataSource)}`);
       const data = await res.json();
       if (!res.ok || data.ok === false) throw new Error(data.message || "搜索失败");
       renderCandidates(data.results || [], q);
@@ -1928,6 +1861,7 @@
     setChoice("entry_state", entryState);
     setChoice("exit_state", exitState);
     setChoice("profit_state", profitState);
+    if (ind.ma_position) setChoice("ma_position", ind.ma_position);
     setCheck("volume_confirm", Boolean(ind.volume_confirm));
     setCheck("pullback_volume_dry", Boolean(ind.pullback_volume_dry));
     setCheck("upper_shadow", Boolean(ind.upper_shadow));
@@ -1941,6 +1875,7 @@
     markChoiceAuto("entry_state", entryState);
     markChoiceAuto("exit_state", exitState);
     markChoiceAuto("profit_state", profitState);
+    if (ind.ma_position) markChoiceAuto("ma_position", ind.ma_position);
     if (!hasVolumeSignal) markChoiceAuto("volume_state", "none");
     markCheckAuto("volume_confirm", Boolean(ind.volume_confirm));
     markCheckAuto("pullback_volume_dry", Boolean(ind.pullback_volume_dry));
@@ -2208,7 +2143,7 @@
 
     document.addEventListener("change", (event) => {
       const target = event.target;
-      // 全局配置字段（仓位边界、执行速度）
+      // 全局配置字段（仓位边界、执行控制）
       if (target?.dataset?.globalField) {
         globalConfigState[target.dataset.globalField] = numberOr(target.value, globalConfigState[target.dataset.globalField]);
         refreshDeviationPreviews(document);
@@ -2623,7 +2558,6 @@
         strategy_family: currentCfg.strategy_family || "trend_signal_control",
         strategy: currentCfg.strategy || "balanced",
         position_mode: currentCfg.position_mode || "core_satellite",
-        risk_per_trade_pct: Number(currentCfg.risk_per_trade_pct || 1),
         risk_free_rate_pct: currentCfg.backtest_risk_free_rate_pct === undefined || currentCfg.backtest_risk_free_rate_pct === "" ? 2 : Number(currentCfg.backtest_risk_free_rate_pct),
         source: currentCfg.data_source || "auto",
         data_source: currentCfg.data_source || "auto",

@@ -22,8 +22,6 @@ FAMILY_META: Dict[str, Any] = {
 
 STYLE_PARAM_PRESETS: Dict[str, Dict[str, Any]] = {
     "balanced": {
-        "buy_step": 0.26,
-        "sell_step": 0.48,
         "far_below_buy_pct": 30.0,
         "below_buy_pct": 15.0,
         "above_sell_pct": 15.0,
@@ -37,8 +35,6 @@ STYLE_PARAM_PRESETS: Dict[str, Dict[str, Any]] = {
         "strict_max_position_pct": 60.0,
     },
     "defensive": {
-        "buy_step": 0.16,
-        "sell_step": 0.60,
         "far_below_buy_pct": 18.0,
         "below_buy_pct": 10.0,
         "above_sell_pct": 18.0,
@@ -52,8 +48,6 @@ STYLE_PARAM_PRESETS: Dict[str, Dict[str, Any]] = {
         "strict_max_position_pct": 60.0,
     },
     "aggressive": {
-        "buy_step": 0.36,
-        "sell_step": 0.38,
         "far_below_buy_pct": 40.0,
         "below_buy_pct": 22.0,
         "above_sell_pct": 12.0,
@@ -115,10 +109,18 @@ def _pct_param(strategy: Dict[str, Any], key: str, default: float) -> float:
 
 
 def _current_position(cfg: Dict[str, Any]) -> float:
+    """与主程序保持一致：当前仓位按“已占用计划本金 / 计划资金”计算。
+
+    current_position_amount 是当前持仓市值；current_profit_pct 用于反推本金占用。
+    这样简易均线策略在实时计算和回测里都使用同一套仓位口径。
+    """
     try:
         plan = max(float(cfg.get("plan_amount") or 0.0), 0.0)
-        amount = max(float(cfg.get("current_position_amount") or 0.0), 0.0)
-        return clamp(amount / plan, 0.0, 0.9999) if plan > 0 else 0.0
+        market_amount = max(float(cfg.get("current_position_amount") or 0.0), 0.0)
+        profit_pct = float(cfg.get("current_profit_pct") or 0.0)
+        profit_factor = max(1.0 + profit_pct / 100.0, 0.0001)
+        cost_amount = market_amount / profit_factor
+        return clamp(cost_amount / plan, 0.0, 0.9999) if plan > 0 else 0.0
     except Exception:
         return 0.0
 
@@ -145,9 +147,6 @@ def target_weight(cfg: Dict[str, Any], signals: Dict[str, Any]) -> Tuple[float, 
     signals["strategy_match_label"] = f"简易均线：{label}"
     signals["strategy_confidence"] = int(confidence)
 
+    # 操作说明只返回当前均线理由，不返回原始调整、边界限制等计算过程。
     notes = [note]
-    if abs(actual_delta - delta) > 1e-9:
-        notes.append(f"仓位边界限制：原始调整 {pct2(delta)}，边界后实际调整 {pct2(actual_delta)}。")
-    else:
-        notes.append(f"策略原始调整：{pct2(delta)}。")
     return target, notes

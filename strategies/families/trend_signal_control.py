@@ -34,6 +34,7 @@ STYLE_PARAM_PRESETS: Dict[str, Dict[str, Any]] = {
         "buy_step": 0.26,
         "sell_step": 0.48,
         "risk_multiplier": 1.00,
+        "risk_per_trade_pct": 1.0,
         "entry_bonus_pct": 100.0,
         "risk_penalty_pct": 100.0,
         "valuation_sensitivity_pct": 100.0,
@@ -58,6 +59,7 @@ STYLE_PARAM_PRESETS: Dict[str, Dict[str, Any]] = {
         "buy_step": 0.16,
         "sell_step": 0.60,
         "risk_multiplier": 0.75,
+        "risk_per_trade_pct": 0.8,
         "entry_bonus_pct": 70.0,
         "risk_penalty_pct": 122.0,
         "valuation_sensitivity_pct": 112.0,
@@ -82,6 +84,7 @@ STYLE_PARAM_PRESETS: Dict[str, Dict[str, Any]] = {
         "buy_step": 0.36,
         "sell_step": 0.38,
         "risk_multiplier": 1.20,
+        "risk_per_trade_pct": 1.2,
         "entry_bonus_pct": 128.0,
         "risk_penalty_pct": 86.0,
         "valuation_sensitivity_pct": 88.0,
@@ -105,6 +108,13 @@ STYLE_PARAM_PRESETS: Dict[str, Dict[str, Any]] = {
 }
 
 STYLE_PARAM_SCHEMA: List[Dict[str, Any]] = [
+    {
+        "title": "交易风险",
+        "desc": "趋势信号策略专属。只有趋势信号策略的纯交易仓会使用止损距离和单笔风险预算来限制新增交易仓。",
+        "fields": [
+            {"name": "risk_per_trade_pct", "label": "单笔风险预算%", "type": "number", "default": 1.0, "min": 0.1, "max": 100, "step": 0.1, "tip": "单笔趋势交易最多允许亏掉总计划资金的比例。该参数只属于趋势信号策略；简易均线、小因子等策略不会读取它。"},
+        ],
+    },
     {
         "title": "趋势信号权重",
         "desc": "趋势信号策略专属：控制入场信号、风险信号、估值和质量对目标仓位的影响强度。",

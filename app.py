@@ -12,6 +12,7 @@ import time
 import contextlib
 import html as html_lib
 from io import StringIO
+from urllib.parse import quote_plus
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -54,7 +55,7 @@ app.secret_key = "local-trend-risk-position-tool"
 
 # 进程内轻量缓存：同一轮本地使用中，参数完全相同的搜索、拉取、回测、连通性测试不重复执行。
 # 不落盘，不保存原始参数；只用参数摘要作为 key，避免把 Cookie/代理等敏感配置写进缓存索引。
-RUNTIME_CACHE_VERSION = 23
+RUNTIME_CACHE_VERSION = 24
 RUNTIME_CACHE_MAX_ITEMS = 160
 RUNTIME_CACHE_TTL_SEC: Dict[str, int] = {
     "search": 6 * 60 * 60,
@@ -471,9 +472,9 @@ def ensure_config() -> Dict[str, Any]:
         if key not in merged or merged[key] is None or merged[key] == "":
             merged[key] = default
 
-    # 全局执行速度：从顶层读取，缺失时回退到均衡默认值。
+    # 全局执行层控制：旧版节奏字段已移除；只保留定投基准与兼容旧配置字段。
     for key, default in [
-        ("global_buy_step_pct", 26.0), ("global_sell_step_pct", 48.0), ("global_risk_multiplier", 1.0),
+        ("global_risk_multiplier", 1.0),
         ("dca_base_buy_pct", 25.0),
     ]:
         if key not in merged or merged[key] is None or merged[key] == "":
@@ -588,16 +589,11 @@ def _flatten_active_style_params(cfg: Dict[str, Any]) -> None:
             return as_float(cfg.get(key), default)
         return as_float(balanced.get(key), default)
 
-    # 操作幅度：从均衡基准读取，只把 deviation 作为运行时计算层。
-    base_buy = _base_pct("global_buy_step_pct", as_float(balanced.get("buy_step_pct"), 26.0))
-    base_sell = _base_pct("global_sell_step_pct", as_float(balanced.get("sell_step_pct"), 48.0))
-    cfg["buy_step_pct"] = clamp(_deviate(base_buy, amp_dev), 0.0, 100.0)
-    cfg["sell_step_pct"] = clamp(_deviate(base_sell, amp_dev), 0.0, 100.0)
     cfg["global_risk_multiplier"] = clamp(_base_pct("global_risk_multiplier", as_float(balanced.get("risk_multiplier"), 1.0)), 0.1, 5.0)
 
     cfg["trade_step_limit_enabled"] = advanced_bool(balanced, "trade_step_limit_enabled", True)
 
-    # 执行层控制 + 仓位边界：也统一从均衡基准出发。
+    # 执行层控制 + 仓位边界：统一从均衡基准出发。
     for key, default in [
         ("dca_base_buy_pct", 25.0),
         ("core_step_pct", 22.0),  # 兼容旧配置；前端不再展示。
@@ -605,6 +601,10 @@ def _flatten_active_style_params(cfg: Dict[str, Any]) -> None:
         ("sell_step_limit_pct", 45.0),
     ]:
         cfg[key] = clamp(_deviate(_base_pct(key, default), thr_dev), 0.0, 100.0)
+
+    # 兼容旧执行函数：内部 buy_step/sell_step 直接等同于“买入上限/卖出上限”，不再单独维护“节奏”。
+    cfg["buy_step_pct"] = cfg["buy_step_limit_pct"]
+    cfg["sell_step_pct"] = cfg["sell_step_limit_pct"]
 
     for key, default in [
         ("core_min_position_pct", 5.0), ("core_max_position_pct", 92.0),
@@ -628,10 +628,44 @@ def advanced_bool(cfg: Dict[str, Any], key: str, default: bool = True) -> bool:
 
 
 
-def current_position(cfg: Dict[str, Any]) -> float:
+def current_position_market_amount(cfg: Dict[str, Any]) -> float:
+    """用户填写的“当前持仓”按账户里的当前持仓市值理解。"""
+    return max(as_float(cfg.get("current_position_amount"), 0.0), 0.0)
+
+
+def current_profit_factor(cfg: Dict[str, Any]) -> float:
+    """持仓市值 / 已投入本金。
+
+    例：当前持仓市值 50，持仓盈亏 +100%，说明已投入本金是 25。
+    因此剩余计划资金不是 100 - 50，而是 100 - 25。
+    """
+    profit_pct = clamp(as_float(cfg.get("current_profit_pct"), 0.0), -99.99, 9999.0)
+    return max(1.0 + profit_pct / 100.0, 0.0001)
+
+
+def current_position_cost_amount(cfg: Dict[str, Any]) -> float:
+    """当前持仓占用的计划本金。
+
+    current_position_amount 是当前市值；结合持仓盈亏率反推本金占用：
+    已投入本金 = 当前持仓市值 / (1 + 持仓盈亏率)。
+    """
+    return current_position_market_amount(cfg) / current_profit_factor(cfg)
+
+
+def remaining_plan_cash_amount(cfg: Dict[str, Any]) -> float:
     plan = max(as_float(cfg.get("plan_amount"), 0.0), 0.0)
-    current_amount = max(as_float(cfg.get("current_position_amount"), 0.0), 0.0)
-    return clamp(current_amount / plan, 0.0, 2.0) if plan > 0 else 0.0
+    return max(plan - current_position_cost_amount(cfg), 0.0)
+
+
+def current_position(cfg: Dict[str, Any]) -> float:
+    """当前仓位按“已占用计划本金 / 计划资金”计算，而不是直接用持仓市值。
+
+    这样盈利后的持仓不会错误占用未投入资金；例如计划资金 100、
+    当前持仓市值 50、盈亏 +100%，当前仓位为 25%，剩余计划资金为 75。
+    """
+    plan = max(as_float(cfg.get("plan_amount"), 0.0), 0.0)
+    current_cost = current_position_cost_amount(cfg)
+    return clamp(current_cost / plan, 0.0, 2.0) if plan > 0 else 0.0
 
 
 
@@ -681,7 +715,7 @@ def parse_signals(form: Dict[str, Any]) -> Dict[str, Any]:
         "close", "ma20", "ma50", "ma200", "atr14", "atr_pct",
         "volume_ratio_20d", "return_20d", "return_60d", "return_120d",
         "volatility_20d", "volatility_60d", "drawdown_252d",
-        "ma50_slope_20d", "ma200_slope_20d", "distance_ma50_pct", "distance_ma200_pct",
+        "ma50_slope_20d", "ma200_slope_20d", "distance_ma20_pct", "distance_ma50_pct", "distance_ma200_pct",
         "macd_dif", "macd_dea", "macd_bar", "macd_dif_pct", "macd_dea_pct", "macd_bar_pct",
         "rsi6", "rsi14",
         "boll_mid", "boll_upper", "boll_lower", "boll_width_pct", "boll_percent_b",
@@ -860,14 +894,15 @@ def risk_score(signals: Dict[str, Any], cfg: Dict[str, Any]) -> Tuple[int, List[
 def risk_position_cap(cfg: Dict[str, Any], signals: Dict[str, Any], strategy: Dict[str, Any]) -> Tuple[float, List[str]]:
     warnings: List[str] = []
     stop = float(signals["stop_loss_pct"])
-    risk_budget = clamp(as_float(cfg.get("risk_per_trade_pct"), 1.0), 0.1, 100.0) / 100
+    risk_budget = clamp(as_float(strategy.get("risk_per_trade_pct"), cfg.get("risk_per_trade_pct", 1.0)), 0.1, 100.0) / 100
 
     if stop <= 0:
         warnings.append("未填写止损距离：禁止新增交易仓；已有仓位只根据破位/止盈信号处理。")
         return 0.0, warnings
 
+    # 单笔风险预算已经是趋势信号策略自己的显式参数。
+    # 不再叠加隐藏的 risk_multiplier，避免用户看不到的倍率继续影响结果。
     cap = risk_budget / stop
-    cap *= float(strategy["risk_multiplier"])
     cap = clamp(cap, 0.0, 0.9999)
 
     if cap < 0.08:
@@ -1369,17 +1404,13 @@ def raw_target_by_signal(cfg: Dict[str, Any], signals: Dict[str, Any], cur: floa
         low, high = core_asset_floor_bounds("core", cfg)
         target = clamp(cur + dca_delta + strategy_delta, low, high)
         action = target_action_from_delta(cur, target, buy_label="买入", sell_label="减仓")
-        matched = f"定投增强：固定买入{pct2(dca_delta)} + {strategy_matched}"
+        # 操作说明只展示当前策略理由，不展示“固定买入 + 策略偏移”的计算过程。
+        matched = f"定投增强：{strategy_matched}"
         confidence = strategy_confidence
         signals["core_target_model"] = True
         signals["strategy_model_driven"] = True
         signals["pure_strategy_target"] = True
         signals["dca_composed_target"] = True
-        reason.append(f"定投增强底盘：先给出总资金 {pct2(dca_delta)} 的固定买入建议。")
-        if abs(strategy_delta) >= 0.0001:
-            reason.append(f"策略偏移：{strategy_matched}，策略目标相对当前仓位 {pct2(strategy_delta)}。")
-        else:
-            reason.append(f"策略偏移：{strategy_matched}，策略本身建议维持当前仓位。")
         reason.extend(strategy_reasons)
         return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
 
@@ -1518,13 +1549,11 @@ def raw_target_by_signal(cfg: Dict[str, Any], signals: Dict[str, Any], cur: floa
         signals["pure_strategy_target"] = True
         if action in {"买入", "加仓"}:
             matched = f"{base_rule}：策略买入"
-            reason.append("当前总体策略直接输出交易目标；不再套用趋势策略的震荡/突破/回踩硬规则。")
         elif action in {"减仓", "清仓"}:
             matched = f"{base_rule}：策略卖出"
-            reason.append("当前总体策略直接输出交易目标；执行层不再用其他策略条件改写方向。")
         else:
             matched = f"{base_rule}：策略维持"
-            reason.append("当前仓位已经接近当前总体策略目标。")
+        # 操作说明只展示当前策略理由；“当前总体策略直接输出/不再套用其他策略规则”等属于计算过程，不再展示。
         reason.extend(core_notes)
         return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
 
@@ -1648,12 +1677,17 @@ def compute_decision(cfg: Dict[str, Any], form: Dict[str, Any]) -> Decision:
         else:
             signals["exit_state"] = "hit_stop"
 
-    risk, risk_notes = risk_score(signals, cfg)
-    t_score = trend_score(signals)
-    r_cap, cap_warnings = risk_position_cap(cfg, signals, strategy)
-
     action, raw_target, matched, reasons, confidence = raw_target_by_signal(cfg, signals, cur)
     pure_strategy_target = bool(signals.get("pure_strategy_target"))
+
+    risk, risk_notes = risk_score(signals, cfg)
+    t_score = trend_score(signals)
+    if pure_strategy_target:
+        # 简易均线 / 小因子 / 定投增强合成目标等纯目标策略，不使用趋势交易的止损距离与单笔风险预算。
+        r_cap, cap_warnings = 1.0, []
+    else:
+        r_cap, cap_warnings = risk_position_cap(cfg, signals, strategy)
+
     signal_quality, quality_notes2 = signal_quality_score(signals, action)
     expected_r, opportunity_grade, odds_notes = expected_reward_r(signals, action)
     trade_frequency, frequency_mult, frequency_notes = trade_frequency_profile(signals, action)
@@ -1724,7 +1758,7 @@ def compute_decision(cfg: Dict[str, Any], form: Dict[str, Any]) -> Decision:
     is_allocation_fill = bool(signals.get("allocation_fill"))
     if pure_strategy_target:
         # 交易模式：策略给出什么就是什么；定投模式：固定买入 + 策略偏移已经在 raw_target_by_signal 中合成。
-        # 这里不再用止损风险预算、赔率过滤、估值刹车或单次补仓上限改写方向/幅度。
+        # 这里不再用止损风险预算、赔率过滤、估值刹车或旧版补仓限制改写方向/幅度。
         base_buy_step_limit = 1.0
     elif is_allocation_fill:
         base_buy_step_limit, allocation_step_notes = core_allocation_step_limit(cfg, signals, strategy)
@@ -1862,15 +1896,33 @@ def compute_decision(cfg: Dict[str, Any], form: Dict[str, Any]) -> Decision:
 
 def amount_payload(cfg: Dict[str, Any], result: Decision) -> Dict[str, Any]:
     plan = max(as_float(cfg.get("plan_amount"), 0.0), 0.0)
-    current_amount = max(as_float(cfg.get("current_position_amount"), 0.0), 0.0)
+    current_market_amount = current_position_market_amount(cfg)
+    current_cost_amount = current_position_cost_amount(cfg)
+    remaining_cash = remaining_plan_cash_amount(cfg)
+    profit_factor = current_profit_factor(cfg)
     cur_pos = current_position(cfg)
+
+    # 策略目标仓位的单位是“计划本金占用比例”。
+    # 买入时：新增买入金额 = 目标本金 - 当前已投入本金。
+    # 卖出时：需要按当前盈亏率换算成应卖出的当前市值。
     target_amount = result.target_position * plan
-    diff = target_amount - current_amount
+    cost_diff = target_amount - current_cost_amount
+    if cost_diff > 1e-9:
+        trade_diff = min(cost_diff, remaining_cash)
+    elif cost_diff < -1e-9:
+        trade_diff = cost_diff * profit_factor
+    else:
+        trade_diff = 0.0
+
     return {
         "current_pos": cur_pos,
+        "current_market_amount": current_market_amount,
+        "current_cost_amount": current_cost_amount,
+        "remaining_plan_cash": remaining_cash,
         "target_amount": target_amount,
-        "diff": diff,
-        "direction": "买入" if diff > 1e-9 else ("卖出" if diff < -1e-9 else "不操作"),
+        "cost_diff": cost_diff,
+        "diff": trade_diff,
+        "direction": "买入" if trade_diff > 1e-9 else ("卖出" if trade_diff < -1e-9 else "不操作"),
     }
 
 
@@ -1885,10 +1937,25 @@ DATA_DISPLAY_REASON_PATTERNS = (
     r"合计修正.*\d",
     r"原始目标.*\d",
     r"风格调整.*\d",
-    r"风险倍率.*\d",
     r"允许区间",
     r"投票结果",
     r"合计 [+-]?\d",
+    # 以下都是执行/合成/边界信息，不属于“当前策略理由”。
+    r"定投增强底盘",
+    r"策略偏移",
+    r"固定买入",
+    r"当前总体策略",
+    r"不再套用",
+    r"执行层",
+    r"仓位边界限制",
+    r"策略原始调整",
+    r"原始调整",
+    r"边界后实际调整",
+    r"相对当前仓位",
+    r"本次最多",
+    r"目标由.*限制",
+    r"低于执行阈值",
+    r"计算后",
 )
 
 
@@ -1913,7 +1980,8 @@ def join_reason_text(items: List[Any]) -> str:
         cleaned.append(text)
     if not cleaned:
         return "当前信号不足，按规则维持原仓位。"
-    return "；".join(cleaned[:5]) + "。"
+    # 结果区只保留当前理由，避免把计算过程堆成一长串。
+    return "；".join(cleaned[:3]) + "。"
 
 
 def decision_to_payload(cfg: Dict[str, Any], result: Decision) -> Dict[str, Any]:
@@ -1972,8 +2040,10 @@ def decision_to_payload(cfg: Dict[str, Any], result: Decision) -> Dict[str, Any]
         {"label": "ROE修正", "value": pct2(result.quality_adjustment)},
         {"label": "系统防守仓位", "value": pct2(result.core_floor)},
         {"label": "计划金额", "value": money(as_float(cfg.get("plan_amount"), 0.0))},
-        {"label": "当前持仓", "value": money(as_float(cfg.get("current_position_amount"), 0.0))},
-        {"label": "目标持仓", "value": money(amount["target_amount"])},
+        {"label": "当前持仓市值", "value": money(amount["current_market_amount"])},
+        {"label": "已投入本金", "value": money(amount["current_cost_amount"])},
+        {"label": "剩余计划资金", "value": money(amount["remaining_plan_cash"])},
+        {"label": "目标投入本金", "value": money(amount["target_amount"])},
         {"label": "标的", "value": f"{cfg.get('symbol_name') or '--'} {cfg.get('symbol') or ''}".strip(), "wide": True},
         {"label": "总体策略", "value": strategy_family_summary(cfg).replace("<br>", " / "), "wide": True},
         {"label": "参数风格", "value": f"{strategy['name']}：{strategy['desc']}", "wide": True},
@@ -1981,12 +2051,12 @@ def decision_to_payload(cfg: Dict[str, Any], result: Decision) -> Dict[str, Any]
         {"label": "命中规则", "value": result.matched_rule, "wide": True},
     ]
 
-    # strategy_isolation_v3_metrics_filter
-    # 模型型总体策略不显示趋势信号风控策略专属指标。
-    family_key_for_metrics = str(cfg.get("strategy_family") or "")
-    if family_key_for_metrics in {"simple_ma", "mini_factor_timing"}:
+    # 趋势交易专属指标：只有趋势信号策略 + 纯交易仓才展示。
+    # 简易均线、小因子、定投增强等模式不会使用单笔风险预算/止损风险仓位，避免界面继续误导。
+    show_trend_trade_risk = is_signal_driven_family(cfg) and cfg.get("position_mode") == "strict_trade"
+    if not show_trend_trade_risk:
         trend_only_metric_labels = {
-            "预期赔率", "操作频率", "止损距离", "风险仓位上限",
+            "信号质量", "预期赔率", "操作频率", "止损距离", "风险仓位上限",
             "本次买入上限", "本次卖出上限", "估值修正", "ROE修正", "系统防守仓位",
         }
         metrics = [item for item in metrics if item.get("label") not in trend_only_metric_labels]
@@ -2000,7 +2070,7 @@ def decision_to_payload(cfg: Dict[str, Any], result: Decision) -> Dict[str, Any]
         "target_position": result.target_position,
         "target_position_text": pct(result.target_position),
         "confidence": result.confidence,
-        "reason": result.reason,
+        "reason": [item for item in result.reason if str(item).strip() and not _is_data_display_reason(str(item).strip())],
         "warnings": result.warnings,
         "matched_rule": result.matched_rule,
         "risk_score": result.risk_score,
@@ -2074,6 +2144,130 @@ def is_cn_open_fund_like(symbol: str, market: str, asset_kind: str = "", symbol_
     market_u = str(market or "auto").strip().upper()
     is_cn_code = bool(re.fullmatch(r"\d{6}", re.sub(r"\D", "", str(symbol or ""))))
     return kind in {"fund", "fof", "qdii", "fund_of_funds"} and (market_u == "CN" or is_cn_code)
+
+
+def is_danjuan_nav_like(symbol: str, market: str, asset_kind: str = "", symbol_name: str = "") -> bool:
+    """蛋卷基金净值接口可尝试的标的：场外基金、ETF、LOF/QDII 等 6 位基金类代码。"""
+    kind = resolve_asset_kind(symbol, market, asset_kind or "auto", symbol_name)
+    market_u = str(market or "auto").strip().upper()
+    digits = re.sub(r"\D", "", str(symbol or ""))
+    is_cn_code = bool(re.fullmatch(r"\d{6}", digits))
+    return kind in {"fund", "fof", "qdii", "fund_of_funds", "etf"} and (market_u == "CN" or is_cn_code)
+
+
+def is_danjuan_only_source(source: Any) -> bool:
+    return str(source or "").strip().lower() in {"danjuan_only", "only_danjuan", "只使用蛋卷"}
+
+
+def local_danjuan_search(query: str) -> List[Dict[str, str]]:
+    """只使用蛋卷时的轻量搜索：不调用 yfinance/AKShare，只返回本地/代码可确定的蛋卷候选。"""
+    q = str(query or "").strip()
+    items = []
+    for item in local_symbol_search(q):
+        symbol = str(item.get("symbol") or "").strip().upper()
+        market = str(item.get("market") or ("CN" if re.fullmatch(r"\d{6}", symbol) else "auto")).strip().upper()
+        kind = resolve_asset_kind(symbol, market, item.get("asset_kind", "auto"), item.get("name", ""))
+        if is_danjuan_nav_like(symbol, market, kind, item.get("name", "")):
+            out = dict(item)
+            out["symbol"] = symbol
+            out["market"] = market
+            out["asset_kind"] = kind
+            out["source"] = "danjuan_only"
+            items.append(out)
+    raw = q.upper()
+    if re.fullmatch(r"\d{6}", raw) and not any(str(x.get("symbol") or "").upper() == raw for x in items):
+        kind = guess_cn_asset_kind(raw)
+        if is_danjuan_nav_like(raw, "CN", kind, raw):
+            items.append({"symbol": raw, "name": raw, "market": "CN", "asset_kind": kind, "source": "danjuan_only"})
+    return items
+
+
+
+def _walk_json_nodes(value: Any):
+    """递归遍历 JSON 节点，用于兼容蛋卷搜索接口返回字段变化。"""
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk_json_nodes(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_json_nodes(child)
+
+
+def _first_text(item: Dict[str, Any], keys: Tuple[str, ...]) -> str:
+    for key in keys:
+        value = item.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _normalise_danjuan_search_item(item: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    code = _first_text(item, ("fd_code", "fund_code", "code", "symbol", "fundcode", "fundCode"))
+    code = re.sub(r"\D", "", code)
+    if not re.fullmatch(r"\d{6}", code):
+        return None
+    name = _first_text(item, ("fd_name", "fund_name", "name", "fname", "fundName", "fd_full_name", "full_name")) or code
+    kind = guess_cn_asset_kind(code, name)
+    if not is_danjuan_nav_like(code, "CN", kind, name):
+        return None
+    return {"symbol": code, "name": name, "market": "CN", "asset_kind": kind, "source": "danjuan_only"}
+
+
+def search_danjuan_funds(query: str, options: Optional[FetchOptions] = None) -> List[Dict[str, str]]:
+    """蛋卷搜索。用于“只使用蛋卷”模式下支持中文名称/简称搜索。
+
+    蛋卷 Web 接口字段偶尔会调整，所以这里同时尝试几个常见入口，并用宽松 JSON 解析提取
+    fd_code/fund_code/code + fd_name/name 这类基金候选。失败时返回空列表，不回退到其他数据源。
+    """
+    q = str(query or "").strip()
+    if not q:
+        return []
+    import requests  # type: ignore
+
+    options = options or FetchOptions()
+    encoded = quote_plus(q)
+    candidate_urls = [
+        f"https://danjuanfunds.com/djapi/fund/search?key={encoded}",
+        f"https://danjuanfunds.com/djapi/fund/search?keyword={encoded}",
+        f"https://danjuanfunds.com/djapi/fund/search?kw={encoded}",
+        f"https://danjuanfunds.com/djapi/search/fund?key={encoded}",
+    ]
+    headers = _danjuan_headers(options)
+    headers["Accept"] = "application/json, text/plain, */*"
+    headers["Referer"] = "https://danjuanfunds.com/"
+
+    results: List[Dict[str, str]] = []
+    seen = set()
+    last_error = ""
+    for url in candidate_urls:
+        try:
+            resp = requests.get(url, headers=headers, timeout=options.timeout, proxies=request_proxies(options))
+            text = resp.text or ""
+            resp.raise_for_status()
+            try:
+                payload = resp.json()
+            except Exception as exc:
+                last_error = f"蛋卷搜索返回不是 JSON：{exc}; preview={text[:120]}"
+                continue
+            for node in _walk_json_nodes(payload):
+                item = _normalise_danjuan_search_item(node)
+                if not item:
+                    continue
+                key = item["symbol"]
+                if key in seen:
+                    continue
+                seen.add(key)
+                results.append(item)
+                if len(results) >= 20:
+                    break
+            if results:
+                break
+        except Exception as exc:
+            last_error = str(exc)[:180]
+            continue
+    # 保持搜索接口容错：在线蛋卷搜索失败时返回本地候选即可，不污染 UI。
+    return results
 
 
 def local_symbol_search(query: str) -> List[Dict[str, str]]:
@@ -2208,7 +2402,7 @@ def symbol_result_rank(item: Dict[str, str], exact_query: str = "") -> Tuple[int
     placeholder_score = 1 if is_placeholder_symbol_candidate(item) else 0
     # 精确代码搜索时，基金/ETF/指数优先于股票占位项；真实有名称的股票仍会保留。
     kind_order = {"fund": 0, "fof": 0, "qdii": 0, "etf": 1, "index": 2, "stock": 3, "auto": 4}.get(kind, 5)
-    source_order = {"akshare": 0, "danjuan": 1, "eastmoney": 2, "yfinance": 3}.get(source, 4)
+    source_order = {"akshare": 0, "danjuan_only": 0, "danjuan": 1, "eastmoney": 2, "yfinance": 3}.get(source, 4)
     return (exact_score, placeholder_score, kind_order + source_order, symbol)
 
 
@@ -4167,8 +4361,13 @@ def fetch_market_data(symbol: str, market: str, asset_kind: str, source: str, cf
     options = fetch_options_from_cfg(cfg)
     source = str(source or "auto").lower()
     market = str(market or "auto").upper()
-    asset_kind = resolve_asset_kind(symbol, market, asset_kind, str(cfg.get("symbol_name") or ""))
-    is_cn_fund = is_cn_open_fund_like(symbol, market, asset_kind, str(cfg.get("symbol_name") or ""))
+    symbol_name = str(cfg.get("symbol_name") or "")
+    asset_kind = resolve_asset_kind(symbol, market, asset_kind, symbol_name)
+    is_cn_fund = is_cn_open_fund_like(symbol, market, asset_kind, symbol_name)
+    is_danjuan_nav = is_danjuan_nav_like(symbol, market, asset_kind, symbol_name)
+    danjuan_only = is_danjuan_only_source(source)
+    if danjuan_only:
+        source = "danjuan_only"
     trace_all: List[Dict[str, Any]] = []
     candidates: List[Tuple[str, Callable[[], Tuple[List[Dict[str, float]], Dict[str, Any]]]]] = []
 
@@ -4176,8 +4375,11 @@ def fetch_market_data(symbol: str, market: str, asset_kind: str, source: str, cf
         if label not in [x[0] for x in candidates]:
             candidates.append((label, fn))
 
-    if source in {"auto", "akshare", "fund", "danjuan"} and is_cn_fund:
+    if source in {"auto", "akshare", "fund", "danjuan", "danjuan_only"} and (is_cn_fund or (danjuan_only and is_danjuan_nav)):
         add("danjuan_fund_nav", lambda: fetch_danjuan_fund_nav_recent(symbol, options))
+
+    if danjuan_only and not candidates:
+        raise RuntimeError("只使用蛋卷目前仅支持可通过蛋卷基金净值接口获取的基金 / ETF / QDII 标的")
 
     if source in {"auto", "akshare"} and (market == "CN" or re.fullmatch(r"\d{6}", symbol)):
         add("akshare", lambda: fetch_akshare(symbol, asset_kind, options))
@@ -4204,7 +4406,7 @@ def fetch_market_data(symbol: str, market: str, asset_kind: str, source: str, cf
         for ys in yahoo_symbol_candidates(symbol, market, asset_kind):
             add(f"yahoo_chart:{ys}", lambda ys=ys: fetch_yahoo_chart_api(ys, options))
 
-    if not candidates:
+    if not candidates and not danjuan_only:
         add("yfinance", lambda: fetch_yfinance(symbol, options))
 
     for label, fn in candidates:
@@ -4219,13 +4421,29 @@ def fetch_market_data(symbol: str, market: str, asset_kind: str, source: str, cf
                 danjuan_cookie=options.danjuan_cookie,
                 valuation_method="danjuan_detail",
             )
+            cfg_symbol_name = str(cfg.get("symbol_name") or symbol_name or "").strip()
+            fund_symbol_name = str(
+                fundamentals.get("long_name")
+                or fundamentals.get("fund_full_name")
+                or fundamentals.get("name")
+                or ""
+            ).strip()
+            # “只使用蛋卷”搜索如果只传了代码，估值映射会缺少中文指数关键词；
+            # 优先使用蛋卷基金详情返回的真实基金名称，便于匹配 NDX/SP500/沪深300 等指数估值。
+            valuation_symbol_name = cfg_symbol_name
+            if (
+                not valuation_symbol_name
+                or valuation_symbol_name.upper() == str(symbol or "").strip().upper()
+                or re.fullmatch(r"\d{6}", valuation_symbol_name)
+            ):
+                valuation_symbol_name = fund_symbol_name or valuation_symbol_name
             fundamentals, valuation_trace = enrich_fundamentals_with_public_valuation(
                 symbol=symbol,
                 market=market,
                 asset_kind=asset_kind,
                 fundamentals=fundamentals,
                 options=valuation_options,
-                symbol_name=str(cfg.get("symbol_name") or ""),
+                symbol_name=valuation_symbol_name,
             )
             trace_all.extend(valuation_trace)
             return records, fundamentals, trace_all, label
@@ -4373,6 +4591,22 @@ def compute_indicators(records: List[Dict[str, float]], fundamentals: Dict[str, 
     vol20 = sum(vols[-20:]) / 20 if len(vols) >= 20 and any(vols[-20:]) else None
     volume_ratio = vols[-1] / vol20 if vol20 else None
 
+    # 简易均线策略的自动信号：只基于价格与 20 日均线的距离生成 ma_position。
+    # 这同时服务于实时拉取后的自动填充与历史回测，否则回测中 ma_position 会一直缺省为 at_ma，导致没有交易记录。
+    distance_ma20_pct = (close / ma20 - 1.0) * 100.0 if ma20 else None
+    ma_position = "at_ma"
+    if distance_ma20_pct is not None:
+        if distance_ma20_pct <= -5.0:
+            ma_position = "far_below"
+        elif distance_ma20_pct < -1.0:
+            ma_position = "below"
+        elif distance_ma20_pct <= 1.0:
+            ma_position = "at_ma"
+        elif distance_ma20_pct < 5.0:
+            ma_position = "above"
+        else:
+            ma_position = "far_above"
+
     macd_dif, macd_dea, macd_bar = macd_last(closes)
     rsi6 = rsi_last(closes, 6)
     rsi14 = rsi_last(closes, 14)
@@ -4463,8 +4697,10 @@ def compute_indicators(records: List[Dict[str, float]], fundamentals: Dict[str, 
         "drawdown_252d": round(drawdown_252d * 100.0, 2) if drawdown_252d is not None else None,
         "ma50_slope_20d": round(slope_pct(ma50, ma50_prev) * 100.0, 2) if slope_pct(ma50, ma50_prev) is not None else None,
         "ma200_slope_20d": round(slope_pct(ma200, ma200_prev) * 100.0, 2) if slope_pct(ma200, ma200_prev) is not None else None,
+        "distance_ma20_pct": round(distance_ma20_pct, 2) if distance_ma20_pct is not None else None,
         "distance_ma50_pct": round((close / ma50 - 1.0) * 100.0, 2) if ma50 else None,
         "distance_ma200_pct": round((close / ma200 - 1.0) * 100.0, 2) if ma200 else None,
+        "ma_position": ma_position,
         "market_state": market_state,
         "entry_state": entry_state,
         "exit_state": exit_state,
@@ -5685,6 +5921,8 @@ def normalize_backtest_source(source: str, market: str) -> str:
     raw = str(source or "auto").strip().lower()
     if raw in {"", "auto", "multi", "自动", "自动多链路"}:
         return "auto"
+    if is_danjuan_only_source(raw):
+        return "danjuan_only"
     if raw in {"akshare", "funddb", "danjuan", "danjuan_json", "danjuan_html", "lixinger"}:
         # AKShare/蛋卷在主程序里常用于估值或实时数据；回测历史行情改走可直接拉历史K线的链路。
         return "auto" if market.upper() == "CN" else "auto"
@@ -5706,13 +5944,20 @@ def backtest_fetch_records_uncached(symbol: str, market: str, source: str, start
     candidates: List[Callable[[], Tuple[List[Dict[str, Any]], str]]] = []
 
     asset_kind = resolve_asset_kind(symbol, market, asset_kind, str(cfg.get("symbol_name") or ""))
-    is_cn_fund = is_cn_open_fund_like(symbol, market, asset_kind, str(cfg.get("symbol_name") or ""))
+    symbol_name = str(cfg.get("symbol_name") or "")
+    is_cn_fund = is_cn_open_fund_like(symbol, market, asset_kind, symbol_name)
+    is_danjuan_nav = is_danjuan_nav_like(symbol, market, asset_kind, symbol_name)
+    danjuan_only = source == "danjuan_only"
 
     # 场外基金 / ETF联接 / QDII基金优先使用基金净值。
     # 不能直接用股票K线接口，否则会出现 017641.SZ / 007721.SZ 这类无效链路。
-    if source in {"auto", "fund", "eastmoney", "akshare", "danjuan"} and is_cn_fund:
+    if source in {"auto", "fund", "eastmoney", "akshare", "danjuan", "danjuan_only"} and (is_cn_fund or (danjuan_only and is_danjuan_nav)):
         candidates.append(lambda: backtest_fetch_danjuan_fund_nav(symbol, start, end, options))
-        candidates.append(lambda: backtest_fetch_eastmoney_fund_nav(symbol, start, end, options))
+        if not danjuan_only:
+            candidates.append(lambda: backtest_fetch_eastmoney_fund_nav(symbol, start, end, options))
+
+    if danjuan_only and not candidates:
+        raise RuntimeError("只使用蛋卷目前仅支持可通过蛋卷基金净值接口获取的基金 / ETF / QDII 标的")
 
     # 国内股票/ETF/指数才优先东方财富K线；场外基金不走这条链路。
     if source in {"auto", "eastmoney"} and not is_cn_fund and (market.upper() == "CN" or re.fullmatch(r"\d{6}", symbol or "")):
@@ -6461,10 +6706,11 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
                 avg_cost = (old_cost + gross) / shares if shares > 0 else None
                 cash -= gross + gross * fee
                 turnover_value += gross
+                current_total_asset = cash + shares * price
                 trades.append({
                     "信号日": signal_rec["date"], "执行日": next_rec["date"], "方向": "买入", "成交价": round(price, 4),
-                    "成交金额": round(gross, 2), "目标仓位%": round(target_pos * 100, 2), "操作建议": payload_result.get("headline", last_signal),
-                    "命中规则": payload_metric_value(payload_result, "命中规则"),
+                    "成交金额": round(gross, 2), "当前总资产": round(current_total_asset, 2), "目标仓位%": round(target_pos * 100, 2),
+                    "操作建议": payload_result.get("headline", last_signal), "命中规则": payload_metric_value(payload_result, "命中规则"),
                 })
         elif trade_value < 0 and shares > 0:
             price = exec_open * (1.0 - effective_slip)
@@ -6478,9 +6724,10 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
             if shares <= 1e-9:
                 shares = 0.0
                 avg_cost = None
+            current_total_asset = cash + shares * price
             trades.append({
                 "信号日": signal_rec["date"], "执行日": next_rec["date"], "方向": "卖出", "成交价": round(price, 4),
-                "成交金额": round(gross, 2), "已实现盈亏": round(pnl, 2), "目标仓位%": round(target_pos * 100, 2),
+                "成交金额": round(gross, 2), "当前总资产": round(current_total_asset, 2), "目标仓位%": round(target_pos * 100, 2),
                 "操作建议": payload_result.get("headline", last_signal), "命中规则": payload_metric_value(payload_result, "命中规则"),
             })
 
@@ -6756,13 +7003,11 @@ def api_config():
 
     mode = str(data.get("position_mode", cfg.get("position_mode", "core_satellite")))
     cfg["position_mode"] = mode if mode in {"core_satellite", "strict_trade"} else "core_satellite"
-    cfg["risk_per_trade_pct"] = clamp(as_float(data.get("risk_per_trade_pct"), cfg.get("risk_per_trade_pct", 1.0)), 0.1, 100.0)
+    # risk_per_trade_pct 已迁移为趋势信号策略的独立参数；根级字段只保留旧配置兼容，不再由左侧全局配置更新。
     cfg["backtest_risk_free_rate_pct"] = clamp(as_float(data.get("backtest_risk_free_rate_pct"), cfg.get("backtest_risk_free_rate_pct", 2.0)), -20.0, 30.0)
 
     # 均衡基准运行参数：偏离度只基于这些值临时计算；保存层只保留 balanced。
     for key, default, low, high in [
-        ("global_buy_step_pct", 26.0, 0.0, 100.0),
-        ("global_sell_step_pct", 48.0, 0.0, 100.0),
         ("global_risk_multiplier", 1.0, 0.1, 5.0),  # 兼容旧配置；前端不再展示。
         ("dca_base_buy_pct", 25.0, 0.0, 100.0),
         ("core_step_pct", 22.0, 0.0, 100.0),  # 兼容旧配置；前端不再展示。
@@ -6815,8 +7060,8 @@ def _cfg_for_decision_payload(saved_cfg: Dict[str, Any], payload: Dict[str, Any]
         cfg["position_mode"] = mode if mode in {"core_satellite", "strict_trade"} else "core_satellite"
     for key in [
         "plan_amount", "current_position_amount", "current_profit_pct",
-        "risk_per_trade_pct", "dca_base_buy_pct",
-        "global_buy_step_pct", "global_sell_step_pct", "global_risk_multiplier",
+        "dca_base_buy_pct",
+        "global_risk_multiplier",
         "core_step_pct", "buy_step_limit_pct", "sell_step_limit_pct",
         "core_min_position_pct", "core_max_position_pct",
         "strict_min_position_pct", "strict_max_position_pct",
@@ -6848,8 +7093,12 @@ def api_decision():
 @app.get("/api/search")
 def api_search():
     query = str(request.args.get("q", "")).strip()
+    cfg = ensure_config()
+    source = str(request.args.get("data_source") or request.args.get("source") or cfg.get("data_source") or "auto").strip().lower()
+    danjuan_only = is_danjuan_only_source(source)
     cache_payload = {
         "q": query,
+        "data_source": "danjuan_only" if danjuan_only else source,
         "local_symbols": len(LOCAL_SYMBOLS),
         "aliases": len(ALIASES),
         "index_map_mtime": os.path.getmtime(INDEX_MAP_PATH) if os.path.exists(INDEX_MAP_PATH) else 0,
@@ -6857,6 +7106,20 @@ def api_search():
     cached, age = runtime_cache_get("search", cache_payload)
     if cached is not None:
         return jsonify(add_cache_meta(cached, True, age))
+
+    if danjuan_only:
+        # 严格蛋卷模式：搜索阶段不调用 yfinance / AKShare，
+        # 但允许调用蛋卷自己的搜索接口，所以中文名称/简称也能搜到。
+        items = []
+        items.extend(local_danjuan_search(query))
+        try:
+            items.extend(search_danjuan_funds(query, fetch_options_from_cfg(cfg)))
+        except Exception:
+            pass
+        results = dedupe_symbols(items, query)
+        payload = {"ok": True, "results": results[:12], "source_mode": "danjuan_only"}
+        runtime_cache_set("search", cache_payload, payload)
+        return jsonify(add_cache_meta(payload, False))
 
     items = []
     items.extend(local_symbol_search(query))
@@ -6984,8 +7247,8 @@ def api_backtest():
             "version": 19,
             "data": data,
             "cfg": {key: cfg.get(key) for key in [
-                "plan_amount", "strategy_family", "strategy", "strategy_mix", "strategy_family_params", "deviation", "position_mode", "risk_per_trade_pct", "backtest_risk_free_rate_pct",
-                "global_buy_step_pct", "global_sell_step_pct", "global_risk_multiplier", "dca_base_buy_pct",
+                "plan_amount", "strategy_family", "strategy", "strategy_mix", "strategy_family_params", "deviation", "position_mode", "backtest_risk_free_rate_pct",
+                "global_risk_multiplier", "dca_base_buy_pct",
                 "symbol", "symbol_name", "market", "asset_kind", "data_source",
                 "proxy_mode", "proxy_url", "request_timeout_sec", "retry_count",
                 "danjuan_cookie", "valuation_method",
