@@ -1764,26 +1764,66 @@
       return;
     }
 
-    if (host) {
-      host.innerHTML = `<div class="candidate-empty">正在搜索“${escapeHTML(q)}”…</div>`;
-    }
-    // 非空搜索期间也保持下拉栏展开；否则按 Enter 时会先折叠，等结果回来再展开，交互很跳。
-    setSearchOpen(true);
+    const currentDataSource = configForm?.querySelector('[name="data_source"]')?.value || "auto";
     const btn = $("#asset-search-btn");
     const restore = setBusy(btn, "搜索中…");
+    const queryToken = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    searchAsset._token = queryToken;
+
+    function stillCurrent() {
+      return searchAsset._token === queryToken && ($("#asset-search-input")?.value?.trim() || "") === q;
+    }
+
+    if (host) {
+      host.innerHTML = `<div class="candidate-empty">正在读取本地缓存“${escapeHTML(q)}”…</div>`;
+    }
+    setSearchOpen(true);
+
+    let renderedLocal = false;
     try {
-      const currentDataSource = configForm?.querySelector('[name="data_source"]')?.value || "auto";
-      const res = await fetch(`/api/search?q=${encodeURIComponent(q)}&data_source=${encodeURIComponent(currentDataSource)}`);
+      // 第一阶段：只读本地持久化缓存 + 内置映射，立即展示，不联网。
+      const localUrl = `/api/search?q=${encodeURIComponent(q)}&data_source=${encodeURIComponent(currentDataSource)}&local_cache=1`;
+      const localRes = await fetch(localUrl);
+      const localData = await localRes.json();
+      if (localRes.ok && localData.ok !== false && stillCurrent()) {
+        const localResults = localData.results || [];
+        if (localResults.length) {
+          renderCandidates(localResults, q);
+          renderedLocal = true;
+          showToast("已先展示本地缓存结果，正在增量刷新");
+        } else if (host) {
+          host.innerHTML = `<div class="candidate-empty">本地暂无“${escapeHTML(q)}”，正在联网搜索…</div>`;
+        }
+      }
+    } catch (_) {
+      // 本地缓存读取失败不影响联网搜索。
+    }
+
+    try {
+      // 第二阶段：联网增量搜索，后端会把新结果合并写入本地 search_cache.json。
+      const url = `/api/search?q=${encodeURIComponent(q)}&data_source=${encodeURIComponent(currentDataSource)}&refresh=1`;
+      const res = await fetch(url);
       const data = await res.json();
       if (!res.ok || data.ok === false) throw new Error(data.message || "搜索失败");
+      if (!stillCurrent()) return;
       renderCandidates(data.results || [], q);
-      if (data.cache?.hit) showToast("搜索结果来自缓存");
+      if (data.cache?.hit) {
+        showToast("搜索结果来自缓存");
+      } else if (renderedLocal) {
+        showToast("搜索结果已增量刷新并写入本地缓存");
+      }
     } catch (err) {
-      showToast(err.message || "搜索失败", true);
+      if (!renderedLocal) {
+        showToast(err.message || "搜索失败", true);
+        if (host) host.innerHTML = `<div class="candidate-empty">搜索失败：${escapeHTML(err.message || "未知错误")}</div>`;
+      } else {
+        showToast("联网增量刷新失败，已保留本地缓存结果", true);
+      }
     } finally {
-      restore();
+      if (stillCurrent()) restore();
     }
   }
+
 
   function profitName(value) {
     return {

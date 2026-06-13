@@ -49,13 +49,17 @@ INDEX_MAP_PATH = os.path.join(DATA_DIR, "index_map.json")
 HISTORY_CACHE_DIR = os.path.join(DATA_DIR, "history_cache")
 PRICE_HISTORY_CACHE_DIR = os.path.join(HISTORY_CACHE_DIR, "prices")
 VALUATION_HISTORY_CACHE_DIR = os.path.join(HISTORY_CACHE_DIR, "valuations")
+# 前端搜索 / 自动拉取结果的持久化缓存。
+# 搜索缓存用于“先展示本地，再增量联网刷新”；拉取缓存按自然日刷新，避免同一天重复抓行情。
+SEARCH_CACHE_PATH = os.path.join(DATA_DIR, "search_cache.json")
+FETCH_RESULT_CACHE_DIR = os.path.join(DATA_DIR, "fetch_cache")
 
 app = Flask(__name__)
 app.secret_key = "local-trend-risk-position-tool"
 
 # 进程内轻量缓存：同一轮本地使用中，参数完全相同的搜索、拉取、回测、连通性测试不重复执行。
 # 不落盘，不保存原始参数；只用参数摘要作为 key，避免把 Cookie/代理等敏感配置写进缓存索引。
-RUNTIME_CACHE_VERSION = 24
+RUNTIME_CACHE_VERSION = 25
 RUNTIME_CACHE_MAX_ITEMS = 160
 RUNTIME_CACHE_TTL_SEC: Dict[str, int] = {
     "search": 6 * 60 * 60,
@@ -121,6 +125,197 @@ def add_cache_meta(payload: Dict[str, Any], hit: bool, age_sec: int = 0) -> Dict
     out["cache"] = {"hit": bool(hit), "age_sec": int(age_sec)}
     return out
 
+
+def _ensure_cache_dirs() -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(FETCH_RESULT_CACHE_DIR, exist_ok=True)
+
+
+def _read_json_file(path: str, default: Any) -> Any:
+    try:
+        if not os.path.exists(path):
+            return _json_cache_copy(default)
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return _json_cache_copy(default)
+
+
+def _write_json_file_atomic(path: str, value: Any) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(value, f, ensure_ascii=False, indent=2, default=str)
+    os.replace(tmp, path)
+
+
+def _search_cache_query_key(query: str) -> str:
+    return _normalize_query(str(query or ""))[:80]
+
+
+def _search_cache_item_key(item: Dict[str, Any]) -> Tuple[str, str, str, str, str]:
+    return (
+        str(item.get("symbol") or "").strip().upper(),
+        str(item.get("market") or "").strip().upper(),
+        str(item.get("asset_kind") or "").strip().lower(),
+        str(item.get("source") or "").strip().lower(),
+        str(item.get("name") or "").strip(),
+    )
+
+
+def _load_search_cache() -> Dict[str, Any]:
+    data = _read_json_file(SEARCH_CACHE_PATH, {"version": 1, "updated_at": "", "queries": {}, "items": []})
+    if not isinstance(data, dict):
+        data = {"version": 1, "updated_at": "", "queries": {}, "items": []}
+    if not isinstance(data.get("queries"), dict):
+        data["queries"] = {}
+    if not isinstance(data.get("items"), list):
+        data["items"] = []
+    return data
+
+
+def _save_search_cache(data: Dict[str, Any]) -> None:
+    data["version"] = 1
+    data["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # 控制文件大小：保留最近/常见的最多 2000 个候选。
+    items = data.get("items") if isinstance(data.get("items"), list) else []
+    data["items"] = items[-2000:]
+    _write_json_file_atomic(SEARCH_CACHE_PATH, data)
+
+
+def _merge_search_cache_results(query: str, results: List[Dict[str, Any]], source_mode: str = "") -> None:
+    if not results:
+        return
+    qkey = _search_cache_query_key(query)
+    cache = _load_search_cache()
+    old_items = [dict(x) for x in cache.get("items", []) if isinstance(x, dict)]
+    by_key: Dict[Tuple[str, str, str, str, str], Dict[str, Any]] = {}
+    for item in old_items:
+        key = _search_cache_item_key(item)
+        if key[0]:
+            by_key[key] = item
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    query_symbols: List[str] = []
+    for raw in results:
+        item = dict(raw or {})
+        symbol = str(item.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        item["symbol"] = symbol
+        item["name"] = str(item.get("name") or symbol).strip()
+        item["market"] = str(item.get("market") or ("CN" if re.fullmatch(r"\d{6}", symbol) else "US")).strip().upper()
+        item["asset_kind"] = resolve_asset_kind(symbol, item.get("market", ""), item.get("asset_kind", "auto"), item.get("name", ""))
+        item["source"] = str(item.get("source") or source_mode or "auto").strip()
+        item["cached_at"] = now
+        key = _search_cache_item_key(item)
+        by_key[key] = {**by_key.get(key, {}), **item}
+        query_symbols.append(symbol)
+    cache["items"] = list(by_key.values())
+    q = cache["queries"].get(qkey, {}) if isinstance(cache.get("queries"), dict) else {}
+    cache["queries"][qkey] = {
+        "query": query,
+        "source_mode": source_mode,
+        "symbols": sorted(set(list(q.get("symbols", [])) + query_symbols)),
+        "updated_at": now,
+    }
+    _save_search_cache(cache)
+
+
+def _search_from_persistent_cache(query: str, source: str = "auto") -> List[Dict[str, str]]:
+    q = str(query or "").strip()
+    if not q:
+        return []
+    qnorm = _normalize_query(q)
+    source_l = str(source or "auto").strip().lower()
+    cache = _load_search_cache()
+    items = [dict(x) for x in cache.get("items", []) if isinstance(x, dict)]
+    matched: List[Dict[str, str]] = []
+    for item in items:
+        symbol = str(item.get("symbol") or "").strip().upper()
+        name = str(item.get("name") or symbol).strip()
+        if not symbol:
+            continue
+        if is_danjuan_only_source(source_l) and not is_danjuan_nav_like(symbol, item.get("market", "CN"), item.get("asset_kind", "auto"), name):
+            continue
+        haystack = _normalize_query(f"{symbol} {name} {item.get('market','')} {item.get('asset_kind','')}")
+        if qnorm and qnorm not in haystack:
+            continue
+        matched.append({
+            "symbol": symbol,
+            "name": name,
+            "market": str(item.get("market") or ("CN" if re.fullmatch(r"\d{6}", symbol) else "US")).strip().upper(),
+            "asset_kind": str(item.get("asset_kind") or "auto").strip(),
+            "source": str(item.get("source") or "local_cache").strip(),
+        })
+    return dedupe_symbols(matched, q)[:12]
+
+
+def _fetch_cache_file(symbol: str, market: str, asset_kind: str, source: str, cfg: Dict[str, Any], symbol_name: str = "") -> str:
+    key_payload = {
+        "v": 2,
+        "symbol": str(symbol or "").strip().upper(),
+        "market": str(market or "auto").strip().upper(),
+        "asset_kind": str(asset_kind or "auto").strip().lower(),
+        "source": str(source or "auto").strip().lower(),
+        "symbol_name": str(symbol_name or "").strip(),
+        "valuation_method": str(cfg.get("valuation_method") or "system_calc"),
+    }
+    digest = hashlib.sha256(_stable_cache_json(key_payload).encode("utf-8")).hexdigest()[:28]
+    safe_symbol = _cache_safe_part(key_payload["symbol"] or "unknown")
+    return os.path.join(FETCH_RESULT_CACHE_DIR, f"{safe_symbol}__{digest}.json")
+
+
+def _load_daily_fetch_cache(path: str) -> Optional[Dict[str, Any]]:
+    data = _read_json_file(path, None)
+    if not isinstance(data, dict):
+        return None
+    today = date.today().isoformat()
+    if str(data.get("cache_date") or "") != today:
+        return None
+    records = data.get("records")
+    if not isinstance(records, list) or not records:
+        return None
+    return data
+
+
+def _save_daily_fetch_cache(path: str, records: List[Dict[str, Any]], fundamentals: Dict[str, Any], trace: List[Dict[str, Any]], source_used: str, symbol: str, market: str, asset_kind: str, symbol_name: str) -> None:
+    payload = {
+        "version": 2,
+        "cache_date": date.today().isoformat(),
+        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "symbol": symbol,
+        "symbol_name": symbol_name,
+        "market": market,
+        "asset_kind": asset_kind,
+        "source_used": source_used,
+        "records": records,
+        "fundamentals": fundamentals or {},
+        "trace": trace or [],
+    }
+    _write_json_file_atomic(path, payload)
+
+
+def _clear_search_fetch_persistent_cache() -> int:
+    count = 0
+    for path in [SEARCH_CACHE_PATH]:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+                count += 1
+        except Exception:
+            pass
+    try:
+        if os.path.isdir(FETCH_RESULT_CACHE_DIR):
+            for name in os.listdir(FETCH_RESULT_CACHE_DIR):
+                if name.endswith(".json"):
+                    try:
+                        os.remove(os.path.join(FETCH_RESULT_CACHE_DIR, name))
+                        count += 1
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return count
 
 
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -6638,12 +6833,14 @@ def build_backtest_trade_points(trades: List[Dict[str, Any]]) -> List[Dict[str, 
             continue
         price = _safe_float(row.get("成交价"))
         target_pct = _safe_float(row.get("目标仓位%"))
+        trade_pct = _safe_float(row.get("操作占比%"))
         point = {
             "date": date_value,
             "signal_date": str(row.get("信号日") or "")[:10],
             "direction": str(row.get("方向") or ""),
             "price": round(price, 6) if price is not None else None,
             "target_position_pct": round(target_pct, 2) if target_pct is not None else None,
+            "trade_pct": round(trade_pct, 2) if trade_pct is not None else None,
             "asset_pct": str(row.get("当前总资产") or ""),
             "action": str(row.get("操作建议") or ""),
             "rule": str(row.get("命中规则") or ""),
@@ -6835,7 +7032,8 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
                 current_total_asset = cash + shares * price
                 trades.append({
                     "信号日": signal_rec["date"], "执行日": next_rec["date"], "方向": "买入", "成交价": round(price, 4),
-                    "成交金额": round(gross, 2), "当前总资产": backtest_pct(current_total_asset / initial_cash * 100), "目标仓位%": round(target_pos * 100, 2),
+                    "成交金额": round(gross, 2), "操作占比%": round(gross / max(equity_exec, 1e-9) * 100, 2),
+                    "当前总资产": backtest_pct(current_total_asset / initial_cash * 100), "目标仓位%": round(target_pos * 100, 2),
                     "操作建议": payload_result.get("headline", last_signal), "命中规则": payload_metric_value(payload_result, "命中规则"),
                 })
         elif trade_value < 0 and shares > 0:
@@ -6853,7 +7051,8 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
             current_total_asset = cash + shares * price
             trades.append({
                 "信号日": signal_rec["date"], "执行日": next_rec["date"], "方向": "卖出", "成交价": round(price, 4),
-                "成交金额": round(gross, 2), "当前总资产": backtest_pct(current_total_asset / initial_cash * 100), "目标仓位%": round(target_pos * 100, 2),
+                "成交金额": round(gross, 2), "操作占比%": round(gross / max(equity_exec, 1e-9) * 100, 2),
+                "当前总资产": backtest_pct(current_total_asset / initial_cash * 100), "目标仓位%": round(target_pos * 100, 2),
                 "操作建议": payload_result.get("headline", last_signal), "命中规则": payload_metric_value(payload_result, "命中规则"),
             })
 
@@ -7051,13 +7250,18 @@ def index():
 
 @app.post("/api/cache/clear")
 def api_cache_clear():
-    """清空当前进程内的搜索 / 获取信息 / 回测 / 连通性测试缓存。"""
+    """清空当前进程内缓存，以及搜索/自动拉取的持久化缓存。
+
+    注意：不会删除历史回测的行情/估值 CSV 缓存，避免误删长期回测数据。
+    """
     before = len(_RUNTIME_CACHE)
     runtime_cache_clear()
+    persistent = _clear_search_fetch_persistent_cache()
     return jsonify({
         "ok": True,
-        "message": f"已清除全部运行缓存：{before} 条",
+        "message": f"已清除运行缓存 {before} 条；搜索/拉取本地缓存 {persistent} 个文件。历史回测缓存未删除。",
         "cleared": before,
+        "persistent_cleared": persistent,
     })
 
 @app.get("/api/index-map")
@@ -7234,6 +7438,26 @@ def api_search():
     cfg = ensure_config()
     source = str(request.args.get("data_source") or request.args.get("source") or cfg.get("data_source") or "auto").strip().lower()
     danjuan_only = is_danjuan_only_source(source)
+    local_cache_only = str(request.args.get("local_cache") or "").strip().lower() in {"1", "true", "yes"}
+    refresh = str(request.args.get("refresh") or "").strip().lower() in {"1", "true", "yes"}
+
+    if local_cache_only:
+        # 前端增量搜索第一阶段：立即返回本地持久化缓存 + 内置映射，不联网。
+        items = []
+        if danjuan_only:
+            items.extend(local_danjuan_search(query))
+        else:
+            items.extend(local_symbol_search(query))
+        items.extend(_search_from_persistent_cache(query, "danjuan_only" if danjuan_only else source))
+        results = dedupe_symbols(items, query)
+        return jsonify({
+            "ok": True,
+            "results": results[:12],
+            "source_mode": "danjuan_only" if danjuan_only else source,
+            "cache": {"hit": bool(results), "persistent": True, "local_only": True},
+            "partial": True,
+        })
+
     cache_payload = {
         "q": query,
         "data_source": "danjuan_only" if danjuan_only else source,
@@ -7241,8 +7465,15 @@ def api_search():
         "aliases": len(ALIASES),
         "index_map_mtime": os.path.getmtime(INDEX_MAP_PATH) if os.path.exists(INDEX_MAP_PATH) else 0,
     }
-    cached, age = runtime_cache_get("search", cache_payload)
+    cached = None
+    age = 0
+    # refresh=1 用于增量搜索第二阶段：绕过进程缓存，强制合并最新网络结果到本地。
+    if not refresh:
+        cached, age = runtime_cache_get("search", cache_payload)
     if cached is not None:
+        # 即使命中进程缓存，也额外合并本地持久化结果，避免重启前后的候选不一致。
+        cached_results = dedupe_symbols(list(cached.get("results") or []) + _search_from_persistent_cache(query, "danjuan_only" if danjuan_only else source), query)
+        cached["results"] = cached_results[:12]
         return jsonify(add_cache_meta(cached, True, age))
 
     if danjuan_only:
@@ -7250,17 +7481,20 @@ def api_search():
         # 但允许调用蛋卷自己的搜索接口，所以中文名称/简称也能搜到。
         items = []
         items.extend(local_danjuan_search(query))
+        items.extend(_search_from_persistent_cache(query, "danjuan_only"))
         try:
             items.extend(search_danjuan_funds(query, fetch_options_from_cfg(cfg)))
         except Exception:
             pass
         results = dedupe_symbols(items, query)
         payload = {"ok": True, "results": results[:12], "source_mode": "danjuan_only"}
+        _merge_search_cache_results(query, results, "danjuan_only")
         runtime_cache_set("search", cache_payload, payload)
         return jsonify(add_cache_meta(payload, False))
 
     items = []
     items.extend(local_symbol_search(query))
+    items.extend(_search_from_persistent_cache(query, source))
     # 本地候选优先；在线搜索失败不影响功能。
     try:
         items.extend(search_yfinance(query))
@@ -7279,6 +7513,7 @@ def api_search():
         results.append({"symbol": query.upper(), "name": query.upper(), "market": "CN", "asset_kind": fallback_kind, "source": "akshare"})
 
     payload = {"ok": True, "results": results[:12]}
+    _merge_search_cache_results(query, results, source)
     runtime_cache_set("search", cache_payload, payload)
     return jsonify(add_cache_meta(payload, False))
 
@@ -7336,22 +7571,69 @@ def api_fetch():
         for key in ["proxy_mode", "proxy_url", "request_timeout_sec", "retry_count", "danjuan_cookie", "valuation_method", "current_profit_pct", "current_position_amount", "plan_amount", "symbol_name"]:
             if key in data:
                 cfg[key] = data.get(key)
+
+        fetch_cache_path = _fetch_cache_file(symbol, market, asset_kind, source, cfg, symbol_name)
+        force_refresh = str(data.get("force_refresh") or "").strip().lower() in {"1", "true", "yes"}
+
+        # 每日持久化缓存：同一自然日内，行情/净值和估值原始结果不重复联网。
+        # 注意这里只缓存 records/fundamentals，不缓存最终 indicators；当前仓位、盈亏等用户输入仍然每次即时重算。
+        daily_cache = None if force_refresh else _load_daily_fetch_cache(fetch_cache_path)
+        if daily_cache is not None:
+            records = daily_cache.get("records") or []
+            fundamentals = daily_cache.get("fundamentals") or {}
+            source_used = str(daily_cache.get("source_used") or source)
+            saved_at = str(daily_cache.get("saved_at") or daily_cache.get("cache_date") or "")
+            trace = list(daily_cache.get("trace") or [])
+            trace.append({
+                "source": "local_daily_fetch_cache",
+                "ok": True,
+                "rows": len(records),
+                "elapsed_ms": 0,
+                "message": f"本地日缓存命中：{saved_at}",
+            })
+            indicators = compute_indicators(records, fundamentals)
+            indicators = enrich_indicators_with_user_position(indicators, cfg)
+            indicators["source_used"] = f"local_daily_cache:{source_used}"
+            indicators["fetch_trace"] = trace
+            indicators["proxy_mode"] = cfg.get("proxy_mode", "system")
+            chart_series = build_trend_chart_series(records)
+            payload = {
+                "ok": True,
+                "symbol": symbol,
+                "market": market,
+                "asset_kind": asset_kind,
+                "source": f"local_daily_cache:{source_used}",
+                "trace": trace,
+                "indicators": indicators,
+                "chart_series": chart_series,
+                "chart_meta": {
+                    "rows": len(chart_series),
+                    "start": chart_series[0].get("date") if chart_series else "",
+                    "end": chart_series[-1].get("date") if chart_series else "",
+                    "cache_date": daily_cache.get("cache_date"),
+                },
+                "message": f"数据已从本地日缓存读取：{source_used}。同一天不会重复联网，当前仓位/盈亏已重新计算。",
+                "persistent_cache": {"hit": True, "cache_date": daily_cache.get("cache_date"), "path": os.path.relpath(fetch_cache_path, APP_DIR)},
+            }
+            return jsonify(add_cache_meta(payload, True, 0))
+
         cache_payload = {
             "symbol": symbol,
             "market": market,
             "asset_kind": asset_kind,
             "source": source,
             "symbol_name": symbol_name,
-            "request": data,
+            "request": {k: v for k, v in data.items() if k != "force_refresh"},
             "cfg": {key: cfg.get(key) for key in ["proxy_mode", "proxy_url", "request_timeout_sec", "retry_count", "danjuan_cookie", "valuation_method", "current_profit_pct", "current_position_amount", "plan_amount", "symbol_name"]},
         }
-        cached, age = runtime_cache_get("fetch", cache_payload)
+        cached, age = (None, 0) if force_refresh else runtime_cache_get("fetch", cache_payload)
         if cached is not None:
             cached = add_cache_meta(cached, True, age)
-            cached["message"] = f"数据已从缓存读取：{cached.get('source') or source}。参数未变化，未重复拉取。"
+            cached["message"] = f"数据已从进程缓存读取：{cached.get('source') or source}。参数未变化，未重复拉取。"
             return jsonify(cached)
 
         records, fundamentals, trace, source_used = fetch_market_data(symbol, market, asset_kind, source, cfg)
+        _save_daily_fetch_cache(fetch_cache_path, records, fundamentals, trace, source_used, symbol, market, asset_kind, symbol_name)
         indicators = compute_indicators(records, fundamentals)
         indicators = enrich_indicators_with_user_position(indicators, cfg)
         indicators["source_used"] = source_used
@@ -7371,8 +7653,10 @@ def api_fetch():
                 "rows": len(chart_series),
                 "start": chart_series[0].get("date") if chart_series else "",
                 "end": chart_series[-1].get("date") if chart_series else "",
+                "cache_date": date.today().isoformat(),
             },
-            "message": f"数据已获取：{source_used} 成功。已自动填入中间表单；你可以手动覆盖。",
+            "persistent_cache": {"hit": False, "saved": True, "cache_date": date.today().isoformat(), "path": os.path.relpath(fetch_cache_path, APP_DIR)},
+            "message": f"数据已获取：{source_used} 成功。已写入本地日缓存，并自动填入中间表单；你可以手动覆盖。",
         }
         runtime_cache_set("fetch", cache_payload, payload)
         return jsonify(add_cache_meta(payload, False))

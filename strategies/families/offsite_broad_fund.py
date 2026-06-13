@@ -7,6 +7,7 @@
 策略纯净性：
 - 主要读取净值趋势、均线、估值百分位、回撤、波动、RSI/MACD/BOLL、ROE。
 - 不使用成交量作为核心买卖依据；场外基金没有真实成交量，volume_confirm / pullback_volume_dry 默认不参与。
+- 不要求用户手动选择宽基类型；根据 cfg.symbol_name / cfg.symbol / cfg.asset_kind 自动识别普通宽基、全球核心、成长高波动、价值红利等 profile。
 - 输出的是目标仓位 0~1，不是本次买卖比例。
 """
 from __future__ import annotations
@@ -152,41 +153,7 @@ STYLE_PARAM_SCHEMA: List[Dict[str, Any]] = [
 ]
 
 
-INPUT_SCHEMA: List[Dict[str, Any]] = [
-    {
-        "title": "② 场外宽基设置",
-        "pill": "场外宽基",
-        "tone": "neutral",
-        "desc": "这些输入只属于场外宽基基金策略；不使用成交量作为核心买卖依据。",
-        "fields": [
-            {
-                "name": "offsite_fund_type",
-                "label": "宽基类型",
-                "type": "choice",
-                "default": "standard",
-                "tip": "不同宽基的估值容忍度和波动惩罚不同；不选时按普通宽基处理。",
-                "options": [
-                    ["standard", "普通宽基", "wait", "适合沪深300、中证500等普通宽基。"],
-                    ["global_core", "全球核心/标普500", "buy", "对高估值稍宽容，但仍保留趋势风控。"],
-                    ["growth", "高波动成长/纳指/创业板/科创", "buy-strong", "提高波动和过热惩罚，避免追高。"],
-                    ["value", "价值/红利/上证50", "wait", "更重视估值和回撤性价比。"],
-                ],
-            },
-            {
-                "name": "offsite_manual_bias",
-                "label": "手动修正",
-                "type": "choice",
-                "default": "",
-                "tip": "只做轻微修正，不能覆盖估值和趋势纪律。再次点击选项可取消。",
-                "options": [
-                    ["1", "额外偏多", "buy", "有策略外理由支持提高仓位。"],
-                    ["-1", "额外偏空", "sell", "有策略外风险需要降低仓位。"],
-                ],
-            },
-            {"name": "offsite_extra_risk", "label": "基金/汇率/限购/跟踪误差异常", "type": "checkbox", "default": False, "tip": "QDII限购、汇率异常、跟踪误差扩大、数据明显异常等情况勾选。"},
-        ],
-    },
-]
+INPUT_SCHEMA: List[Dict[str, Any]] = []
 
 
 def _num(signals: Dict[str, Any], key: str) -> Optional[float]:
@@ -234,16 +201,25 @@ def _lerp(a: float, b: float, t: float) -> float:
     return a + (b - a) * clamp(t, 0.0, 1.0)
 
 
-def _manual_bias(signals: Dict[str, Any]) -> int:
-    raw = str(signals.get("offsite_manual_bias", "") or "").strip()
-    if raw in {"-1", "0", "1"}:
-        return int(raw)
-    return 0
+def _fund_profile(cfg: Dict[str, Any]) -> str:
+    """根据标的名称/代码自动识别宽基属性，不要求用户手动输入。"""
+    text = f"{cfg.get('symbol_name') or ''} {cfg.get('symbol') or ''} {cfg.get('asset_kind') or ''}".lower()
+    if any(key in text for key in ["纳指", "nasdaq", "qqq", "ndx", "创业", "科创", "科技", "互联网", "100etf联接"]):
+        return "growth"
+    if any(key in text for key in ["标普", "sp500", "s&p", "spx", "spy", "全球", "msci", "海外", "qdii"]):
+        return "global_core"
+    if any(key in text for key in ["红利", "价值", "上证50", "50etf", "银行", "低波", "央企"]):
+        return "value"
+    return "standard"
 
 
-def _fund_type(signals: Dict[str, Any]) -> str:
-    raw = str(signals.get("offsite_fund_type", "standard") or "standard").strip()
-    return raw if raw in {"standard", "global_core", "growth", "value"} else "standard"
+def _fund_profile_label(profile: str) -> str:
+    return {
+        "standard": "普通宽基",
+        "global_core": "全球核心/标普500/QDII",
+        "growth": "高波动成长/纳指/创业板/科创",
+        "value": "价值/红利/上证50",
+    }.get(profile, "普通宽基")
 
 
 def _valuation_cap(high: float, style: Dict[str, Any], pe: Optional[float]) -> float:
@@ -284,7 +260,7 @@ def target_weight(cfg: Dict[str, Any], signals: Dict[str, Any]) -> Tuple[float, 
 
     market = str(signals.get("market_state", "sideways") or "sideways")
     exit_state = str(signals.get("exit_state", "none") or "none")
-    fund_type = _fund_type(signals)
+    fund_type = _fund_profile(cfg)
 
     trend_weight = _pct_param(style, "trend_weight_pct", 100.0)
     valuation_weight = _pct_param(style, "valuation_weight_pct", 100.0)
@@ -296,15 +272,17 @@ def target_weight(cfg: Dict[str, Any], signals: Dict[str, Any]) -> Tuple[float, 
     if fund_type == "global_core":
         valuation_weight *= 0.86
         vol_penalty *= 0.92
-        notes.append("宽基类型为全球核心/标普500：估值和波动惩罚略放宽，但仍保留趋势纪律。")
+        notes.append("自动识别为全球核心/标普500/QDII：估值和波动惩罚略放宽，但仍保留趋势纪律。")
     elif fund_type == "growth":
         vol_penalty *= 1.18
         overheat_reduce *= 1.20
-        notes.append("宽基类型为高波动成长：提高波动和过热惩罚，避免净值大幅拉升后追高。")
+        notes.append("自动识别为高波动成长宽基：提高波动和过热惩罚，避免净值大幅拉升后追高。")
     elif fund_type == "value":
         valuation_weight *= 1.12
         drawdown_weight *= 1.08
-        notes.append("宽基类型为价值/红利/上证50：更重视估值分位和回撤性价比。")
+        notes.append("自动识别为价值/红利类宽基：更重视估值分位和回撤性价比。")
+    else:
+        notes.append("自动识别为普通宽基基金：按低频均衡配置规则执行。")
 
     base_table = style.get("core_base") or {
         "bear": 0.06,
@@ -425,11 +403,9 @@ def target_weight(cfg: Dict[str, Any], signals: Dict[str, Any]) -> Tuple[float, 
         notes.append(f"净值短期过热，降低追买力度 {pct2(reduce)}。")
 
     # 7) 风险事件 / 退出状态。
-    extra_risk = _bool_signal(signals, "offsite_extra_risk")
+    # 不再要求用户手动勾选基金/汇率/限购等主观项；只读取系统通用 market_risk。
+    extra_risk = False
     market_risk = _bool_signal(signals, "market_risk")
-    if extra_risk:
-        target -= 0.06
-        notes.append("出现基金/汇率/限购/跟踪误差等额外风险，目标仓位下调。")
     if market_risk:
         target -= 0.06
         notes.append("同类资产或大盘同步走弱，策略降低风险暴露。")
@@ -443,14 +419,6 @@ def target_weight(cfg: Dict[str, Any], signals: Dict[str, Any]) -> Tuple[float, 
     elif exit_state == "below_20":
         target -= 0.03
         notes.append("跌破20日线只视为短期降温，场外基金不因短线波动大幅卖出。")
-
-    manual = _manual_bias(signals)
-    if manual > 0:
-        target += 0.04
-        notes.append("手动修正偏多，目标仓位轻微上调。")
-    elif manual < 0:
-        target -= 0.04
-        notes.append("手动修正偏空，目标仓位轻微下调。")
 
     # 风险倍率只拉伸偏离中性仓位的幅度，不直接整体乘目标，避免过度极端。
     risk_mult = clamp(float(style.get("risk_multiplier", 1.0) or 1.0), 0.1, 5.0)
@@ -491,7 +459,7 @@ def target_weight(cfg: Dict[str, Any], signals: Dict[str, Any]) -> Tuple[float, 
     data_bonus = min(coverage, 7) * 2
     confidence = int(clamp(56 + abs(target - 0.32) * 55 + data_bonus, 55, 86))
 
-    signals["strategy_match_label"] = f"场外宽基：{regime}"
+    signals["strategy_match_label"] = f"场外宽基：{regime}（{_fund_profile_label(fund_type)}）"
     signals["strategy_confidence"] = confidence
 
     if not notes:

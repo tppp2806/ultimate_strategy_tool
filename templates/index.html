@@ -462,6 +462,7 @@
     <div id="trend-chart-kpis" class="trend-chart-kpis"></div>
     <div class="trend-chart-body">
       <canvas id="trend-chart-canvas" aria-label="净值和均线趋势图"></canvas>
+      <div id="trend-chart-hover-card" class="trend-chart-hover-card" hidden></div>
       <div id="trend-chart-empty" class="empty compact-empty" hidden>暂无趋势图数据。请先点击“拉取所选标的数据”。</div>
     </div>
   </section>
@@ -662,6 +663,27 @@
   border-radius: 14px;
   background: #fffdfa;
 }
+.trend-chart-hover-card {
+  position: absolute;
+  right: 26px;
+  bottom: 26px;
+  z-index: 4;
+  width: min(320px, calc(100% - 52px));
+  min-height: 48px;
+  padding: 10px 12px;
+  border: 1px solid rgba(86, 67, 50, .18);
+  border-radius: 12px;
+  background: rgba(255, 250, 242, .97);
+  color: #3d3026;
+  box-shadow: 0 12px 28px rgba(43, 30, 19, .18);
+  pointer-events: none;
+  font-size: 12px;
+  line-height: 1.55;
+  backdrop-filter: blur(2px);
+}
+.trend-chart-hover-card strong { display: block; margin-bottom: 4px; color: #2f241d; font-size: 13px; }
+.trend-chart-hover-card .muted { color: var(--muted); }
+.trend-chart-hover-card .reason-text { color: #4a382a; word-break: break-word; }
 #trend-chart-empty {
   position: absolute;
   inset: 12px 16px 16px;
@@ -881,6 +903,8 @@ input[type="range"]::-moz-range-thumb {
   let lastChartMeta = {};
   let lastChartTrades = [];
   let lastChartMode = "auto";
+  let trendChartTradeMarkers = [];
+  let trendChartHoverMarkerId = "";
 
   const $ = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
@@ -1127,6 +1151,7 @@ input[type="range"]::-moz-range-thumb {
       direction: String(row?.direction || row?.方向 || ""),
       price: finiteNumber(row?.price ?? row?.成交价),
       target_position_pct: finiteNumber(row?.target_position_pct ?? row?.["目标仓位%"]),
+      trade_pct: finiteNumber(row?.trade_pct ?? row?.["操作占比%"]),
       asset_pct: String(row?.asset_pct || row?.["当前总资产"] || ""),
       action: String(row?.action || row?.操作建议 || ""),
       rule: String(row?.rule || row?.命中规则 || ""),
@@ -1155,6 +1180,8 @@ input[type="range"]::-moz-range-thumb {
   }
   function setBacktestTrendChartData(series = [], trades = [], meta = {}) {
     lastChartMode = "backtest";
+    trendChartHoverMarkerId = "";
+    hideTrendChartHoverCard();
     lastChartSeries = normaliseChartSeries(series);
     lastChartTrades = normaliseChartTrades(trades);
     lastChartMeta = meta && typeof meta === "object" ? meta : {};
@@ -1200,6 +1227,114 @@ input[type="range"]::-moz-range-thumb {
       <div class="trend-chart-kpi"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>
     `).join("");
   }
+  function hideTrendChartHoverCard() {
+    const card = $("#trend-chart-hover-card");
+    if (card) {
+      card.hidden = true;
+      card.innerHTML = "";
+    }
+  }
+  function showTrendChartHoverCard(marker) {
+    const card = $("#trend-chart-hover-card");
+    if (!card || !marker) return;
+    const reason = String(marker.trade?.rule || marker.trade?.action || "暂无操作原因").trim() || "暂无操作原因";
+    card.innerHTML = `
+      <strong>操作原因</strong>
+      <div class="reason-text">${escapeHtml(reason)}</div>
+    `;
+    card.hidden = false;
+  }
+  function markerDisplayWeight(marker) {
+    const tradePct = Number.isFinite(marker?.tradePct) ? Math.abs(marker.tradePct) : null;
+    const targetPct = Number.isFinite(marker?.pct) ? Math.abs(marker.pct) : null;
+    if (Number.isFinite(tradePct)) return tradePct;
+    if (Number.isFinite(targetPct)) return targetPct;
+    return -Infinity;
+  }
+  function markDefaultTradeLabels(markers) {
+    if (!Array.isArray(markers) || !markers.length) return;
+    const sorted = markers
+      .slice()
+      .sort((a, b) => markerDisplayWeight(b) - markerDisplayWeight(a) || a.x - b.x || a.y - b.y);
+    const visibleCount = markers.length <= 8
+      ? markers.length
+      : Math.min(10, Math.max(3, Math.ceil(markers.length * 0.25)));
+    const keepIds = new Set(sorted.slice(0, visibleCount).map(item => item.id));
+    for (const marker of markers) marker.defaultLabel = keepIds.has(marker.id);
+  }
+  function buildTradeMarkers(ctx, xFor, yFor, pad, plotW, plotH) {
+    if (lastChartMode !== "backtest" || !lastChartTrades.length) return [];
+    const dateIndex = new Map(lastChartSeries.map((row, idx) => [row.date, idx]));
+    const nearestIndexForDate = date => {
+      if (dateIndex.has(date)) return dateIndex.get(date);
+      const t = Date.parse(date);
+      if (!Number.isFinite(t)) return -1;
+      let best = -1;
+      let bestDelta = Infinity;
+      for (let idx = 0; idx < lastChartSeries.length; idx++) {
+        const rt = Date.parse(lastChartSeries[idx].date);
+        if (!Number.isFinite(rt)) continue;
+        const delta = Math.abs(rt - t);
+        if (delta < bestDelta) {
+          bestDelta = delta;
+          best = idx;
+        }
+      }
+      return best;
+    };
+    const markers = [];
+    for (const trade of lastChartTrades) {
+      const idx = nearestIndexForDate(trade.date);
+      if (idx < 0) continue;
+      const row = lastChartSeries[idx];
+      const price = finiteNumber(trade.price) ?? finiteNumber(row.close);
+      if (price === null) continue;
+      const x = xFor(idx);
+      const y = yFor(price);
+      const isSell = /卖|减|清/.test(trade.direction);
+      const color = isSell ? "#c24135" : "#138a4f";
+      const pct = finiteNumber(trade.target_position_pct);
+      const tradePct = finiteNumber(trade.trade_pct);
+      const displayPct = tradePct ?? pct;
+      const label = `${isSell ? "卖" : "买"}${displayPct === null ? "" : ` ${displayPct.toFixed(0)}%`}`;
+      const labelY = Math.max(pad.top + 12, Math.min(pad.top + plotH - 12, y + (isSell ? -20 : 20)));
+      markers.push({
+        id: `${trade.date}-${trade.direction}-${trade.action || ''}-${markers.length}`,
+        trade, idx, x, y, isSell, color, pct, tradePct, label, labelY, radius: 5.5, defaultLabel: true
+      });
+    }
+    markers.sort((a, b) => a.x - b.x || a.y - b.y);
+    markDefaultTradeLabels(markers);
+    return markers;
+  }
+  function drawTradeMarker(ctx, marker, opts = {}) {
+    const {showLabel = false, emphasise = false} = opts;
+    ctx.save();
+    ctx.fillStyle = marker.color;
+    ctx.strokeStyle = "#fffdfa";
+    ctx.lineWidth = emphasise ? 3 : 2;
+    ctx.beginPath();
+    ctx.arc(marker.x, marker.y, emphasise ? marker.radius + 1.5 : marker.radius, 0, Math.PI * 2);
+    ctx.closePath();
+    ctx.stroke();
+    ctx.fill();
+    if (showLabel) {
+      ctx.font = emphasise ? "12px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" : "11px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      const textW = ctx.measureText(marker.label).width + 12;
+      const boxH = emphasise ? 20 : 18;
+      const boxY = marker.labelY - boxH / 2;
+      ctx.fillStyle = "rgba(255, 253, 250, .92)";
+      ctx.fillRect(marker.x - textW / 2, boxY, textW, boxH);
+      ctx.strokeStyle = emphasise ? "rgba(86, 67, 50, .28)" : "rgba(86, 67, 50, .18)";
+      ctx.strokeRect(marker.x - textW / 2, boxY, textW, boxH);
+      ctx.fillStyle = marker.color;
+      ctx.fillText(marker.label, marker.x, marker.labelY);
+    }
+    ctx.restore();
+  }
+
   function drawTrendEmpty(ctx, w, h, text) {
     ctx.clearRect(0, 0, w, h);
     ctx.fillStyle = "#fffdfa";
@@ -1334,66 +1469,23 @@ input[type="range"]::-moz-range-thumb {
       }
     }
 
+    trendChartTradeMarkers = [];
     if (lastChartMode === "backtest" && lastChartTrades.length) {
-      const dateIndex = new Map(lastChartSeries.map((row, idx) => [row.date, idx]));
-      const nearestIndexForDate = date => {
-        if (dateIndex.has(date)) return dateIndex.get(date);
-        const t = Date.parse(date);
-        if (!Number.isFinite(t)) return -1;
-        let best = -1;
-        let bestDelta = Infinity;
-        for (let idx = 0; idx < lastChartSeries.length; idx++) {
-          const rt = Date.parse(lastChartSeries[idx].date);
-          if (!Number.isFinite(rt)) continue;
-          const delta = Math.abs(rt - t);
-          if (delta < bestDelta) {
-            bestDelta = delta;
-            best = idx;
-          }
-        }
-        return best;
-      };
-      ctx.font = "11px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
-      ctx.textAlign = "center";
-      ctx.textBaseline = "middle";
-      for (const trade of lastChartTrades) {
-        const idx = nearestIndexForDate(trade.date);
-        if (idx < 0) continue;
-        const row = lastChartSeries[idx];
-        const price = finiteNumber(trade.price) ?? finiteNumber(row.close);
-        if (price === null) continue;
-        const x = xFor(idx);
-        const y = yFor(price);
-        const isSell = /卖|减|清/.test(trade.direction);
-        const color = isSell ? "#c24135" : "#138a4f";
-        ctx.fillStyle = color;
-        ctx.strokeStyle = "#fffdfa";
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        if (isSell) {
-          ctx.moveTo(x, y + 7);
-          ctx.lineTo(x - 7, y - 6);
-          ctx.lineTo(x + 7, y - 6);
-        } else {
-          ctx.moveTo(x, y - 7);
-          ctx.lineTo(x - 7, y + 6);
-          ctx.lineTo(x + 7, y + 6);
-        }
-        ctx.closePath();
-        ctx.stroke();
-        ctx.fill();
-
-        const pct = finiteNumber(trade.target_position_pct);
-        const label = `${isSell ? "卖" : "买"}${pct === null ? "" : ` ${pct.toFixed(0)}%`}`;
-        const labelY = Math.max(pad.top + 10, Math.min(pad.top + plotH - 10, y + (isSell ? -18 : 18)));
-        const textW = ctx.measureText(label).width + 10;
-        ctx.fillStyle = "rgba(255, 253, 250, .86)";
-        ctx.fillRect(x - textW / 2, labelY - 9, textW, 18);
-        ctx.strokeStyle = "rgba(86, 67, 50, .18)";
-        ctx.strokeRect(x - textW / 2, labelY - 9, textW, 18);
-        ctx.fillStyle = color;
-        ctx.fillText(label, x, labelY);
+      trendChartTradeMarkers = buildTradeMarkers(ctx, xFor, yFor, pad, plotW, plotH);
+      const hoveredId = trendChartHoverMarkerId;
+      const hoverMarker = hoveredId ? trendChartTradeMarkers.find(item => item.id === hoveredId) : null;
+      for (const marker of trendChartTradeMarkers) {
+        const showLabel = marker.defaultLabel || (hoverMarker && hoverMarker.id === marker.id);
+        if (hoverMarker && hoverMarker.id === marker.id) continue;
+        drawTradeMarker(ctx, marker, {showLabel, emphasise: false});
       }
+      if (hoverMarker) {
+        drawTradeMarker(ctx, hoverMarker, {showLabel: true, emphasise: true});
+      } else {
+        hideTrendChartHoverCard();
+      }
+    } else {
+      hideTrendChartHoverCard();
     }
   }
   function openTrendChartModal() {
@@ -1403,6 +1495,8 @@ input[type="range"]::-moz-range-thumb {
   }
   function openAutoTrendChartModal() {
     lastChartMode = "auto";
+    trendChartHoverMarkerId = "";
+    hideTrendChartHoverCard();
     lastChartSeries = autoChartSeries.slice();
     lastChartTrades = [];
     lastChartMeta = Object.assign({}, autoChartMeta);
@@ -1416,7 +1510,65 @@ input[type="range"]::-moz-range-thumb {
   function closeTrendChartModal() {
     const modal = $("#trend-chart-modal");
     if (modal) modal.hidden = true;
+    trendChartHoverMarkerId = "";
+    hideTrendChartHoverCard();
   }
+  function findTrendChartMarkerAt(canvas, evt) {
+    if (!canvas || !trendChartTradeMarkers.length) return null;
+    const rect = canvas.getBoundingClientRect();
+    const x = evt.clientX - rect.left;
+    const y = evt.clientY - rect.top;
+    let hit = null;
+    let best = Infinity;
+    for (const marker of trendChartTradeMarkers) {
+      const dx = x - marker.x;
+      const dy = y - marker.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      const hitRadius = Math.max(marker.radius + 5, 10);
+      if (dist <= hitRadius && dist < best) {
+        hit = marker;
+        best = dist;
+      }
+    }
+    return hit;
+  }
+  document.addEventListener("mousemove", event => {
+    const canvas = $("#trend-chart-canvas");
+    const modal = $("#trend-chart-modal");
+    if (!canvas || !modal || modal.hidden || lastChartMode !== "backtest") return;
+    const rect = canvas.getBoundingClientRect();
+    const within = event.clientX >= rect.left && event.clientX <= rect.right && event.clientY >= rect.top && event.clientY <= rect.bottom;
+    if (!within) {
+      if (trendChartHoverMarkerId) {
+        trendChartHoverMarkerId = "";
+        canvas.style.cursor = "default";
+        hideTrendChartHoverCard();
+        drawTrendChart();
+      }
+      return;
+    }
+    const marker = findTrendChartMarkerAt(canvas, event);
+    const nextId = marker?.id || "";
+    canvas.style.cursor = marker ? "pointer" : "default";
+    if (nextId !== trendChartHoverMarkerId) {
+      trendChartHoverMarkerId = nextId;
+      drawTrendChart();
+      if (marker) showTrendChartHoverCard(marker);
+      else hideTrendChartHoverCard();
+    } else if (marker) {
+      showTrendChartHoverCard(marker);
+    }
+  }, true);
+  document.addEventListener("mouseleave", event => {
+    if (event.target?.id !== "trend-chart-canvas") return;
+    const canvas = event.target;
+    if (trendChartHoverMarkerId) {
+      trendChartHoverMarkerId = "";
+      canvas.style.cursor = "default";
+      hideTrendChartHoverCard();
+      drawTrendChart();
+    }
+  }, true);
   window.addEventListener("resize", () => {
     if (!$("#trend-chart-modal")?.hidden) drawTrendChart();
   });
