@@ -109,10 +109,16 @@ def _pct_param(strategy: Dict[str, Any], key: str, default: float) -> float:
 
 
 def _current_position(cfg: Dict[str, Any]) -> float:
-    """与主程序保持一致：当前仓位按“已占用计划本金 / 计划资金”计算。
+    """与主程序保持一致：当前仓位按“持仓市值 / 当前实际总资产”计算。
 
-    current_position_amount 是当前持仓市值；current_profit_pct 用于反推本金占用。
-    这样简易均线策略在实时计算和回测里都使用同一套仓位口径。
+    计划金额 = 用户最多愿意投入的外部本金上限。
+    当前实际总资产 = 计划金额 + 当前累计盈亏。
+    当前累计盈亏通过 current_position_amount 与 current_profit_pct 反推：
+    已投入本金 = 当前持仓市值 / (1 + 当前盈亏率)，
+    当前累计盈亏 = 当前持仓市值 - 已投入本金。
+
+    这样简易均线的买入/卖出幅度以真实风险仓位为基准，不再把
+    “已投入本金占用”误当成当前仓位，避免低于均线时算出反向减仓。
     """
     try:
         plan = max(float(cfg.get("plan_amount") or 0.0), 0.0)
@@ -120,7 +126,9 @@ def _current_position(cfg: Dict[str, Any]) -> float:
         profit_pct = float(cfg.get("current_profit_pct") or 0.0)
         profit_factor = max(1.0 + profit_pct / 100.0, 0.0001)
         cost_amount = market_amount / profit_factor
-        return clamp(cost_amount / plan, 0.0, 0.9999) if plan > 0 else 0.0
+        pnl_amount = market_amount - cost_amount
+        equity_amount = max(plan + pnl_amount, 0.0)
+        return clamp(market_amount / equity_amount, 0.0, 2.0) if equity_amount > 0 else 0.0
     except Exception:
         return 0.0
 

@@ -832,14 +832,14 @@ def current_profit_factor(cfg: Dict[str, Any]) -> float:
     """持仓市值 / 已投入本金。
 
     例：当前持仓市值 50，持仓盈亏 +100%，说明已投入本金是 25。
-    因此剩余计划资金不是 100 - 50，而是 100 - 25。
+    这个值只用于反推“已占用的外部计划本金”和“累计盈亏”。
     """
     profit_pct = clamp(as_float(cfg.get("current_profit_pct"), 0.0), -99.99, 9999.0)
     return max(1.0 + profit_pct / 100.0, 0.0001)
 
 
 def current_position_cost_amount(cfg: Dict[str, Any]) -> float:
-    """当前持仓占用的计划本金。
+    """当前持仓占用的外部计划本金。
 
     current_position_amount 是当前市值；结合持仓盈亏率反推本金占用：
     已投入本金 = 当前持仓市值 / (1 + 持仓盈亏率)。
@@ -847,20 +847,36 @@ def current_position_cost_amount(cfg: Dict[str, Any]) -> float:
     return current_position_market_amount(cfg) / current_profit_factor(cfg)
 
 
+def current_position_pnl_amount(cfg: Dict[str, Any]) -> float:
+    """当前累计盈亏 = 当前持仓市值 - 已投入外部本金。"""
+    return current_position_market_amount(cfg) - current_position_cost_amount(cfg)
+
+
+def current_account_equity_amount(cfg: Dict[str, Any]) -> float:
+    """当前实际本金/总资产口径：计划金额 + 当前累计盈亏。
+
+    计划金额表示用户最多愿意投入的外部本金上限；盈利后实际可管理资产应随盈利增加，
+    亏损后实际可管理资产应随亏损减少。
+    """
+    plan = max(as_float(cfg.get("plan_amount"), 0.0), 0.0)
+    equity = plan + current_position_pnl_amount(cfg)
+    return max(equity, 0.0)
+
+
 def remaining_plan_cash_amount(cfg: Dict[str, Any]) -> float:
+    """剩余可投入外部本金，不含已浮盈部分。"""
     plan = max(as_float(cfg.get("plan_amount"), 0.0), 0.0)
     return max(plan - current_position_cost_amount(cfg), 0.0)
 
 
 def current_position(cfg: Dict[str, Any]) -> float:
-    """当前仓位按“已占用计划本金 / 计划资金”计算，而不是直接用持仓市值。
+    """当前仓位按“当前持仓市值 / 当前实际总资产”计算。
 
-    这样盈利后的持仓不会错误占用未投入资金；例如计划资金 100、
-    当前持仓市值 50、盈亏 +100%，当前仓位为 25%，剩余计划资金为 75。
+    当前实际总资产 = 计划金额 + 当前累计盈亏。
+    这与历史回测中的 equity = 现金 + 持仓市值保持同一口径。
     """
-    plan = max(as_float(cfg.get("plan_amount"), 0.0), 0.0)
-    current_cost = current_position_cost_amount(cfg)
-    return clamp(current_cost / plan, 0.0, 2.0) if plan > 0 else 0.0
+    equity = current_account_equity_amount(cfg)
+    return clamp(current_position_market_amount(cfg) / equity, 0.0, 2.0) if equity > 0 else 0.0
 
 
 
@@ -1754,24 +1770,7 @@ def raw_target_by_signal(cfg: Dict[str, Any], signals: Dict[str, Any], cur: floa
             reason.append("20日线失守，但当前仓位已经低于系统防守仓位，本次不追加卖出，也不因防守仓位差额买入。")
         return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
 
-    # 3. 总体策略目标仓位模型。
-    if use_target_model:
-        target = core_target
-        action = target_action_from_delta(cur, target, buy_label="买入", sell_label="减仓")
-        base_rule = strategy_rule_label(signals, "目标仓位模型")
-        confidence = strategy_confidence_hint(signals, 68 if action in {"买入", "加仓"} else 62)
-        signals["pure_strategy_target"] = True
-        if action in {"买入", "加仓"}:
-            matched = f"{base_rule}：策略买入"
-        elif action in {"减仓", "清仓"}:
-            matched = f"{base_rule}：策略卖出"
-        else:
-            matched = f"{base_rule}：策略维持"
-        # 操作说明只展示当前策略理由；“当前总体策略直接输出/不再套用其他策略规则”等属于计算过程，不再展示。
-        reason.extend(core_notes)
-        return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
-
-    # 4. 纯交易仓：趋势信号风控策略保留原趋势交易逻辑。
+    # 3. 纯交易仓：趋势信号风控策略保留原趋势交易逻辑。
     if market == "bear":
         action = "观望" if cur <= floor else "减仓"
         target = min(cur, floor)
@@ -2112,29 +2111,50 @@ def amount_payload(cfg: Dict[str, Any], result: Decision) -> Dict[str, Any]:
     plan = max(as_float(cfg.get("plan_amount"), 0.0), 0.0)
     current_market_amount = current_position_market_amount(cfg)
     current_cost_amount = current_position_cost_amount(cfg)
+    current_pnl_amount = current_position_pnl_amount(cfg)
+    current_equity_amount = current_account_equity_amount(cfg)
     remaining_cash = remaining_plan_cash_amount(cfg)
-    profit_factor = current_profit_factor(cfg)
     cur_pos = current_position(cfg)
 
-    # 策略目标仓位的单位是“计划本金占用比例”。
-    # 买入时：新增买入金额 = 目标本金 - 当前已投入本金。
-    # 卖出时：需要按当前盈亏率换算成应卖出的当前市值。
-    target_amount = result.target_position * plan
-    cost_diff = target_amount - current_cost_amount
-    if cost_diff > 1e-9:
-        trade_diff = min(cost_diff, remaining_cash)
-    elif cost_diff < -1e-9:
-        trade_diff = cost_diff * profit_factor
+    # 策略目标仓位按“当前实际总资产”执行：
+    # 当前实际总资产 = 计划金额 + 当前累计盈亏。
+    # 因此操作建议、目标仓位和历史回测的 equity 口径保持一致。
+    target_amount = result.target_position * current_equity_amount
+    market_diff = target_amount - current_market_amount
+    if market_diff > 1e-9:
+        trade_diff = min(market_diff, remaining_cash)
+    elif market_diff < -1e-9:
+        trade_diff = market_diff
     else:
         trade_diff = 0.0
+
+    # 本金投入进度只用于展示：
+    # - 买入时：新增买入额会占用新的外部计划本金；
+    # - 卖出时：按卖出市值占当前持仓市值的比例，等比例释放原投入本金。
+    # 这个字段不参与买卖决策，决策仍统一使用“当前持仓市值 / 当前总资金”的真实仓位口径。
+    if trade_diff >= 0:
+        target_cost_amount = current_cost_amount + trade_diff
+    elif current_market_amount > 1e-9:
+        sell_ratio = clamp((-trade_diff) / current_market_amount, 0.0, 1.0)
+        target_cost_amount = current_cost_amount * (1.0 - sell_ratio)
+    else:
+        target_cost_amount = 0.0
+    target_cost_amount = clamp(target_cost_amount, 0.0, plan if plan > 0 else target_cost_amount)
+    current_cost_pct = current_cost_amount / plan if plan > 1e-9 else 0.0
+    target_cost_pct = target_cost_amount / plan if plan > 1e-9 else 0.0
 
     return {
         "current_pos": cur_pos,
         "current_market_amount": current_market_amount,
         "current_cost_amount": current_cost_amount,
+        "current_pnl_amount": current_pnl_amount,
+        "current_equity_amount": current_equity_amount,
         "remaining_plan_cash": remaining_cash,
         "target_amount": target_amount,
-        "cost_diff": cost_diff,
+        "target_cost_amount": target_cost_amount,
+        "current_cost_pct": current_cost_pct,
+        "target_cost_pct": target_cost_pct,
+        "market_diff": market_diff,
         "diff": trade_diff,
         "direction": "买入" if trade_diff > 1e-9 else ("卖出" if trade_diff < -1e-9 else "不操作"),
     }
@@ -2201,23 +2221,24 @@ def join_reason_text(items: List[Any]) -> str:
 def decision_to_payload(cfg: Dict[str, Any], result: Decision) -> Dict[str, Any]:
     amount = amount_payload(cfg, result)
     cur_pos = amount["current_pos"]
-    delta = result.target_position - cur_pos
+    equity_amount = max(float(amount.get("current_equity_amount") or 0.0), 1e-9)
+    trade_delta = float(amount.get("diff") or 0.0) / equity_amount
     strategy = get_strategy(cfg)
 
     reason_text = join_reason_text(result.reason)
 
-    # 顶部【实时计算结果】显示"动作 + 本次仓位变化"，而不是只显示买入/卖出。
-    # 例如当前 10%、目标 22%，显示"加仓 +12%"；当前 50%、目标 20%，显示"减仓 -30%"。
-    if delta > 0.005:
+    # 顶部【实时计算结果】显示“真实本次操作占比”，与回测的【操作占比%】保持同一口径。
+    # 目标仓位仍显示在指标区；标题不再用策略参数里的原始调整幅度误导实际成交。
+    if trade_delta > 0.005:
         action_label = "加仓" if cur_pos > 0.005 else "买入"
-        action_delta_text = f"+{pct(delta)}"
+        action_delta_text = f"+{pct(trade_delta)}"
         action_text = f"{action_label}{action_delta_text}"
         action_tone = "buy"
         headline = action_text
         subline = reason_text
-    elif delta < -0.005:
+    elif trade_delta < -0.005:
         action_label = "清仓" if result.target_position <= 0.005 or result.action == "清仓" else ("止盈" if result.action == "止盈" else "减仓")
-        action_delta_text = f"-{pct(abs(delta))}"
+        action_delta_text = f"-{pct(abs(trade_delta))}"
         action_text = f"{action_label}{action_delta_text}"
         action_tone = "sell"
         headline = action_text
@@ -2237,12 +2258,13 @@ def decision_to_payload(cfg: Dict[str, Any], result: Decision) -> Dict[str, Any]
     else:
         amount_action = "不操作"
 
+    invested_pct_text = f"{pct(amount['current_cost_pct'])}→{pct(amount['target_cost_pct'])}"
+    position_adjust_text = f"{pct(amount['current_pos'])}→{pct(result.target_position)}"
     metrics = [
-        {"label": "当前仓位", "value": pct(amount["current_pos"])},
-        {"label": "目标仓位", "value": pct(result.target_position)},
         {"label": "建议金额", "value": amount_action},
-        {"label": "风险分", "value": f"{result.risk_score}/100"},
-        {"label": "趋势分", "value": f"{result.trend_score:+d}"},
+        {"label": "仓位调整", "value": position_adjust_text},
+        {"label": "已投入本金%", "value": invested_pct_text},
+        {"label": "当前总资金", "value": money(amount["current_equity_amount"])},
         {"label": "信号质量", "value": f"{result.signal_quality}/100"},
         {"label": "预期赔率", "value": "--" if result.expected_reward_r <= 0 else f"{result.expected_reward_r:.2f}R（{result.opportunity_grade}）"},
         {"label": "操作频率", "value": result.trade_frequency},
@@ -2253,11 +2275,6 @@ def decision_to_payload(cfg: Dict[str, Any], result: Decision) -> Dict[str, Any]
         {"label": "估值修正", "value": pct2(result.valuation_adjustment)},
         {"label": "ROE修正", "value": pct2(result.quality_adjustment)},
         {"label": "系统防守仓位", "value": pct2(result.core_floor)},
-        {"label": "计划金额", "value": money(as_float(cfg.get("plan_amount"), 0.0))},
-        {"label": "当前持仓市值", "value": money(amount["current_market_amount"])},
-        {"label": "已投入本金", "value": money(amount["current_cost_amount"])},
-        {"label": "剩余计划资金", "value": money(amount["remaining_plan_cash"])},
-        {"label": "目标投入本金", "value": money(amount["target_amount"])},
         {"label": "标的", "value": f"{cfg.get('symbol_name') or '--'} {cfg.get('symbol') or ''}".strip(), "wide": True},
         {"label": "总体策略", "value": strategy_family_summary(cfg).replace("<br>", " / "), "wide": True},
         {"label": "参数风格", "value": f"{strategy['name']}：{strategy['desc']}", "wide": True},
@@ -2291,6 +2308,10 @@ def decision_to_payload(cfg: Dict[str, Any], result: Decision) -> Dict[str, Any]
         "headline": headline,
         "subline": subline,
         "metrics": metrics,
+        "extended_metrics": [
+            {"label": "风险分", "value": f"{result.risk_score}/100"},
+            {"label": "趋势分", "value": f"{result.trend_score:+d}"},
+        ],
     }
 
 
@@ -5189,9 +5210,9 @@ BACKTEST_METRIC_NOTES: Dict[str, str] = {
     "定投策略最大回撤": "定投基准权益从阶段高点到之后低点的最大跌幅。",
     "买入持有最大回撤": "买入持有基准的最大回撤。",
     "标的核心得分": "按长期资产质量、估值安全边际、风险与回撤、收益质量、产品与交易可用性综合评估这只股票/基金是否适合作为长期核心资产。",
-    "系统策略得分": "按年化超额收益、最大回撤控制、卡玛比率、夏普比率、执行质量综合评估系统策略表现。",
-    "定投策略得分": "按年化超额收益、最大回撤控制、卡玛比率、夏普比率、执行质量综合评估定投基准表现。",
-    "持有策略得分": "按年化超额收益、最大回撤控制、卡玛比率、夏普比率、执行质量综合评估一次性买入持有基准表现。",
+    "系统策略得分": "按年化超额收益、最大回撤控制、夏普比率、卡玛比率、执行质量综合评估系统策略表现。",
+    "定投策略得分": "按年化超额收益、最大回撤控制、夏普比率、卡玛比率、执行质量综合评估定投基准表现。",
+    "持有策略得分": "按年化超额收益、最大回撤控制、夏普比率、卡玛比率、执行质量综合评估一次性买入持有基准表现。",
     "卡玛比率": "（策略年化收益 - 无风险收益率）/ 策略最大回撤绝对值，越高表示单位回撤换来的超额收益越高。",
     "定投策略卡玛比率": "（定投策略年化收益 - 无风险收益率）/ 定投策略最大回撤绝对值，用作定投基准的风险收益比。",
     "持有策略卡玛比率": "（买入持有年化收益 - 无风险收益率）/ 买入持有最大回撤绝对值，用作买入持有基准的风险收益比。",
@@ -5202,7 +5223,7 @@ BACKTEST_METRIC_NOTES: Dict[str, str] = {
     "持有策略夏普比率": "买入持有基准的年化超额收益 / 年化波动率，已扣除无风险收益率。",
     "交易次数": "回测期间实际执行的买入和卖出次数。",
     "已实现胜率": "只按卖出时已实现盈亏统计，未平仓浮盈浮亏不计入。",
-    "盈亏因子": "已实现盈利总额 / 已实现亏损总额绝对值；只统计已经通过卖出落袋的交易，未卖出的浮盈浮亏不计入。若有盈利且没有已实现亏损，显示 999 代表近似无穷大，不是收益率。",
+    "盈亏因子": "已实现盈利总额 / 已实现亏损总额绝对值。",
     "平均仓位": "回测期间平均持仓暴露。",
     "换手率": "累计成交金额 / 初始资金。",
     "期末权益": "回测结束时策略账户权益。",
@@ -6745,6 +6766,7 @@ def backtest_metrics_rows(metrics: Dict[str, Any]) -> List[Dict[str, Any]]:
         "历史PB", "页面PB", "PB误差",
         "历史PB百分位", "页面PB百分位", "PB百分位误差",
         "历史ROE", "页面ROE", "ROE误差",
+        # 诊断项放在后面，避免一进回测结果就被“结论/拖累”抢占主指标位置。
         "相对定投收益差", "相对持有收益差", "相对定投回撤改善", "相对持有回撤改善",
         "估算交易成本拖累", "估算现金拖累",
     ]
@@ -6828,6 +6850,28 @@ def build_backtest_trend_chart_series(records: List[Dict[str, Any]], start_index
         if item.get("date") and item.get("close") is not None:
             out.append(item)
     return out
+
+
+def backtest_trade_headline(direction: str, trade_pct: float, current_value_before: float, target_pos: float, result_action: str = "") -> str:
+    """按真实成交占比生成回测交易记录里的【操作建议】。
+
+    策略参数可能是“目标仓位调整幅度”，但实际成交需要按当前总资产和目标仓位执行。
+    因此这里以真实成交金额 / 当时总资产为准，保证【操作建议】与【操作占比%】一致。
+    """
+    pct_text = pct(abs(float(trade_pct or 0.0)))
+    direction_text = str(direction or "")
+    if direction_text == "买入":
+        label = "加仓" if current_value_before > 1e-9 else "买入"
+        return f"{label}+{pct_text}"
+    if direction_text == "卖出":
+        if target_pos <= 0.005 or str(result_action or "") == "清仓":
+            label = "清仓"
+        elif str(result_action or "") == "止盈":
+            label = "止盈"
+        else:
+            label = "减仓"
+        return f"{label}-{pct_text}"
+    return f"维持 {pct(target_pos)}"
 
 
 def build_backtest_trade_points(trades: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -6974,15 +7018,22 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
         equity_signal = cash + shares * close
         pos_value_signal = shares * close
         profit_pct = ((close / avg_cost - 1.0) * 100.0) if (avg_cost and shares > 0) else 0.0
+        profit_factor_signal = max(1.0 + profit_pct / 100.0, 0.0001)
+        position_cost_signal = pos_value_signal / profit_factor_signal if shares > 0 else 0.0
+        # 回测里当前实际总资产 equity_signal = 现金 + 持仓市值。
+        # 按“计划金额 + 盈亏 = 实际本金”的口径，传给实时决策层的计划金额应是：
+        # 现金 + 已投入成本，而不是 equity_signal 本身，避免把浮盈重复计入一次。
+        plan_amount_signal = max(cash + position_cost_signal, 0.0)
 
         target_pos = (pos_value_signal / equity_signal) if equity_signal > 0 else 0.0
         payload_result: Dict[str, Any] = {"headline": last_signal, "metrics": {}}
+        result_action = ""
         is_review_day = i >= next_signal_index
         if is_review_day:
             decision_cfg = DEFAULT_CONFIG.copy()
             decision_cfg.update({key: cfg.get(key, DEFAULT_CONFIG.get(key)) for key in ADVANCED_PARAM_KEYS})
             decision_cfg.update({
-                "plan_amount": equity_signal,
+                "plan_amount": plan_amount_signal,
                 "current_position_amount": pos_value_signal,
                 "current_profit_pct": profit_pct,
                 "strategy_family": strategy_family,
@@ -7005,6 +7056,7 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
                 indicators = compute_indicators(records[: i + 1], day_fundamentals)
                 indicators = enrich_indicators_with_user_position(indicators, decision_cfg)
                 result = compute_decision(decision_cfg, indicators)
+                result_action = str(result.action or "")
                 payload_result = decision_to_payload(decision_cfg, result)
                 target_pos = float(result.target_position)
                 last_signal = payload_result.get("headline") or result.action
@@ -7048,11 +7100,13 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
                 cash -= gross + gross * fee
                 turnover_value += gross
                 current_total_asset = cash + shares * price
+                trade_pct_value = gross / max(equity_exec, 1e-9)
                 trades.append({
                     "信号日": signal_rec["date"], "执行日": next_rec["date"], "方向": "买入", "成交价": round(price, 4),
-                    "成交金额": round(gross, 2), "操作占比%": round(gross / max(equity_exec, 1e-9) * 100, 2),
+                    "成交金额": round(gross, 2), "操作占比%": round(trade_pct_value * 100, 2),
                     "当前总资产": backtest_pct(current_total_asset / initial_cash * 100), "目标仓位%": round(target_pos * 100, 2),
-                    "操作建议": payload_result.get("headline", last_signal), "命中规则": payload_metric_value(payload_result, "命中规则"),
+                    "操作建议": backtest_trade_headline("买入", trade_pct_value, current_value_exec, target_pos, result_action),
+                    "命中规则": payload_metric_value(payload_result, "命中规则"),
                 })
         elif trade_value < 0 and shares > 0:
             price = exec_open * (1.0 - effective_slip)
@@ -7067,11 +7121,13 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
                 shares = 0.0
                 avg_cost = None
             current_total_asset = cash + shares * price
+            trade_pct_value = gross / max(equity_exec, 1e-9)
             trades.append({
                 "信号日": signal_rec["date"], "执行日": next_rec["date"], "方向": "卖出", "成交价": round(price, 4),
-                "成交金额": round(gross, 2), "操作占比%": round(gross / max(equity_exec, 1e-9) * 100, 2),
+                "成交金额": round(gross, 2), "操作占比%": round(trade_pct_value * 100, 2),
                 "当前总资产": backtest_pct(current_total_asset / initial_cash * 100), "目标仓位%": round(target_pos * 100, 2),
-                "操作建议": payload_result.get("headline", last_signal), "命中规则": payload_metric_value(payload_result, "命中规则"),
+                "操作建议": backtest_trade_headline("卖出", trade_pct_value, current_value_exec, target_pos, result_action),
+                "命中规则": payload_metric_value(payload_result, "命中规则"),
             })
 
         equity_close = cash + shares * exec_close
