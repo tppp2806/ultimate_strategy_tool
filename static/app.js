@@ -839,12 +839,12 @@
     const execHead = document.createElement("div");
     execHead.className = "family-param-group-title";
     appendTextEl(execHead, "strong", "", "均衡基准 · 执行层控制");
-    appendTextEl(execHead, "em", "", "交易模式按策略本身执行；定投模式使用固定买入 + 策略偏移。");
+    appendTextEl(execHead, "em", "", "实时计算使用固定买入 + 策略偏移；历史回测的定投模式会按操作周期均分计划资金。");
     execBox.appendChild(execHead);
     const execGrid = document.createElement("div");
     execGrid.className = "global-field-row";
     const execFields = [
-      {name: "dca_base_buy_pct", label: "定投基准买入%", default: 25, tip: "定投模式每次先给出的固定买入比例；再叠加当前策略的买卖偏移。"},
+      {name: "dca_base_buy_pct", label: "定投基准买入%", default: 25, tip: "实时计算/单次计算时使用；历史回测的定投模式不读取它，而是按【操作周期 / 每N个交易日】把100%计划资金均分到每次检查。"},
       {name: "buy_step_limit_pct", label: "买入上限%", default: 28, tip: "兼容趋势交易策略的单次买入参考。纯目标策略不会被它改写方向。"},
       {name: "sell_step_limit_pct", label: "卖出上限%", default: 45, tip: "基础单次卖出上限；严重破位时仍会按风险倍数放大。"},
     ];
@@ -1535,7 +1535,7 @@
     const data = toConfigPayload();
     const modeText = data.position_mode === "core_satellite" ? "定投增强策略（固定买入 + 策略偏移）" : "纯交易仓";
     const assetText = data.symbol ? `${data.symbol_name || data.symbol} · ${data.symbol} · ${marketNames[data.market] || data.market} · ${data.asset_kind}` : "未选择标的";
-    const dcaText = `定投基准买入 ${data.dca_base_buy_pct ?? 25}%`;
+    const dcaText = `实时定投基准买入 ${data.dca_base_buy_pct ?? 25}%；历史回测按操作周期均分计划资金`;
     summary.innerHTML = `${strategyFamilyText(data.strategy_family)}<br>${strategySummaryText(data)}<br>仓位模式：${modeText}<br>标的：${assetText}<br>数据容错：代理 ${data.proxy_mode || "system"} / 超时 ${data.request_timeout_sec || 12} 秒 / 重试 ${data.retry_count || 0} 次<br>回测无风险收益率：${data.backtest_risk_free_rate_pct ?? 2}%<br>${dcaText}<br>计划资金=100%上限，不按标的类型封顶。`;
     updateStrategyLabState(data);
 

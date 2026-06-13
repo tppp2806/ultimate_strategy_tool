@@ -280,7 +280,7 @@
           <span>结束日期</span>
           <input type="date" name="end_date" value="{{ today }}">
         </label>
-        <label class="field" data-tip="每隔多少个交易日检查并执行一次。1=每天；5≈每周；20≈每月。定投基准也使用这个周期，默认投入100%计划资金，并排除最后一个可观测日，避免最后一天买入看不到收益。">
+        <label class="field" data-tip="每隔多少个交易日检查并执行一次。1=每天；5≈每周；20≈每月。历史回测的定投模式会按这个周期计算检查次数，并把100%计划资金均分到每次检查；不读取全局定投基准买入%。定投基准同样排除最后一个可观测日，避免最后一天买入看不到收益。">
           <span>操作周期 / 每N个交易日</span>
           <input type="number" step="1" min="1" max="60" name="rebalance_days" value="5">
         </label>
@@ -1234,10 +1234,37 @@ input[type="range"]::-moz-range-thumb {
       card.innerHTML = "";
     }
   }
+  function chartTradeTextHasAny(text, words) {
+    const value = String(text || "");
+    return words.some(word => value.includes(word));
+  }
+  function trendChartMarkerReason(marker) {
+    if (!marker) return "暂无操作原因";
+    const raw = String(marker.trade?.rule || marker.trade?.action || "暂无操作原因").trim() || "暂无操作原因";
+    const buyWords = ["买入", "加仓", "补足", "试仓", "重仓", "策略买入"];
+    const sellWords = ["卖出", "减仓", "止盈", "清仓", "策略卖出", "执行卖出"];
+    if (marker.isSell && chartTradeTextHasAny(raw, buyWords)) {
+      const prefixParts = [];
+      if (raw.includes("定投增强")) prefixParts.push("定投增强");
+      if (raw.includes("简易均线")) prefixParts.push("简易均线");
+      const prefix = prefixParts.length ? `${prefixParts.join("：")}：` : "";
+      const target = Number.isFinite(marker.pct) ? `至 ${marker.pct.toFixed(0)}%` : "";
+      return `${prefix}目标仓位低于当前仓位，执行卖出${target}`;
+    }
+    if (!marker.isSell && chartTradeTextHasAny(raw, sellWords)) {
+      const prefixParts = [];
+      if (raw.includes("定投增强")) prefixParts.push("定投增强");
+      if (raw.includes("简易均线")) prefixParts.push("简易均线");
+      const prefix = prefixParts.length ? `${prefixParts.join("：")}：` : "";
+      const target = Number.isFinite(marker.pct) ? `至 ${marker.pct.toFixed(0)}%` : "";
+      return `${prefix}目标仓位高于当前仓位，执行买入${target}`;
+    }
+    return raw;
+  }
   function showTrendChartHoverCard(marker) {
     const card = $("#trend-chart-hover-card");
     if (!card || !marker) return;
-    const reason = String(marker.trade?.rule || marker.trade?.action || "暂无操作原因").trim() || "暂无操作原因";
+    const reason = trendChartMarkerReason(marker);
     card.innerHTML = `
       <strong>操作原因</strong>
       <div class="reason-text">${escapeHtml(reason)}</div>
