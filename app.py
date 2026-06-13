@@ -1616,23 +1616,6 @@ def raw_target_by_signal(cfg: Dict[str, Any], signals: Dict[str, Any], cur: floa
         signals["core_target_model"] = True
         core_target, core_notes = core_target_weight(cfg, signals)
 
-        # 非信号驱动策略必须彻底隔离：
-        # 例如【简易均线策略】只读取 ma_position，不能再被全局 3R 止盈、止损、
-        # 200/50/20 日线破位、突破失败、量价/估值/风险过滤等旧趋势交易规则改写。
-        # 允许生效的边界只来自策略自身 target_weight() 中的风格参数上下限。
-        action = target_action_from_delta(cur, core_target, buy_label="买入", sell_label="减仓")
-        base_rule = strategy_rule_label(signals, "目标仓位模型")
-        confidence = strategy_confidence_hint(signals, 68 if action in {"买入", "加仓"} else 62)
-        signals["pure_strategy_target"] = True
-        if action in {"买入", "加仓"}:
-            matched = f"{base_rule}：策略买入"
-        elif action in {"减仓", "清仓"}:
-            matched = f"{base_rule}：策略卖出"
-        else:
-            matched = f"{base_rule}：策略维持"
-        reason.extend(core_notes)
-        return action, clamp(core_target, 0.0, 0.9999), matched, reason, confidence
-
     # 1. 硬退出优先。定投增强策略不再把 200日线/50日线 当作一键清零，
     # 而是切换到更低的目标仓位；纯交易仓仍沿用原来的防守逻辑。
     if exit_state == "hit_stop":
@@ -5200,7 +5183,7 @@ BACKTEST_METRIC_NOTES: Dict[str, str] = {
     "持有策略夏普比率": "买入持有基准的年化超额收益 / 年化波动率，已扣除无风险收益率。",
     "交易次数": "回测期间实际执行的买入和卖出次数。",
     "已实现胜率": "只按卖出时已实现盈亏统计，未平仓浮盈浮亏不计入。",
-    "盈亏因子": "已实现盈利总额 / 已实现亏损总额绝对值。",
+    "盈亏因子": "已实现盈利总额 / 已实现亏损总额绝对值；只统计已经通过卖出落袋的交易，未卖出的浮盈浮亏不计入。若有盈利且没有已实现亏损，显示 999 代表近似无穷大，不是收益率。",
     "平均仓位": "回测期间平均持仓暴露。",
     "换手率": "累计成交金额 / 初始资金。",
     "期末权益": "回测结束时策略账户权益。",
@@ -6582,22 +6565,6 @@ def simulate_periodic_dca(
     return equity_curve, buy_count, invested
 
 
-def backtest_dca_schedule_plan(records: List[Dict[str, Any]], start_index: int, rebalance_days: int) -> Tuple[int, float]:
-    """历史回测里的定投模式固定底盘。
-
-    只在历史回测口径下使用：不读取全局【定投基准买入%】，
-    而是按回测实际检查日数量，把 100% 计划资金均分到每个检查日。
-    这样每 5/20 个交易日检查一次时，固定买入比例会自动随回测区间和操作周期变化。
-    """
-    if start_index < 0 or start_index >= len(records) - 1:
-        return 0, 0.0
-    step = max(1, int(rebalance_days))
-    buy_count = len(range(start_index, len(records) - 1, step))
-    if buy_count <= 0:
-        return 0, 0.0
-    return buy_count, clamp(100.0 / buy_count, 0.0, 100.0)
-
-
 def backtest_money(v: float) -> str:
     return f"{v:,.2f}"
 
@@ -6747,19 +6714,18 @@ def backtest_metrics_rows(metrics: Dict[str, Any]) -> List[Dict[str, Any]]:
     # 前端会按同一顺序渲染；导出的核心指标 CSV 也保持这个顺序。
     order = [
         "标的核心得分", "系统策略得分", "定投策略得分", "持有策略得分",
-        "卡玛比率", "定投策略卡玛比率", "持有策略卡玛比率",
+        "策略年化收益", "定投策略年化收益", "买入持有年化收益",
+        "策略最大回撤", "定投策略最大回撤", "买入持有最大回撤",
         "夏普比率", "定投策略夏普比率", "持有策略夏普比率",
+        "卡玛比率", "定投策略卡玛比率", "持有策略卡玛比率",
         "无风险收益率",
         "策略总收益", "定投策略总收益", "买入持有总收益",
-        "策略年化收益", "定投策略年化收益", "买入持有年化收益",
-        "策略最大回撤", "定投策略最大回撤", "买入持有最大回撤", "年化波动",
-        "交易次数", "已实现胜率", "盈亏因子", "平均仓位", "换手率", "期末权益",
+        "年化波动", "交易次数", "已实现胜率", "盈亏因子", "平均仓位", "换手率", "期末权益",
         "估值序列最新日期", "估值页面最新日期",
         "历史PE百分位", "页面PE百分位", "PE百分位误差",
         "历史PB", "页面PB", "PB误差",
         "历史PB百分位", "页面PB百分位", "PB百分位误差",
         "历史ROE", "页面ROE", "ROE误差",
-        # 诊断项放在后面，避免一进回测结果就被"结论/拖累"抢占主指标位置。
         "相对定投收益差", "相对持有收益差", "相对定投回撤改善", "相对持有回撤改善",
         "估算交易成本拖累", "估算现金拖累",
     ]
@@ -6777,59 +6743,6 @@ def payload_metric_value(payload_result: Dict[str, Any], label: str, default: st
             if isinstance(item, dict) and item.get("label") == label:
                 return str(item.get("value", default) or default)
     return default
-
-
-def _text_has_any(text: str, words: Tuple[str, ...]) -> bool:
-    value = str(text or "")
-    return any(word in value for word in words)
-
-
-def backtest_execution_labels(
-    payload_result: Dict[str, Any],
-    direction: str,
-    target_pos: float,
-    current_pos: float,
-) -> Tuple[str, str]:
-    """让历史回测交易记录的文字方向与真实成交方向一致。
-
-    决策层的 matched_rule 描述的是策略信号；但回测成交方向取决于
-    `目标仓位 - 当前仓位`。例如简易均线给出"回调买入"信号时，
-    如果当前仓位已经高于风格上限/目标仓位，真实成交会是卖出。
-    交易表和趋势图买卖点必须优先展示真实执行方向，避免红色卖点
-    的悬浮原因仍显示"策略买入"。
-    """
-    headline = str(payload_result.get("headline") or "").strip()
-    rule = payload_metric_value(payload_result, "命中规则")
-    rule = str(rule or "").strip()
-    direction = str(direction or "").strip()
-    target_text = pct(target_pos)
-
-    buy_words = ("买入", "加仓", "补足", "试仓", "重仓", "策略买入")
-    sell_words = ("卖出", "减仓", "止盈", "清仓", "策略卖出", "执行卖出")
-
-    has_buy_rule = _text_has_any(rule, buy_words)
-    has_sell_rule = _text_has_any(rule, sell_words)
-    prefix_parts = []
-    if "定投增强" in rule:
-        prefix_parts.append("定投增强")
-    if "简易均线" in rule:
-        prefix_parts.append("简易均线")
-    prefix = "：".join(prefix_parts) + "：" if prefix_parts else ""
-
-    if direction == "买入":
-        if not _text_has_any(headline, buy_words):
-            headline = f"买入至 {target_text}"
-        # 只要实际买入点的规则里还带有"卖出/减仓"字样，也改成执行口径。
-        if has_sell_rule or not rule:
-            rule = f"{prefix}目标仓位高于当前仓位，执行买入至 {target_text}"
-    elif direction == "卖出":
-        if not _text_has_any(headline, sell_words):
-            headline = f"卖出至 {target_text}"
-        # 只要实际卖出点的规则里还带有"买入/加仓"字样，就改成执行口径。
-        # 这样图上的红点不会再显示"策略买入"。
-        if has_buy_rule or not rule:
-            rule = f"{prefix}目标仓位低于当前仓位，执行卖出至 {target_text}"
-    return headline, rule
 
 def write_backtest_csv(path: str, rows: List[Dict[str, Any]]) -> None:
     if not rows:
@@ -6991,7 +6904,6 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
         position_mode = "core_satellite"
     risk_per_trade_pct = clamp(as_float(cfg.get("risk_per_trade_pct"), data.get("risk_per_trade_pct", 1.0)), 0.1, 100.0)
     rebalance_days = int(clamp(as_float(data.get("rebalance_days"), 5), 1, 60))
-    dca_plan_count, backtest_dca_base_buy_pct = backtest_dca_schedule_plan(records, start_index, rebalance_days)
     min_trade_pct = clamp(as_float(data.get("min_trade_pct"), 0.5), 0.0, 20.0) / 100.0
     fee = clamp(as_float(data.get("fee_bps"), 2.0), 0.0, 1000.0) / 10000.0
     slip = clamp(as_float(data.get("slippage_bps"), 3.0), 0.0, 1000.0) / 10000.0
@@ -7048,20 +6960,10 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
         payload_result: Dict[str, Any] = {"headline": last_signal, "metrics": {}}
         is_review_day = i >= next_signal_index
         if is_review_day:
-            # 历史回测定投模式：把计划资金按检查次数均分成固定金额，
-            # 再折算成当日权益百分比传给决策层。这样不再使用全局【定投基准买入%】。
-            dca_buy_pct_for_signal = cfg.get("dca_base_buy_pct", DEFAULT_CONFIG.get("dca_base_buy_pct", 25.0))
-            if position_mode == "core_satellite" and dca_plan_count > 0:
-                # 历史回测里“计划资金”必须固定为初始计划资金，不能随净值上涨/下跌漂移。
-                # 因此定投底盘直接按 100% 计划资金 / 检查次数折算成占计划资金比例。
-                dca_buy_pct_for_signal = clamp(100.0 / dca_plan_count, 0.0, 100.0)
             decision_cfg = DEFAULT_CONFIG.copy()
             decision_cfg.update({key: cfg.get(key, DEFAULT_CONFIG.get(key)) for key in ADVANCED_PARAM_KEYS})
             decision_cfg.update({
-                # 回测的计划资金固定使用初始资金。
-                # 策略里的“目标仓位%”表示占用计划本金比例，而不是当日市值仓位；
-                # 否则上涨后会因为市值仓位被动变高，出现“买入信号却被迫卖出再平衡”的假交易。
-                "plan_amount": initial_cash,
+                "plan_amount": equity_signal,
                 "current_position_amount": pos_value_signal,
                 "current_profit_pct": profit_pct,
                 "strategy_family": strategy_family,
@@ -7069,10 +6971,6 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
                 "strategy_mode": cfg.get("strategy_mode", "single"),
                 "strategy_mix": cfg.get("strategy_mix", {}),
                 "position_mode": position_mode,
-                # 历史回测的定投模式不使用全局【定投基准买入%】。
-                # 固定买入底盘由【操作周期 / 每N个交易日】和回测区间共同决定：
-                # 计划资金 100% / 实际检查次数。
-                "dca_base_buy_pct": dca_buy_pct_for_signal,
                 "risk_per_trade_pct": risk_per_trade_pct,
                 "symbol": symbol,
                 "symbol_name": str(data.get("symbol_name") or cfg.get("symbol_name") or ""),
@@ -7104,22 +7002,8 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
 
         equity_exec = cash + shares * exec_open
         current_value_exec = shares * exec_open
-        current_cost_exec = (avg_cost or exec_open) * shares if shares > 0 else 0.0
-
-        # 策略目标仓位的单位是“计划本金占用比例”，和实时计算 amount_payload() 保持一致：
-        # - 买入：目标本金 - 当前已投入本金 = 需要新增投入的现金；
-        # - 卖出：减少的本金占用按当前盈亏倍数折算成需要卖出的市值。
-        # 不能把 target_pos 当成“当前市值占总资产比例”，否则盈利后市值仓位自然变高，
-        # 会把简易均线的买入/维持信号误执行成卖出再平衡。
-        target_cost_exec = target_pos * initial_cash
-        cost_diff_exec = target_cost_exec - current_cost_exec
-        if cost_diff_exec > 0:
-            trade_value = cost_diff_exec
-        elif cost_diff_exec < 0:
-            profit_factor_exec = exec_open / max((avg_cost or exec_open), 1e-9)
-            trade_value = cost_diff_exec * profit_factor_exec
-        else:
-            trade_value = 0.0
+        target_value_exec = target_pos * equity_exec
+        trade_value = target_value_exec - current_value_exec
 
         headline_text = str(payload_result.get("headline") or last_signal or "").strip()
         current_pos_signal = (pos_value_signal / equity_signal) if equity_signal > 0 else 0.0
@@ -7145,12 +7029,11 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
                 cash -= gross + gross * fee
                 turnover_value += gross
                 current_total_asset = cash + shares * price
-                action_text, rule_text = backtest_execution_labels(payload_result, "买入", target_pos, current_pos_signal)
                 trades.append({
                     "信号日": signal_rec["date"], "执行日": next_rec["date"], "方向": "买入", "成交价": round(price, 4),
                     "成交金额": round(gross, 2), "操作占比%": round(gross / max(equity_exec, 1e-9) * 100, 2),
                     "当前总资产": backtest_pct(current_total_asset / initial_cash * 100), "目标仓位%": round(target_pos * 100, 2),
-                    "操作建议": action_text, "命中规则": rule_text,
+                    "操作建议": payload_result.get("headline", last_signal), "命中规则": payload_metric_value(payload_result, "命中规则"),
                 })
         elif trade_value < 0 and shares > 0:
             price = exec_open * (1.0 - effective_slip)
@@ -7165,12 +7048,11 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
                 shares = 0.0
                 avg_cost = None
             current_total_asset = cash + shares * price
-            action_text, rule_text = backtest_execution_labels(payload_result, "卖出", target_pos, current_pos_signal)
             trades.append({
                 "信号日": signal_rec["date"], "执行日": next_rec["date"], "方向": "卖出", "成交价": round(price, 4),
                 "成交金额": round(gross, 2), "操作占比%": round(gross / max(equity_exec, 1e-9) * 100, 2),
                 "当前总资产": backtest_pct(current_total_asset / initial_cash * 100), "目标仓位%": round(target_pos * 100, 2),
-                "操作建议": action_text, "命中规则": rule_text,
+                "操作建议": payload_result.get("headline", last_signal), "命中规则": payload_metric_value(payload_result, "命中规则"),
             })
 
         equity_close = cash + shares * exec_close
@@ -7321,10 +7203,6 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
             "数据源": source_label,
             "回测周期": f"{equity_curve[0]['日期']} ~ {equity_curve[-1]['日期']}",
             "操作周期": f"每 {rebalance_days} 个交易日检查一次",
-            "定投模式买入底盘": (
-                f"历史回测按操作周期均分计划资金：每次 {backtest_dca_base_buy_pct:.2f}% 计划资金；检查 {dca_plan_count} 次；不使用全局定投基准买入%"
-                if position_mode == "core_satellite" else "纯交易仓模式不使用固定定投底盘"
-            ),
             "定投基准": f"每 {rebalance_days} 个交易日定额买入；默认投入100%计划资金；排除最后一个可观测日；买入 {dca_buy_count} 次",
             "K线数量": len(records),
             "交易次数": len(trades),
@@ -7504,7 +7382,7 @@ def api_config():
         "ok": True,
         "message": "配置已保存",
         "current_pos_text": pct(current_position(cfg)),
-        "strategy_text": f"{full_strategy_summary(cfg)}<br>仓位模式：{mode_text}<br>标的：{symbol_text}<br>数据容错：代理 {cfg.get('proxy_mode')} / 超时 {cfg.get('request_timeout_sec')} 秒 / 重试 {cfg.get('retry_count')} 次<br>估值来源：{valuation_method_text(cfg.get('valuation_method'))}<br>回测无风险收益率：{cfg.get('backtest_risk_free_rate_pct', 2.0)}%<br>实时定投基准买入：{cfg.get('dca_base_buy_pct', 25.0)}%；历史回测按操作周期均分计划资金<br>计划资金=100%上限，不按标的类型封顶。",
+        "strategy_text": f"{full_strategy_summary(cfg)}<br>仓位模式：{mode_text}<br>标的：{symbol_text}<br>数据容错：代理 {cfg.get('proxy_mode')} / 超时 {cfg.get('request_timeout_sec')} 秒 / 重试 {cfg.get('retry_count')} 次<br>估值来源：{valuation_method_text(cfg.get('valuation_method'))}<br>回测无风险收益率：{cfg.get('backtest_risk_free_rate_pct', 2.0)}%<br>定投基准买入：{cfg.get('dca_base_buy_pct', 25.0)}%<br>计划资金=100%上限，不按标的类型封顶。",
         "config": cfg,
     })
 
