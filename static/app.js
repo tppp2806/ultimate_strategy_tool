@@ -1920,10 +1920,12 @@
     const restore = setBusy(btn, "拉取中…", "拉取所选标的数据");
 
     resetAutoFetchedFields();
+    if (window.__setTrendChartData) window.__setTrendChartData([], {});
     if (status) status.textContent = "已清空旧自动数据，正在拉取行情/指标…";
 
     try {
       const res = await postJSON("/api/fetch", data);
+      if (window.__setTrendChartData) window.__setTrendChartData(res.chart_series || [], res.chart_meta || res);
       applyFetchedIndicators(res.indicators);
       if (status) status.textContent = res.message || "数据已更新";
       showToast(res.cache?.hit ? "数据来自缓存，已自动填入" : "数据已自动填入，可手动覆盖");
@@ -2473,6 +2475,38 @@
     host.innerHTML = `<table class="${tableClass}">${thead}<tbody>${body}</tbody></table>`;
   }
 
+  function updateBacktestTrendChartButton(result = lastBacktestResult) {
+    const btn = $("#open-backtest-trend-chart-btn");
+    if (!btn) return;
+    const series = result?.backtest_chart_series || [];
+    const enabled = Array.isArray(series) && series.length >= 2;
+    btn.disabled = !enabled;
+    btn.title = enabled ? "打开回测趋势图并显示买卖点" : "请先完成一次历史回测";
+  }
+
+  function openBacktestTrendChartFromResult() {
+    const result = lastBacktestResult || {};
+    const series = result.backtest_chart_series || [];
+    if (!Array.isArray(series) || series.length < 2) {
+      showToast("请先完成一次历史回测，且需要至少2条趋势数据", true);
+      updateBacktestTrendChartButton(result);
+      return;
+    }
+    const trades = result.backtest_trade_points || [];
+    const meta = {
+      ...(result.backtest_chart_meta || {}),
+      ...(result.summary || {}),
+    };
+    if (window.__openBacktestTrendChartModal) {
+      window.__openBacktestTrendChartModal(series, trades, meta);
+    } else if (window.__setBacktestTrendChartData) {
+      window.__setBacktestTrendChartData(series, trades, meta);
+      showToast("趋势图模块已加载，但弹窗入口未初始化", true);
+    } else {
+      showToast("趋势图模块未加载，请刷新页面", true);
+    }
+  }
+
   function openTablePreview(kind) {
     const modal = $("#table-preview-modal");
     const title = $("#table-preview-title");
@@ -2519,6 +2553,7 @@
     }
     renderTable($("#backtest-metrics"), result.metrics || [], "暂无核心指标", BACKTEST_METRIC_INLINE_COLUMNS);
     renderTable($("#backtest-trades"), result.trades || [], "暂无交易记录");
+    updateBacktestTrendChartButton(result);
 
     const exportInfo = $("#backtest-export-info");
     if (exportInfo) {
@@ -2556,6 +2591,7 @@
       status.className = "pill wait";
     }
     lastBacktestResult = null;
+    updateBacktestTrendChartButton(null);
     renderTable($("#backtest-metrics"), [], "正在计算核心指标…", BACKTEST_METRIC_INLINE_COLUMNS);
     renderTable($("#backtest-trades"), [], "正在生成交易记录…");
     try {
@@ -2622,6 +2658,15 @@
         openTablePreview(btn.dataset.previewTable);
       });
     });
+    const backtestChartBtn = $("#open-backtest-trend-chart-btn");
+    if (backtestChartBtn) {
+      backtestChartBtn.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        openBacktestTrendChartFromResult();
+      });
+      updateBacktestTrendChartButton(null);
+    }
     $$('[data-close-preview]').forEach(btn => btn.addEventListener('click', closeTablePreview));
     document.addEventListener('keydown', (event) => {
       if (event.key === 'Escape') closeTablePreview();

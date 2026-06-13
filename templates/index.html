@@ -239,6 +239,7 @@
         </div>
         <div class="auto-actions">
           <button id="fetch-data-btn" class="btn mini" type="button">拉取所选标的数据</button>
+          <button id="open-trend-chart-btn" class="btn mini light" type="button" disabled>查看趋势图</button>
           <button id="open-auto-data-modal-btn" class="btn mini light" type="button">查看全部自动数据</button>
         </div>
         <span id="fetch-status" class="small" hidden aria-hidden="true"></span>
@@ -384,7 +385,10 @@
       <details class="details-block" open>
         <summary class="backtest-section-summary">
           <span>交易记录</span>
-          <button class="mini-action-btn" type="button" data-preview-table="trades">预览</button>
+          <span class="backtest-section-actions">
+            <button id="open-backtest-trend-chart-btn" class="mini-action-btn" type="button" disabled>查看趋势图</button>
+            <button class="mini-action-btn" type="button" data-preview-table="trades">预览</button>
+          </span>
         </summary>
         <div id="backtest-trades" class="backtest-table-wrap"></div>
       </details>
@@ -434,6 +438,35 @@
   </section>
 </div>
 
+<div id="trend-chart-modal" class="auto-data-modal trend-chart-modal" hidden>
+  <div class="auto-data-modal-backdrop" data-close-trend-chart></div>
+  <section class="auto-data-dialog trend-chart-dialog" role="dialog" aria-modal="true" aria-labelledby="trend-chart-title">
+    <header class="auto-data-modal-head">
+      <div>
+        <div class="auto-data-modal-kicker">趋势图 · 只读</div>
+        <h2 id="trend-chart-title">净值 / 均线趋势</h2>
+      </div>
+      <button class="ghost-btn auto-data-close-btn" type="button" data-close-trend-chart>关闭</button>
+    </header>
+    <div class="trend-chart-tools">
+      <span id="trend-chart-meta" class="small">拉取数据后可查看最近约一年趋势。</span>
+      <div class="trend-chart-legend" aria-label="图例">
+        <span><i data-line="close"></i>净值/收盘</span>
+        <span><i data-line="ma20"></i>MA20</span>
+        <span><i data-line="ma50"></i>MA50</span>
+        <span><i data-line="ma200"></i>MA200</span>
+        <span><i data-line="buy"></i>买入点</span>
+        <span><i data-line="sell"></i>卖出点</span>
+      </div>
+    </div>
+    <div id="trend-chart-kpis" class="trend-chart-kpis"></div>
+    <div class="trend-chart-body">
+      <canvas id="trend-chart-canvas" aria-label="净值和均线趋势图"></canvas>
+      <div id="trend-chart-empty" class="empty compact-empty" hidden>暂无趋势图数据。请先点击“拉取所选标的数据”。</div>
+    </div>
+  </section>
+</div>
+
 <style>
 /* 自动数据区域：只保留一套外部表单。原 app.js 会把全部自动数据渲染到 #auto-data-list，
    这里隐藏它，避免和新的“关键摘要 + 全量弹窗表单”重复显示。 */
@@ -441,7 +474,8 @@
 #fetch-status { display: none !important; }
 .auto-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
 .auto-actions #fetch-data-btn { flex: 0 0 auto; }
-.auto-actions #open-auto-data-modal-btn { flex: 0 0 auto; margin-left: auto; }
+.auto-actions #open-trend-chart-btn { flex: 0 0 auto; margin-left: auto; }
+.auto-actions #open-auto-data-modal-btn { flex: 0 0 auto; }
 .auto-data-summary { margin-top: 0; margin-bottom: 10px; }
 .auto-data-summary-head { display: none !important; }
 .auto-data-key-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 0; }
@@ -451,8 +485,10 @@
 .auto-manual-core-grid { margin-top: 10px; }
 
 /* 全量自动数据弹窗：完全独立于 table-preview 预览弹窗，避免继承表格预览样式导致字段被压扁。 */
-#auto-data-modal[hidden] { display: none !important; }
-#auto-data-modal {
+#auto-data-modal[hidden],
+#trend-chart-modal[hidden] { display: none !important; }
+#auto-data-modal,
+#trend-chart-modal {
   position: fixed;
   inset: 0;
   z-index: 3000;
@@ -461,13 +497,15 @@
   justify-content: center;
   padding: 18px;
 }
-#auto-data-modal .auto-data-modal-backdrop {
+#auto-data-modal .auto-data-modal-backdrop,
+#trend-chart-modal .auto-data-modal-backdrop {
   position: absolute;
   inset: 0;
   background: rgba(36, 25, 16, .55);
   backdrop-filter: blur(2px);
 }
-#auto-data-modal .auto-data-dialog {
+#auto-data-modal .auto-data-dialog,
+#trend-chart-modal .auto-data-dialog {
   position: relative;
   z-index: 1;
   width: min(1120px, calc(100vw - 28px));
@@ -480,7 +518,8 @@
   background: #fffaf2;
   box-shadow: 0 22px 70px rgba(43, 30, 19, .30);
 }
-#auto-data-modal .auto-data-modal-head {
+#auto-data-modal .auto-data-modal-head,
+#trend-chart-modal .auto-data-modal-head {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
@@ -490,9 +529,12 @@
   background: #2f241d;
   color: #fff6e8;
 }
-#auto-data-modal .auto-data-modal-head h2 { margin: 2px 0 0; font-size: 18px; }
-#auto-data-modal .auto-data-modal-kicker { color: #d9c6ad; font-size: 12px; }
-#auto-data-modal .auto-data-close-btn {
+#auto-data-modal .auto-data-modal-head h2,
+#trend-chart-modal .auto-data-modal-head h2 { margin: 2px 0 0; font-size: 18px; }
+#auto-data-modal .auto-data-modal-kicker,
+#trend-chart-modal .auto-data-modal-kicker { color: #d9c6ad; font-size: 12px; }
+#auto-data-modal .auto-data-close-btn,
+#trend-chart-modal .auto-data-close-btn {
   flex: 0 0 auto;
   border-color: rgba(255,255,255,.28);
   background: rgba(255,255,255,.08);
@@ -571,8 +613,68 @@
 #auto-data-modal .auto-data-row-tip { color: var(--muted); line-height: 1.45; word-break: break-word; }
 #auto-data-modal [data-auto-field-wrap][hidden],
 #auto-data-modal .auto-data-section[hidden] { display: none !important; }
-@media (max-width: 1100px) { .auto-data-key-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-@media (max-width: 700px) { .auto-actions, #auto-data-modal .auto-data-modal-tools { flex-direction: column; align-items: stretch; } .auto-data-key-metrics { grid-template-columns: 1fr; } #auto-data-modal { padding: 8px; } #auto-data-modal .auto-data-dialog { width: calc(100vw - 16px); max-height: calc(100dvh - 16px); } #auto-data-modal .auto-data-table { min-width: 760px; } }
+
+#trend-chart-modal .trend-chart-dialog { width: min(1180px, calc(100vw - 28px)); }
+.trend-chart-tools {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line);
+  background: #fffaf2;
+}
+.trend-chart-legend { display: flex; flex-wrap: wrap; gap: 10px 14px; color: var(--muted); font-size: 12px; font-weight: 800; }
+.trend-chart-legend span { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.trend-chart-legend i { width: 18px; height: 3px; border-radius: 999px; display: inline-block; background: #8f6b43; }
+.trend-chart-legend i[data-line="close"] { background: #2f241d; }
+.trend-chart-legend i[data-line="ma20"] { background: #1f7a4d; }
+.trend-chart-legend i[data-line="ma50"] { background: #2d63b8; }
+.trend-chart-legend i[data-line="ma200"] { background: #b65d2a; }
+.trend-chart-legend i[data-line="buy"] { background: #138a4f; height: 8px; width: 8px; border-radius: 50%; }
+.trend-chart-legend i[data-line="sell"] { background: #c24135; height: 8px; width: 8px; border-radius: 50%; }
+.backtest-section-actions { display: inline-flex; align-items: center; gap: 8px; margin-left: auto; }
+.trend-chart-kpis {
+  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+  padding: 12px 16px 0;
+  background: #fffaf2;
+}
+.trend-chart-kpi { border: 1px solid var(--line); border-radius: 12px; background: rgba(255,255,255,.64); padding: 8px 10px; min-width: 0; }
+.trend-chart-kpi span { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.trend-chart-kpi strong { display: block; color: #3d3026; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.trend-chart-body {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 360px;
+  padding: 12px 16px 16px;
+  background: #fffaf2;
+}
+#trend-chart-canvas {
+  width: 100%;
+  height: min(520px, calc(100dvh - 260px));
+  min-height: 320px;
+  display: block;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #fffdfa;
+}
+#trend-chart-empty {
+  position: absolute;
+  inset: 12px 16px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px dashed var(--line);
+  border-radius: 14px;
+  background: rgba(255,255,255,.72);
+}
+#trend-chart-empty[hidden] { display: none !important; }
+@media (max-width: 1100px) { .auto-data-key-metrics, .trend-chart-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 700px) { .auto-actions, #auto-data-modal .auto-data-modal-tools, .trend-chart-tools { flex-direction: column; align-items: stretch; } .auto-actions #open-trend-chart-btn { margin-left: 0; } .auto-data-key-metrics, .trend-chart-kpis { grid-template-columns: 1fr; } #auto-data-modal, #trend-chart-modal { padding: 8px; } #auto-data-modal .auto-data-dialog, #trend-chart-modal .auto-data-dialog { width: calc(100vw - 16px); max-height: calc(100dvh - 16px); } #auto-data-modal .auto-data-table { min-width: 760px; } #trend-chart-canvas { height: 360px; } }
 
 
  .strategy-specific-inputs { display: grid; gap: 10px; }
@@ -773,6 +875,12 @@ input[type="range"]::-moz-range-thumb {
   // 首页不再提供 PE/PB/ROE/止损距离的可编辑输入，因此空字段不保留。
   const AUTO_DATA_KEEP_EMPTY_KEYS = new Set([]);
   let lastIndicators = {};
+  let autoChartSeries = [];
+  let autoChartMeta = {};
+  let lastChartSeries = [];
+  let lastChartMeta = {};
+  let lastChartTrades = [];
+  let lastChartMode = "auto";
 
   const $ = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
@@ -984,6 +1092,335 @@ input[type="range"]::-moz-range-thumb {
     const modal = $("#auto-data-modal");
     if (modal) modal.hidden = true;
   }
+
+  const CHART_LINES = [
+    {key: "close", label: "净值/收盘", color: "#2f241d", width: 2.4},
+    {key: "ma20", label: "MA20", color: "#1f7a4d", width: 1.8},
+    {key: "ma50", label: "MA50", color: "#2d63b8", width: 1.8},
+    {key: "ma200", label: "MA200", color: "#b65d2a", width: 1.8}
+  ];
+
+  function finiteNumber(value) {
+    if (value === null || value === undefined || value === "") return null;
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  }
+  function normaliseChartSeries(series = []) {
+    if (!Array.isArray(series)) return [];
+    return series.map(row => ({
+      date: String(row?.date || "").slice(0, 10),
+      close: finiteNumber(row?.close),
+      ma20: finiteNumber(row?.ma20),
+      ma50: finiteNumber(row?.ma50),
+      ma200: finiteNumber(row?.ma200),
+      drawdown_252d: finiteNumber(row?.drawdown_252d),
+      rsi14: finiteNumber(row?.rsi14),
+      macd_bar_pct: finiteNumber(row?.macd_bar_pct),
+      return_60d: finiteNumber(row?.return_60d),
+    })).filter(row => row.date && row.close !== null);
+  }
+  function normaliseChartTrades(trades = []) {
+    if (!Array.isArray(trades)) return [];
+    return trades.map(row => ({
+      date: String(row?.date || row?.执行日 || "").slice(0, 10),
+      signal_date: String(row?.signal_date || row?.信号日 || "").slice(0, 10),
+      direction: String(row?.direction || row?.方向 || ""),
+      price: finiteNumber(row?.price ?? row?.成交价),
+      target_position_pct: finiteNumber(row?.target_position_pct ?? row?.["目标仓位%"]),
+      asset_pct: String(row?.asset_pct || row?.["当前总资产"] || ""),
+      action: String(row?.action || row?.操作建议 || ""),
+      rule: String(row?.rule || row?.命中规则 || ""),
+    })).filter(row => row.date && row.direction);
+  }
+  function updateTrendChartButton() {
+    const btn = $("#open-trend-chart-btn");
+    if (!btn) return;
+    const hasData = autoChartSeries.length >= 2;
+    btn.disabled = !hasData;
+    btn.title = hasData ? "打开最近行情趋势图" : "请先拉取标的数据";
+  }
+  function setTrendChartData(series = [], meta = {}) {
+    autoChartSeries = normaliseChartSeries(series);
+    autoChartMeta = meta && typeof meta === "object" ? meta : {};
+    window.__CHART_SERIES = autoChartSeries.slice();
+    window.__CHART_META = Object.assign({}, autoChartMeta);
+    updateTrendChartButton();
+    if (lastChartMode === "auto" || $("#trend-chart-modal")?.hidden) {
+      lastChartMode = "auto";
+      lastChartSeries = autoChartSeries.slice();
+      lastChartTrades = [];
+      lastChartMeta = Object.assign({}, autoChartMeta);
+      if (!$("#trend-chart-modal")?.hidden) drawTrendChart();
+    }
+  }
+  function setBacktestTrendChartData(series = [], trades = [], meta = {}) {
+    lastChartMode = "backtest";
+    lastChartSeries = normaliseChartSeries(series);
+    lastChartTrades = normaliseChartTrades(trades);
+    lastChartMeta = meta && typeof meta === "object" ? meta : {};
+    window.__BACKTEST_CHART_SERIES = lastChartSeries.slice();
+    window.__BACKTEST_CHART_TRADES = lastChartTrades.slice();
+    if (!$("#trend-chart-modal")?.hidden) drawTrendChart();
+  }
+  window.__setTrendChartData = setTrendChartData;
+  window.__setBacktestTrendChartData = setBacktestTrendChartData;
+
+  function fmtChartValue(value, key = "") {
+    if (value === null || value === undefined || value === "" || !Number.isFinite(Number(value))) return "--";
+    const n = Number(value);
+    if (/pct|drawdown|return|rsi/i.test(key)) return `${n.toFixed(2)}%`;
+    if (Math.abs(n) >= 100) return n.toFixed(2);
+    if (Math.abs(n) >= 1) return n.toFixed(4);
+    return n.toFixed(6);
+  }
+  function renderTrendChartKpis() {
+    const host = $("#trend-chart-kpis");
+    if (!host) return;
+    if (!lastChartSeries.length) {
+      host.innerHTML = "";
+      return;
+    }
+    const last = lastChartSeries[lastChartSeries.length - 1] || {};
+    const prev = lastChartSeries.length >= 2 ? lastChartSeries[lastChartSeries.length - 2] : null;
+    const dayRet = prev && prev.close ? (last.close / prev.close - 1) * 100 : null;
+    const rows = [
+      ["最新", fmtChartValue(last.close, "close")],
+      ["日涨跌", fmtChartValue(dayRet, "return")],
+      ["MA20", fmtChartValue(last.ma20, "ma20")],
+      ["MA50", fmtChartValue(last.ma50, "ma50")],
+      ["MA200", fmtChartValue(last.ma200, "ma200")],
+      ["252日回撤", fmtChartValue(last.drawdown_252d, "drawdown_252d")],
+      ["RSI14", last.rsi14 === null ? "--" : Number(last.rsi14).toFixed(2)],
+      ["MACD柱%", fmtChartValue(last.macd_bar_pct, "macd_bar_pct")],
+      ["60日收益", fmtChartValue(last.return_60d, "return_60d")],
+      ...(lastChartMode === "backtest" ? [["交易点", `${lastChartTrades.length}个`]] : []),
+      ["样本", `${lastChartSeries.length}条`],
+    ];
+    host.innerHTML = rows.map(([label, value]) => `
+      <div class="trend-chart-kpi"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>
+    `).join("");
+  }
+  function drawTrendEmpty(ctx, w, h, text) {
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = "#fffdfa";
+    ctx.fillRect(0, 0, w, h);
+    ctx.fillStyle = "#8a7b6b";
+    ctx.font = "14px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(text, w / 2, h / 2);
+  }
+  function drawTrendChart() {
+    const canvas = $("#trend-chart-canvas");
+    const empty = $("#trend-chart-empty");
+    const meta = $("#trend-chart-meta");
+    renderTrendChartKpis();
+    const title = $("#trend-chart-title");
+    if (title) title.textContent = lastChartMode === "backtest" ? "回测趋势 / 买卖点" : "净值 / 均线趋势";
+    if (meta) {
+      const start = lastChartSeries[0]?.date || lastChartMeta.start || "--";
+      const end = lastChartSeries[lastChartSeries.length - 1]?.date || lastChartMeta.end || "--";
+      if (lastChartMode === "backtest") {
+        meta.textContent = lastChartSeries.length ? `${start} 至 ${end} · ${lastChartSeries.length}条 · 买卖点${lastChartTrades.length}个` : "暂无回测趋势图数据，请先运行历史回测。";
+      } else {
+        meta.textContent = lastChartSeries.length ? `${start} 至 ${end} · ${lastChartSeries.length}条 · 拉取后本地绘制` : "暂无数据，请先拉取标的数据。";
+      }
+    }
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const ratio = Math.max(window.devicePixelRatio || 1, 1);
+    const w = Math.max(320, Math.floor(rect.width || 920));
+    const h = Math.max(260, Math.floor(rect.height || 420));
+    canvas.width = Math.floor(w * ratio);
+    canvas.height = Math.floor(h * ratio);
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+
+    if (empty) empty.hidden = lastChartSeries.length >= 2;
+    if (lastChartSeries.length < 2) {
+      drawTrendEmpty(ctx, w, h, "暂无趋势图数据");
+      return;
+    }
+
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = "#fffdfa";
+    ctx.fillRect(0, 0, w, h);
+
+    const pad = {left: 58, right: 22, top: 22, bottom: 34};
+    const plotW = Math.max(10, w - pad.left - pad.right);
+    const plotH = Math.max(10, h - pad.top - pad.bottom);
+    const allValues = [];
+    for (const row of lastChartSeries) {
+      for (const line of CHART_LINES) {
+        const v = finiteNumber(row[line.key]);
+        if (v !== null) allValues.push(v);
+      }
+    }
+    if (!allValues.length) {
+      drawTrendEmpty(ctx, w, h, "没有可绘制的价格/均线数据");
+      return;
+    }
+    let minV = Math.min(...allValues);
+    let maxV = Math.max(...allValues);
+    if (minV === maxV) {
+      minV *= 0.98;
+      maxV *= 1.02;
+    }
+    const padding = (maxV - minV) * 0.08;
+    minV -= padding;
+    maxV += padding;
+    const xFor = idx => pad.left + (lastChartSeries.length === 1 ? 0 : idx / (lastChartSeries.length - 1) * plotW);
+    const yFor = value => pad.top + (maxV - value) / (maxV - minV) * plotH;
+
+    ctx.strokeStyle = "rgba(86, 67, 50, .14)";
+    ctx.lineWidth = 1;
+    ctx.fillStyle = "#7b6b5c";
+    ctx.font = "12px ui-monospace, SFMono-Regular, Consolas, monospace";
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    for (let i = 0; i <= 5; i++) {
+      const y = pad.top + i / 5 * plotH;
+      const value = maxV - i / 5 * (maxV - minV);
+      ctx.beginPath();
+      ctx.moveTo(pad.left, y);
+      ctx.lineTo(pad.left + plotW, y);
+      ctx.stroke();
+      ctx.fillText(fmtChartValue(value, "close"), pad.left - 8, y);
+    }
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    const ticks = Math.min(6, lastChartSeries.length);
+    for (let i = 0; i < ticks; i++) {
+      const idx = Math.round(i * (lastChartSeries.length - 1) / Math.max(ticks - 1, 1));
+      const x = xFor(idx);
+      ctx.strokeStyle = "rgba(86, 67, 50, .08)";
+      ctx.beginPath();
+      ctx.moveTo(x, pad.top);
+      ctx.lineTo(x, pad.top + plotH);
+      ctx.stroke();
+      ctx.fillStyle = "#8a7b6b";
+      ctx.fillText(lastChartSeries[idx].date.slice(5), x, pad.top + plotH + 10);
+    }
+    ctx.strokeStyle = "rgba(47, 36, 29, .28)";
+    ctx.strokeRect(pad.left, pad.top, plotW, plotH);
+
+    for (const line of CHART_LINES) {
+      ctx.beginPath();
+      let started = false;
+      let points = 0;
+      for (let idx = 0; idx < lastChartSeries.length; idx++) {
+        const v = finiteNumber(lastChartSeries[idx][line.key]);
+        if (v === null) {
+          started = false;
+          continue;
+        }
+        const x = xFor(idx);
+        const y = yFor(v);
+        if (!started) {
+          ctx.moveTo(x, y);
+          started = true;
+        } else {
+          ctx.lineTo(x, y);
+        }
+        points++;
+      }
+      if (points >= 2) {
+        ctx.strokeStyle = line.color;
+        ctx.lineWidth = line.width;
+        ctx.lineJoin = "round";
+        ctx.lineCap = "round";
+        ctx.stroke();
+      }
+    }
+
+    if (lastChartMode === "backtest" && lastChartTrades.length) {
+      const dateIndex = new Map(lastChartSeries.map((row, idx) => [row.date, idx]));
+      const nearestIndexForDate = date => {
+        if (dateIndex.has(date)) return dateIndex.get(date);
+        const t = Date.parse(date);
+        if (!Number.isFinite(t)) return -1;
+        let best = -1;
+        let bestDelta = Infinity;
+        for (let idx = 0; idx < lastChartSeries.length; idx++) {
+          const rt = Date.parse(lastChartSeries[idx].date);
+          if (!Number.isFinite(rt)) continue;
+          const delta = Math.abs(rt - t);
+          if (delta < bestDelta) {
+            bestDelta = delta;
+            best = idx;
+          }
+        }
+        return best;
+      };
+      ctx.font = "11px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      for (const trade of lastChartTrades) {
+        const idx = nearestIndexForDate(trade.date);
+        if (idx < 0) continue;
+        const row = lastChartSeries[idx];
+        const price = finiteNumber(trade.price) ?? finiteNumber(row.close);
+        if (price === null) continue;
+        const x = xFor(idx);
+        const y = yFor(price);
+        const isSell = /卖|减|清/.test(trade.direction);
+        const color = isSell ? "#c24135" : "#138a4f";
+        ctx.fillStyle = color;
+        ctx.strokeStyle = "#fffdfa";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        if (isSell) {
+          ctx.moveTo(x, y + 7);
+          ctx.lineTo(x - 7, y - 6);
+          ctx.lineTo(x + 7, y - 6);
+        } else {
+          ctx.moveTo(x, y - 7);
+          ctx.lineTo(x - 7, y + 6);
+          ctx.lineTo(x + 7, y + 6);
+        }
+        ctx.closePath();
+        ctx.stroke();
+        ctx.fill();
+
+        const pct = finiteNumber(trade.target_position_pct);
+        const label = `${isSell ? "卖" : "买"}${pct === null ? "" : ` ${pct.toFixed(0)}%`}`;
+        const labelY = Math.max(pad.top + 10, Math.min(pad.top + plotH - 10, y + (isSell ? -18 : 18)));
+        const textW = ctx.measureText(label).width + 10;
+        ctx.fillStyle = "rgba(255, 253, 250, .86)";
+        ctx.fillRect(x - textW / 2, labelY - 9, textW, 18);
+        ctx.strokeStyle = "rgba(86, 67, 50, .18)";
+        ctx.strokeRect(x - textW / 2, labelY - 9, textW, 18);
+        ctx.fillStyle = color;
+        ctx.fillText(label, x, labelY);
+      }
+    }
+  }
+  function openTrendChartModal() {
+    const modal = $("#trend-chart-modal");
+    if (modal) modal.hidden = false;
+    requestAnimationFrame(drawTrendChart);
+  }
+  function openAutoTrendChartModal() {
+    lastChartMode = "auto";
+    lastChartSeries = autoChartSeries.slice();
+    lastChartTrades = [];
+    lastChartMeta = Object.assign({}, autoChartMeta);
+    openTrendChartModal();
+  }
+  function openBacktestTrendChartModal(series = [], trades = [], meta = {}) {
+    setBacktestTrendChartData(series, trades, meta);
+    openTrendChartModal();
+  }
+  window.__openBacktestTrendChartModal = openBacktestTrendChartModal;
+  function closeTrendChartModal() {
+    const modal = $("#trend-chart-modal");
+    if (modal) modal.hidden = true;
+  }
+  window.addEventListener("resize", () => {
+    if (!$("#trend-chart-modal")?.hidden) drawTrendChart();
+  });
+
   function notifyFormChanged() {
     const form = $("#signal-form");
     if (form) {
@@ -1288,6 +1725,7 @@ input[type="range"]::-moz-range-thumb {
   function initAutoDataModal() {
     buildModalFields({});
     renderSummary({});
+    updateTrendChartButton();
     renderStrategySpecificInputs(resolveActiveStrategyFamily());
     const tabs = $("#strategy-family-tabs");
     if (tabs && window.MutationObserver) {
@@ -1301,7 +1739,9 @@ input[type="range"]::-moz-range-thumb {
       handleToggleableRadioClick(event);
       if (event.defaultPrevented) return;
       if (event.target.closest("#open-auto-data-modal-btn")) openModal();
+      if (event.target.closest("#open-trend-chart-btn")) openAutoTrendChartModal();
       if (event.target.closest("[data-close-auto-data]")) closeModal();
+      if (event.target.closest("[data-close-trend-chart]")) closeTrendChartModal();
       if (event.target.closest("#strategy-family-tabs")) {
         if (event.target.closest("[data-open-family-settings]")) return;
         const clickedKey = strategyFamilyKeyFromTarget(event.target);
@@ -1328,7 +1768,9 @@ input[type="range"]::-moz-range-thumb {
       }
     });
     document.addEventListener("keydown", event => {
-      if (event.key === "Escape" && !$("#auto-data-modal")?.hidden) closeModal();
+      if (event.key !== "Escape") return;
+      if (!$("#trend-chart-modal")?.hidden) closeTrendChartModal();
+      else if (!$("#auto-data-modal")?.hidden) closeModal();
     });
   }
 
@@ -1340,6 +1782,7 @@ input[type="range"]::-moz-range-thumb {
       if (String(url).includes("/api/fetch")) {
         response.clone().json().then(data => {
           if (data && data.ok !== false && data.indicators) {
+            setTrendChartData(data.chart_series || [], data.chart_meta || data);
             [0, 80, 240].forEach(delay => setTimeout(() => syncIndicators(data.indicators), delay));
           }
         }).catch(() => {});

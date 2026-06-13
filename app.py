@@ -5246,6 +5246,48 @@ def _as_optional_float_cell(value: Any) -> Any:
         return value
 
 
+def build_trend_chart_series(records: List[Dict[str, Any]], limit: int = 260) -> List[Dict[str, Any]]:
+    """把本次拉取到的行情序列整理成前端趋势图可直接绘制的数据。
+
+    只使用已有行情 records 计算，不新增网络请求；limit 默认约等于一年交易日，
+    保留少量常用技术字段，避免 /api/fetch 返回体过大。
+    """
+    try:
+        enriched = enrich_history_records_for_cache(records)
+    except Exception:
+        enriched = normalize_history_records(records)
+    keys = [
+        "date",
+        "close",
+        "ma20",
+        "ma50",
+        "ma200",
+        "drawdown_252d",
+        "rsi14",
+        "macd_bar_pct",
+        "return_60d",
+    ]
+    out: List[Dict[str, Any]] = []
+    for row in enriched[-max(int(limit or 260), 60):]:
+        item: Dict[str, Any] = {}
+        for key in keys:
+            value = row.get(key)
+            if value in (None, ""):
+                item[key] = None
+                continue
+            if key == "date":
+                item[key] = str(value)[:10]
+                continue
+            try:
+                v = float(value)
+                item[key] = None if math.isnan(v) or math.isinf(v) else round(v, 6)
+            except Exception:
+                item[key] = value
+        if item.get("date") and item.get("close") is not None:
+            out.append(item)
+    return out
+
+
 def enrich_history_records_for_cache(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """保存行情/净值时同步写入常用技术衍生字段。
 
@@ -6525,6 +6567,90 @@ def write_backtest_csv(path: str, rows: List[Dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+
+def build_backtest_trend_chart_series(records: List[Dict[str, Any]], start_index: int = 0, max_points: int = 2600) -> List[Dict[str, Any]]:
+    """把历史回测区间行情整理成趋势图序列。
+
+    与实时拉取趋势图不同，回测图需要保留整个回测区间，并且 MA20/50/200
+    需要使用开始日期之前的预热数据计算后再裁剪，避免图表开头均线大量为空。
+    """
+    try:
+        enriched = enrich_history_records_for_cache(records)
+    except Exception:
+        enriched = normalize_history_records(records)
+    try:
+        start = max(int(start_index or 0), 0)
+    except Exception:
+        start = 0
+    subset = enriched[start:]
+    if max_points and len(subset) > max_points:
+        subset = subset[-max_points:]
+    keys = [
+        "date",
+        "close",
+        "ma20",
+        "ma50",
+        "ma200",
+        "drawdown_252d",
+        "rsi14",
+        "macd_bar_pct",
+        "return_60d",
+    ]
+    out: List[Dict[str, Any]] = []
+    for row in subset:
+        item: Dict[str, Any] = {}
+        for key in keys:
+            value = row.get(key)
+            if value in (None, ""):
+                item[key] = None
+                continue
+            if key == "date":
+                item[key] = str(value)[:10]
+                continue
+            try:
+                v = float(value)
+                item[key] = None if math.isnan(v) or math.isinf(v) else round(v, 6)
+            except Exception:
+                item[key] = value
+        if item.get("date") and item.get("close") is not None:
+            out.append(item)
+    return out
+
+
+def build_backtest_trade_points(trades: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """把交易记录压缩成前端趋势图买卖点。"""
+    def _safe_float(value: Any) -> Optional[float]:
+        if value in (None, ""):
+            return None
+        try:
+            text = str(value).strip().replace(",", "")
+            if text.endswith("%"):
+                text = text[:-1]
+            v = float(text)
+            return None if math.isnan(v) or math.isinf(v) else v
+        except Exception:
+            return None
+
+    out: List[Dict[str, Any]] = []
+    for row in trades or []:
+        date_value = str(row.get("执行日") or row.get("信号日") or "")[:10]
+        if not date_value:
+            continue
+        price = _safe_float(row.get("成交价"))
+        target_pct = _safe_float(row.get("目标仓位%"))
+        point = {
+            "date": date_value,
+            "signal_date": str(row.get("信号日") or "")[:10],
+            "direction": str(row.get("方向") or ""),
+            "price": round(price, 6) if price is not None else None,
+            "target_position_pct": round(target_pct, 2) if target_pct is not None else None,
+            "asset_pct": str(row.get("当前总资产") or ""),
+            "action": str(row.get("操作建议") or ""),
+            "rule": str(row.get("命中规则") or ""),
+        }
+        out.append(point)
+    return out
+
 def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
     symbol = str(data.get("symbol") or cfg.get("symbol") or "").strip()
     if not symbol:
@@ -6709,7 +6835,7 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
                 current_total_asset = cash + shares * price
                 trades.append({
                     "信号日": signal_rec["date"], "执行日": next_rec["date"], "方向": "买入", "成交价": round(price, 4),
-                    "成交金额": round(gross, 2), "当前总资产": round(current_total_asset, 2), "目标仓位%": round(target_pos * 100, 2),
+                    "成交金额": round(gross, 2), "当前总资产": backtest_pct(current_total_asset / initial_cash * 100), "目标仓位%": round(target_pos * 100, 2),
                     "操作建议": payload_result.get("headline", last_signal), "命中规则": payload_metric_value(payload_result, "命中规则"),
                 })
         elif trade_value < 0 and shares > 0:
@@ -6727,7 +6853,7 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
             current_total_asset = cash + shares * price
             trades.append({
                 "信号日": signal_rec["date"], "执行日": next_rec["date"], "方向": "卖出", "成交价": round(price, 4),
-                "成交金额": round(gross, 2), "当前总资产": round(current_total_asset, 2), "目标仓位%": round(target_pos * 100, 2),
+                "成交金额": round(gross, 2), "当前总资产": backtest_pct(current_total_asset / initial_cash * 100), "目标仓位%": round(target_pos * 100, 2),
                 "操作建议": payload_result.get("headline", last_signal), "命中规则": payload_metric_value(payload_result, "命中规则"),
             })
 
@@ -6854,6 +6980,8 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
         str(cfg.get("symbol_name") or data.get("symbol_name") or ""),
     )
     metric_rows = backtest_metrics_rows(metrics)
+    backtest_chart_series = build_backtest_trend_chart_series(records, start_index)
+    backtest_trade_points = build_backtest_trade_points(trades)
 
     exported: Dict[str, str] = {}
     if export_files:
@@ -6888,6 +7016,16 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
         "trades": trades[-300:],
         "trade_count": len(trades),
         "curve_tail": equity_curve[-120:],
+        "backtest_chart_series": backtest_chart_series,
+        "backtest_trade_points": backtest_trade_points,
+        "backtest_chart_meta": {
+            "rows": len(backtest_chart_series),
+            "trades": len(backtest_trade_points),
+            "start": backtest_chart_series[0].get("date") if backtest_chart_series else "",
+            "end": backtest_chart_series[-1].get("date") if backtest_chart_series else "",
+            "symbol": symbol,
+            "market": market,
+        },
         "exported": exported,
         "fetch_errors": fetch_errors + valuation_trace + valuation_compare_notes,
     }
@@ -7219,6 +7357,7 @@ def api_fetch():
         indicators["source_used"] = source_used
         indicators["fetch_trace"] = trace
         indicators["proxy_mode"] = cfg.get("proxy_mode", "system")
+        chart_series = build_trend_chart_series(records)
         payload = {
             "ok": True,
             "symbol": symbol,
@@ -7227,6 +7366,12 @@ def api_fetch():
             "source": source_used,
             "trace": trace,
             "indicators": indicators,
+            "chart_series": chart_series,
+            "chart_meta": {
+                "rows": len(chart_series),
+                "start": chart_series[0].get("date") if chart_series else "",
+                "end": chart_series[-1].get("date") if chart_series else "",
+            },
             "message": f"数据已获取：{source_used} 成功。已自动填入中间表单；你可以手动覆盖。",
         }
         runtime_cache_set("fetch", cache_payload, payload)
@@ -7244,7 +7389,7 @@ def api_backtest():
     try:
         cfg = ensure_config()
         cache_payload = {
-            "version": 19,
+            "version": 20,
             "data": data,
             "cfg": {key: cfg.get(key) for key in [
                 "plan_amount", "strategy_family", "strategy", "strategy_mix", "strategy_family_params", "deviation", "position_mode", "backtest_risk_free_rate_pct",

@@ -1,15 +1,22 @@
-覆盖补丁：策略逻辑纯净隔离
+覆盖说明：历史回测趋势图补丁
 
-覆盖路径：
+覆盖文件：
 1. app.py
-2. strategies/families/simple_ma.py
+2. static/app.js
+3. templates/index.html
 
-修改重点：
-- 非信号驱动总体策略（例如 simple_ma、mini_factor_timing）直接走自己的 target_weight()。
-- 执行层只做仓位上下限、单次买卖节奏限制、0.5%微小变化过滤。
-- 不再把趋势信号策略的突破/回踩/跌破均线/止损/估值刹车/量价确认/赔率过滤套到其他策略上。
-- 简易均线策略只读取 ma_position 和本策略参数，不再调用 lower_floor()，因此不会被 PE/PB/ROE/market_state/market_risk 等全局信号污染。
+本次修改：
+1. /api/backtest 返回 backtest_chart_series、backtest_trade_points、backtest_chart_meta。
+2. 历史回测【交易记录】标题栏右侧新增【查看趋势图】按钮。
+3. 趋势图弹窗复用原“净值/均线趋势”弹窗，并在回测模式下显示买入点、卖出点。
+4. 买卖点标签显示操作方向和目标仓位百分比，例如“买 60%”“卖 35%”。
+5. 历史回测交易记录中的【当前总资产】改为相对初始资金的百分比，例如“103.25%”。
+6. 回测缓存版本从 19 提升到 20，避免旧缓存缺少图表字段。
 
-预期效果：
-- 选择“简易均线策略”且“远低于20日均线”时，即使 PE/PB 很高、趋势状态是震荡，也应按均线策略给出买入/加仓目标；最终只被单次买入节奏限制。
-- 选择“小因子择时策略”时，只按小因子策略文件里的因子模型输出目标仓位，不再被趋势信号硬规则覆盖。
+使用方式：
+把 zip 内文件按路径覆盖到项目根目录，重启 Flask。
+
+检查结果：
+- python -m py_compile app.py 通过
+- node --check static/app.js 通过
+- templates/index.html 新增内联脚本语法检查通过
