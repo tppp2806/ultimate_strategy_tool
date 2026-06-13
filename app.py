@@ -1616,6 +1616,25 @@ def raw_target_by_signal(cfg: Dict[str, Any], signals: Dict[str, Any], cur: floa
         signals["core_target_model"] = True
         core_target, core_notes = core_target_weight(cfg, signals)
 
+    # 非信号驱动策略（如【简易均线策略】）必须在这里直接返回自己的目标仓位。
+    # 这类策略只允许被自身参数/风格上限影响，不能继续落入下面的
+    # 初始止损、2R/3R止盈、跌破均线、突破失败等趋势交易通用规则。
+    if use_target_model:
+        target = core_target
+        action = target_action_from_delta(cur, target, buy_label="买入", sell_label="减仓")
+        base_rule = strategy_rule_label(signals, "目标仓位模型")
+        confidence = strategy_confidence_hint(signals, 68 if action in {"买入", "加仓"} else 62)
+        signals["pure_strategy_target"] = True
+        signals["strategy_rule_isolated"] = True
+        if action in {"买入", "加仓"}:
+            matched = f"{base_rule}：策略买入"
+        elif action in {"减仓", "清仓"}:
+            matched = f"{base_rule}：策略卖出"
+        else:
+            matched = f"{base_rule}：策略维持"
+        reason.extend(core_notes)
+        return action, clamp(target, 0.0, 0.9999), matched, reason, confidence
+
     # 1. 硬退出优先。定投增强策略不再把 200日线/50日线 当作一键清零，
     # 而是切换到更低的目标仓位；纯交易仓仍沿用原来的防守逻辑。
     if exit_state == "hit_stop":
