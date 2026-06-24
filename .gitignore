@@ -182,3 +182,4 @@ cython_debug/
 /backtest_reports
 /data
 /data
+/data/history_cache
