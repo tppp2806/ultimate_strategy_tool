@@ -6853,51 +6853,22 @@ def write_backtest_csv(path: str, rows: List[Dict[str, Any]]) -> None:
 
 
 
-def build_backtest_trend_chart_series(records: List[Dict[str, Any]], start_index: int = 0, max_points: int = 2600) -> List[Dict[str, Any]]:
-    """把历史回测区间行情整理成趋势图序列。
-
-    与实时拉取趋势图不同，回测图需要保留整个回测区间，并且 MA20/50/200
-    需要使用开始日期之前的预热数据计算后再裁剪，避免图表开头均线大量为空。
-    """
-    try:
-        enriched = enrich_history_records_for_cache(records)
-    except Exception:
-        enriched = normalize_history_records(records)
-    try:
-        start = max(int(start_index or 0), 0)
-    except Exception:
-        start = 0
-    subset = enriched[start:]
+def build_backtest_trend_chart_series(equity_curve: List[Dict[str, Any]], initial_cash: float, max_points: int = 2600) -> List[Dict[str, Any]]:
+    """把单标的回测权益曲线整理成趋势图序列。"""
+    subset = list(equity_curve or [])
     if max_points and len(subset) > max_points:
         subset = subset[-max_points:]
-    keys = [
-        "date",
-        "close",
-        "ma20",
-        "ma50",
-        "ma200",
-        "drawdown_252d",
-        "rsi14",
-        "macd_bar_pct",
-        "return_60d",
-    ]
+    base = max(float(initial_cash or 0.0), 1e-9)
     out: List[Dict[str, Any]] = []
     for row in subset:
-        item: Dict[str, Any] = {}
-        for key in keys:
-            value = row.get(key)
-            if value in (None, ""):
-                item[key] = None
-                continue
-            if key == "date":
-                item[key] = str(value)[:10]
-                continue
-            try:
-                v = float(value)
-                item[key] = None if math.isnan(v) or math.isinf(v) else round(v, 6)
-            except Exception:
-                item[key] = value
-        if item.get("date") and item.get("close") is not None:
+        item = {
+            "date": str(row.get("日期") or row.get("date") or "")[:10],
+            "close": round(as_float(row.get("策略权益"), 0.0) / base * 100.0, 6),
+            "ma20": round(as_float(row.get("定投策略权益"), 0.0) / base * 100.0, 6),
+            "ma50": round(as_float(row.get("买入持有权益"), 0.0) / base * 100.0, 6),
+            "ma200": None,
+        }
+        if item["date"]:
             out.append(item)
     return out
 
@@ -7307,7 +7278,7 @@ def run_backtest_single_asset(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict
         str(cfg.get("symbol_name") or data.get("symbol_name") or ""),
     )
     metric_rows = backtest_metrics_rows(metrics)
-    backtest_chart_series = build_backtest_trend_chart_series(records, start_index)
+    backtest_chart_series = build_backtest_trend_chart_series(equity_curve, initial_cash)
     backtest_trade_points = build_backtest_trade_points(trades)
 
     exported: Dict[str, str] = {}
@@ -7355,7 +7326,7 @@ def run_backtest_single_asset(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict
             "symbol": symbol,
             "market": market,
             "chart_type": "single_asset",
-            "line_labels": {"close": "基金净值/收盘", "ma20": "MA20", "ma50": "MA50", "ma200": "MA200"},
+            "line_labels": {"close": "系统策略", "ma20": "定投策略", "ma50": "持有策略"},
         },
         "exported": exported,
 

@@ -1144,7 +1144,7 @@ input[type="range"]::-moz-range-thumb {
   function chartLinesForCurrentMode() {
     const labels = (lastChartMeta && typeof lastChartMeta.line_labels === "object") ? lastChartMeta.line_labels : {};
     const base = CHART_LINES.map(line => ({...line, label: labels[line.key] || line.label}));
-    if (isPortfolioBacktestChart()) return base.filter(line => line.key !== "ma200");
+    if (lastChartMode === "backtest") return base.filter(line => ["close", "ma20", "ma50"].includes(line.key));
     return base;
   }
   function renderTrendChartLegend(lines = chartLinesForCurrentMode()) {
@@ -1248,11 +1248,12 @@ input[type="range"]::-moz-range-thumb {
     const prev = lastChartSeries.length >= 2 ? lastChartSeries[lastChartSeries.length - 2] : null;
     const dayRet = prev && prev.close ? (last.close / prev.close - 1) * 100 : null;
     const portfolioMode = isPortfolioBacktestChart();
-    const rows = portfolioMode ? [
-      ["组合策略权益指数", fmtChartValue(last.close, "close")],
+    const backtestMode = lastChartMode === "backtest";
+    const rows = backtestMode ? [
+      [portfolioMode ? "组合策略权益指数" : "系统策略权益指数", fmtChartValue(last.close, "close")],
       ["策略日收益", fmtChartValue(dayRet, "return")],
-      ["组合定投权益指数", fmtChartValue(last.ma20, "ma20")],
-      ["组合持有权益指数", fmtChartValue(last.ma50, "ma50")],
+      [portfolioMode ? "组合定投权益指数" : "定投策略权益指数", fmtChartValue(last.ma20, "ma20")],
+      [portfolioMode ? "组合持有权益指数" : "持有策略权益指数", fmtChartValue(last.ma50, "ma50")],
       ["交易点", `${lastChartTrades.length}个`],
       ["样本", `${lastChartSeries.length}条`],
     ] : [
@@ -1265,7 +1266,6 @@ input[type="range"]::-moz-range-thumb {
       ["RSI14", last.rsi14 === null ? "--" : Number(last.rsi14).toFixed(2)],
       ["MACD柱%", fmtChartValue(last.macd_bar_pct, "macd_bar_pct")],
       ["60日收益", fmtChartValue(last.return_60d, "return_60d")],
-      ...(lastChartMode === "backtest" ? [["交易点", `${lastChartTrades.length}个`]] : []),
       ["样本", `${lastChartSeries.length}条`],
     ];
     host.innerHTML = rows.map(([label, value]) => `
