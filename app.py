@@ -5213,6 +5213,9 @@ BACKTEST_METRIC_NOTES: Dict[str, str] = {
     "系统策略得分": "按年化超额收益、最大回撤控制、夏普比率、卡玛比率、执行质量综合评估系统策略表现。",
     "定投策略得分": "按年化超额收益、最大回撤控制、夏普比率、卡玛比率、执行质量综合评估定投基准表现。",
     "持有策略得分": "按年化超额收益、最大回撤控制、夏普比率、卡玛比率、执行质量综合评估一次性买入持有基准表现。",
+    "组合策略得分": "按组合策略权益的年化超额收益、最大回撤控制、夏普比率、卡玛比率和执行质量综合评估组合策略表现。",
+    "组合定投得分": "按组合定投基准权益的年化超额收益、最大回撤控制、夏普比率、卡玛比率和执行质量综合评估组合定投表现。",
+    "组合持有得分": "按组合买入持有基准权益的年化超额收益、最大回撤控制、夏普比率、卡玛比率和执行质量综合评估组合持有表现。",
     "卡玛比率": "（策略年化收益 - 无风险收益率）/ 策略最大回撤绝对值，越高表示单位回撤换来的超额收益越高。",
     "定投策略卡玛比率": "（定投策略年化收益 - 无风险收益率）/ 定投策略最大回撤绝对值，用作定投基准的风险收益比。",
     "持有策略卡玛比率": "（买入持有年化收益 - 无风险收益率）/ 买入持有最大回撤绝对值，用作买入持有基准的风险收益比。",
@@ -6754,6 +6757,7 @@ def backtest_metrics_rows(metrics: Dict[str, Any]) -> List[Dict[str, Any]]:
     # 前端会按同一顺序渲染；导出的核心指标 CSV 也保持这个顺序。
     order = [
         "标的核心得分", "系统策略得分", "定投策略得分", "持有策略得分",
+        "组合策略得分", "组合定投得分", "组合持有得分",
         "策略年化收益", "定投策略年化收益", "买入持有年化收益",
         "策略最大回撤", "定投策略最大回撤", "买入持有最大回撤",
         "夏普比率", "定投策略夏普比率", "持有策略夏普比率",
@@ -6906,11 +6910,15 @@ def build_backtest_trade_points(trades: List[Dict[str, Any]]) -> List[Dict[str, 
             "asset_pct": str(row.get("当前总资产") or ""),
             "action": str(row.get("操作建议") or ""),
             "rule": str(row.get("命中规则") or ""),
+            "symbol": str(row.get("标的") or ""),
+            "symbol_name": str(row.get("名称") or ""),
+            "plan_weight_pct": str(row.get("计划占比%") or ""),
+            "amount": str(row.get("成交金额") or ""),
         }
         out.append(point)
     return out
 
-def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
+def run_backtest_single_asset(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
     symbol = str(data.get("symbol") or cfg.get("symbol") or "").strip()
     if not symbol:
         raise RuntimeError("请先填写回测标的代码")
@@ -6955,7 +6963,7 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
         raise RuntimeError("可回测区间太短，或开始日期前没有足够预热数据")
 
     # 回测优先使用左侧【标的与资金】里的核心配置，避免回测页重复字段与主配置不一致。
-    initial_cash = max(as_float(cfg.get("plan_amount"), as_float(data.get("initial_cash"), 100000.0)), 1.0)
+    initial_cash = max(as_float(data.get("initial_cash"), as_float(cfg.get("plan_amount"), 100000.0)), 1.0)
     strategy_family = str(cfg.get("strategy_family") or data.get("strategy_family") or DEFAULT_STRATEGY_FAMILY)
     if strategy_family not in STRATEGY_FAMILIES:
         strategy_family = DEFAULT_STRATEGY_FAMILY
@@ -7281,6 +7289,8 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
             "定投基准": f"每 {rebalance_days} 个交易日定额买入；默认投入100%计划资金；排除最后一个可观测日；买入 {dca_buy_count} 次",
             "K线数量": len(records),
             "交易次数": len(trades),
+            "计划资金": backtest_money(initial_cash),
+            "组合计划占比": backtest_pct(as_float(data.get("plan_weight_pct"), 100.0)) if data.get("plan_weight_pct") not in (None, "") else "100%",
             "估值模式": {"none": "不使用估值修正", "fixed": "固定估值假设", "historical": "历史估值序列"}.get(valuation_mode, valuation_mode),
             "估值序列条数": len(valuation_series) if valuation_series else 0,
             "提示": "历史估值序列只使用当日及以前数据自算百分位；若不可用则不使用估值修正。" if valuation_mode == "historical" else ("PE/PB/ROE作为固定假设参与整段回测。" if valuation_mode == "fixed" else "本次回测不使用估值修正。"),
@@ -7298,10 +7308,319 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
             "end": backtest_chart_series[-1].get("date") if backtest_chart_series else "",
             "symbol": symbol,
             "market": market,
+            "chart_type": "single_asset",
+            "line_labels": {"close": "基金净值/收盘", "ma20": "MA20", "ma50": "MA50", "ma200": "MA200"},
         },
         "exported": exported,
+
         "fetch_errors": fetch_errors + valuation_trace + valuation_compare_notes,
+        "_equity_curve_full": equity_curve if data.get("_include_full_curve") else [],
+        "_trades_full": trades if data.get("_include_full_curve") else [],
+        "_allocated_cash": initial_cash,
     }
+
+
+def _parse_backtest_portfolio_items(data: Dict[str, Any], cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """读取历史回测页的固定计划占比组合。"""
+    raw_items = data.get("portfolio_items")
+    if raw_items is None:
+        raw_items = data.get("portfolio_items_json")
+    if isinstance(raw_items, str):
+        text = raw_items.strip()
+        if not text:
+            raw_items = []
+        else:
+            try:
+                raw_items = json.loads(text)
+            except Exception:
+                raise RuntimeError("组合配置 JSON 解析失败，请检查固定计划占比列表")
+    if not isinstance(raw_items, list):
+        raw_items = []
+
+    items: List[Dict[str, Any]] = []
+    seen = set()
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        symbol = str(raw.get("symbol") or "").strip()
+        if not symbol:
+            continue
+        market = str(raw.get("market") or "auto").strip().upper() or "AUTO"
+        symbol_name = str(raw.get("symbol_name") or raw.get("name") or symbol).strip()
+        asset_kind = resolve_asset_kind(symbol, market, str(raw.get("asset_kind") or "auto"), symbol_name)
+        source = str(raw.get("source") or raw.get("data_source") or cfg.get("data_source") or "auto").strip() or "auto"
+        target_pct = clamp(as_float(raw.get("target_pct", raw.get("plan_pct", raw.get("weight_pct", 0.0))), 0.0), 0.0, 100.0)
+        key = (symbol.upper(), market, asset_kind)
+        if target_pct <= 0 or key in seen:
+            continue
+        seen.add(key)
+        items.append({
+            "symbol": symbol,
+            "symbol_name": symbol_name,
+            "market": "CN" if market == "AUTO" and re.fullmatch(r"\d{6}", symbol) else (market if market != "AUTO" else "US"),
+            "asset_kind": asset_kind,
+            "source": source,
+            "target_pct": target_pct,
+        })
+    return items
+
+
+def _portfolio_curve_from_single_results(results: List[Dict[str, Any]], total_cash: float, unallocated_cash: float) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    dates = sorted({str(row.get("日期") or "")[:10] for item in results for row in item.get("_equity_curve_full", []) if row.get("日期")})
+    if not dates:
+        return [], []
+
+    state: List[Dict[str, Any]] = []
+    for item in results:
+        rows = item.get("_equity_curve_full", []) or []
+        by_date = {str(row.get("日期") or "")[:10]: row for row in rows if row.get("日期")}
+        allocated = float(item.get("_allocated_cash") or 0.0)
+        state.append({
+            "by_date": by_date,
+            "last_strategy": allocated,
+            "last_hold": allocated,
+            "last_dca": allocated,
+            "last_exposure_pct": 0.0,
+        })
+
+    equity_curve: List[Dict[str, Any]] = []
+    chart_series: List[Dict[str, Any]] = []
+    for d in dates:
+        strategy_total = float(unallocated_cash)
+        hold_total = float(unallocated_cash)
+        dca_total = float(unallocated_cash)
+        exposure_value = 0.0
+        for st in state:
+            row = st["by_date"].get(d)
+            if row:
+                st["last_strategy"] = as_float(row.get("策略权益"), st["last_strategy"])
+                st["last_hold"] = as_float(row.get("买入持有权益"), st["last_hold"])
+                st["last_dca"] = as_float(row.get("定投策略权益"), st["last_dca"])
+                st["last_exposure_pct"] = as_float(row.get("仓位比例%"), st["last_exposure_pct"])
+            strategy_total += st["last_strategy"]
+            hold_total += st["last_hold"]
+            dca_total += st["last_dca"]
+            exposure_value += st["last_strategy"] * st["last_exposure_pct"] / 100.0
+        exposure_pct = exposure_value / max(strategy_total, 1e-9) * 100.0
+        equity_curve.append({
+            "日期": d,
+            "策略权益": round(strategy_total, 2),
+            "买入持有权益": round(hold_total, 2),
+            "定投策略权益": round(dca_total, 2),
+            "组合仓位%": round(exposure_pct, 2),
+            "现金/未分配": round(unallocated_cash, 2),
+        })
+        chart_series.append({
+            "date": d,
+            # 组合趋势图使用权益指数口径：初始计划资金=100。
+            # 为了兼容前端原有画线字段，close/ma20/ma50 分别承载
+            # 组合策略权益、组合定投权益、组合买入持有权益，而不是单只基金净值/均线。
+            "close": round(strategy_total / max(total_cash, 1e-9) * 100.0, 6),
+            "ma20": round(dca_total / max(total_cash, 1e-9) * 100.0, 6),
+            "ma50": round(hold_total / max(total_cash, 1e-9) * 100.0, 6),
+            "ma200": None,
+        })
+    return equity_curve, chart_series
+
+
+def run_backtest_portfolio_web(data: Dict[str, Any], cfg: Dict[str, Any], items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    total_cash = max(as_float(data.get("initial_cash"), as_float(cfg.get("plan_amount"), 100000.0)), 1.0)
+    total_pct = sum(float(x.get("target_pct") or 0.0) for x in items)
+    if total_pct <= 0:
+        raise RuntimeError("请至少为一个组合标的设置大于 0% 的计划占比")
+    if total_pct > 100.0001:
+        raise RuntimeError(f"组合计划占比合计不能超过 100%，当前为 {total_pct:.2f}%")
+
+    risk_free_rate = backtest_risk_free_rate(data, cfg)
+    rebalance_days = int(clamp(as_float(data.get("rebalance_days"), 5), 1, 60))
+    export_files = bool(data.get("export_files"))
+    single_results: List[Dict[str, Any]] = []
+    all_trades: List[Dict[str, Any]] = []
+    fetch_errors: List[str] = []
+
+    for idx, item in enumerate(items, 1):
+        allocated_cash = total_cash * float(item["target_pct"]) / 100.0
+        item_data = dict(data)
+        item_data.update({
+            "portfolio_enabled": False,
+            "portfolio_items": [],
+            "portfolio_items_json": "",
+            "symbol": item["symbol"],
+            "symbol_name": item.get("symbol_name") or item["symbol"],
+            "market": item.get("market") or "auto",
+            "asset_kind": item.get("asset_kind") or "auto",
+            "source": item.get("source") or cfg.get("data_source") or "auto",
+            "data_source": item.get("source") or cfg.get("data_source") or "auto",
+            "initial_cash": allocated_cash,
+            "plan_weight_pct": item["target_pct"],
+            "_include_full_curve": True,
+        })
+        try:
+            result = run_backtest_single_asset(item_data, cfg)
+        except Exception as exc:
+            raise RuntimeError(f"组合第 {idx} 个标的 {item['symbol']} 回测失败：{exc}")
+        result["_portfolio_item"] = item
+        single_results.append(result)
+        fetch_errors.extend([f"{item['symbol']}：{x}" for x in (result.get("fetch_errors") or [])])
+        for tr in result.get("_trades_full", []) or []:
+            row = dict(tr)
+            row = {"标的": item["symbol"], "名称": item.get("symbol_name") or item["symbol"], "计划占比%": round(float(item["target_pct"]), 2), **row}
+            all_trades.append(row)
+
+    unallocated_pct = max(0.0, 100.0 - total_pct)
+    unallocated_cash = total_cash * unallocated_pct / 100.0
+    equity_curve, chart_series = _portfolio_curve_from_single_results(single_results, total_cash, unallocated_cash)
+    if not equity_curve:
+        raise RuntimeError("组合回测没有生成权益曲线")
+
+    eq = [float(x["策略权益"]) for x in equity_curve]
+    hold = [float(x["买入持有权益"]) for x in equity_curve]
+    dca = [float(x["定投策略权益"]) for x in equity_curve]
+    days = (parse_date_safe(equity_curve[-1]["日期"]) - parse_date_safe(equity_curve[0]["日期"])).days
+    total_ret = eq[-1] / total_cash - 1.0
+    hold_ret = hold[-1] / total_cash - 1.0
+    dca_ret = dca[-1] / total_cash - 1.0
+    c = backtest_cagr(total_cash, eq[-1], days)
+    hc = backtest_cagr(total_cash, hold[-1], days)
+    dc = backtest_cagr(total_cash, dca[-1], days)
+    mdd = backtest_max_drawdown(eq)
+    hold_mdd = backtest_max_drawdown(hold)
+    dca_mdd = backtest_max_drawdown(dca)
+    vol = backtest_annual_vol(backtest_series_returns(eq))
+    sharpe = backtest_sharpe_ratio(eq, risk_free_rate)
+    hold_sharpe = backtest_sharpe_ratio(hold, risk_free_rate)
+    dca_sharpe = backtest_sharpe_ratio(dca, risk_free_rate)
+    calmar = backtest_calmar_ratio(c, mdd, risk_free_rate)
+    hold_calmar = backtest_calmar_ratio(hc, hold_mdd, risk_free_rate)
+    dca_calmar = backtest_calmar_ratio(dc, dca_mdd, risk_free_rate)
+    trade_turnover = sum(as_float(row.get("成交金额"), 0.0) for row in all_trades)
+    avg_exp = sum(as_float(row.get("组合仓位%"), 0.0) for row in equity_curve) / len(equity_curve)
+    strategy_score = backtest_strategy_score(c, mdd, calmar, sharpe, risk_free_rate, _system_execution_quality_score(avg_exp, len(all_trades)))
+    dca_buy_proxy = max(0, int(len(equity_curve) / max(rebalance_days, 1)))
+    dca_score = backtest_strategy_score(dc, dca_mdd, dca_calmar, dca_sharpe, risk_free_rate, _dca_execution_quality_score(dca_buy_proxy))
+    hold_score = backtest_strategy_score(hc, hold_mdd, hold_calmar, hold_sharpe, risk_free_rate, 95.0)
+
+    metrics = {
+        "组合策略得分": backtest_score_100(strategy_score),
+        "组合定投得分": backtest_score_100(dca_score),
+        "组合持有得分": backtest_score_100(hold_score),
+        "策略总收益": backtest_pct(total_ret * 100),
+        "定投策略总收益": backtest_pct(dca_ret * 100),
+        "买入持有总收益": backtest_pct(hold_ret * 100),
+        "策略年化收益": backtest_pct(c * 100),
+        "定投策略年化收益": backtest_pct(dc * 100),
+        "买入持有年化收益": backtest_pct(hc * 100),
+        "策略最大回撤": backtest_pct(mdd * 100),
+        "定投策略最大回撤": backtest_pct(dca_mdd * 100),
+        "买入持有最大回撤": backtest_pct(hold_mdd * 100),
+        "卡玛比率": round(calmar, 3),
+        "定投策略卡玛比率": round(dca_calmar, 3),
+        "持有策略卡玛比率": round(hold_calmar, 3),
+        "无风险收益率": backtest_pct(risk_free_rate * 100),
+        "年化波动": backtest_pct(vol * 100),
+        "夏普比率": round(sharpe, 3),
+        "定投策略夏普比率": round(dca_sharpe, 3),
+        "持有策略夏普比率": round(hold_sharpe, 3),
+        "交易次数": len(all_trades),
+        "平均仓位": backtest_pct(avg_exp),
+        "换手率": backtest_pct(trade_turnover / total_cash * 100),
+        "期末权益": backtest_money(eq[-1]),
+        "组合计划资金": backtest_money(total_cash),
+        "已分配计划占比": backtest_pct(total_pct),
+        "未分配现金占比": backtest_pct(unallocated_pct),
+        "组合标的数量": len(items),
+    }
+    build_backtest_diagnosis_metrics(
+        metrics,
+        total_ret=total_ret,
+        dca_ret=dca_ret,
+        bench_ret=hold_ret,
+        strategy_mdd=mdd,
+        dca_mdd=dca_mdd,
+        bench_mdd=hold_mdd,
+        avg_exp_pct=avg_exp,
+        turnover_value=trade_turnover,
+        initial_cash=total_cash,
+        fee=clamp(as_float(data.get("fee_bps"), 2.0), 0.0, 1000.0) / 10000.0,
+        effective_slip=clamp(as_float(data.get("slippage_bps"), 3.0), 0.0, 1000.0) / 10000.0,
+        trade_count=len(all_trades),
+    )
+    metric_rows = backtest_metrics_rows(metrics)
+    all_trades.sort(key=lambda r: (str(r.get("执行日") or ""), str(r.get("信号日") or ""), str(r.get("标的") or "")))
+
+    exported: Dict[str, str] = {}
+    if export_files:
+        outdir = os.path.join(APP_DIR, "backtest_reports")
+        os.makedirs(outdir, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        prefix = f"portfolio_{len(items)}assets_{stamp}"
+        metric_path = os.path.join(outdir, f"组合核心指标_{prefix}.csv")
+        trade_path = os.path.join(outdir, f"组合交易记录_{prefix}.csv")
+        curve_path = os.path.join(outdir, f"组合权益曲线_{prefix}.csv")
+        write_backtest_csv(metric_path, metric_rows)
+        write_backtest_csv(trade_path, all_trades)
+        write_backtest_csv(curve_path, equity_curve)
+        exported = {"组合核心指标": metric_path, "组合交易记录": trade_path, "组合权益曲线": curve_path}
+
+    plan_text = "；".join([f"{x.get('symbol_name') or x['symbol']}({x['symbol']}) {x['target_pct']:.2f}%" for x in items])
+    if unallocated_pct > 1e-6:
+        plan_text += f"；未分配现金 {unallocated_pct:.2f}%"
+
+    return {
+        "summary": {
+            "标的": f"固定计划占比组合（{len(items)}只）",
+            "市场": "组合",
+            "数据源": "多标的独立拉取",
+            "回测周期": f"{equity_curve[0]['日期']} ~ {equity_curve[-1]['日期']}",
+            "操作周期": f"每 {rebalance_days} 个交易日检查一次",
+            "定投基准": "每个标的按自己的固定计划资金独立定投；组合层按固定占比汇总。",
+            "K线数量": sum(int(as_float(r.get('summary', {}).get('K线数量'), 0.0)) for r in single_results),
+            "交易次数": len(all_trades),
+            "估值模式": str(single_results[0].get("summary", {}).get("估值模式") or ""),
+            "组合计划": plan_text,
+            "提示": "组合层只按固定计划占比分配资金，不做动态偏移；每只基金内部仍使用当前选择的总体策略/参数风格。",
+        },
+        "metrics": metric_rows,
+        "trades": all_trades[-500:],
+        "trade_count": len(all_trades),
+        "curve_tail": equity_curve[-180:],
+        "backtest_chart_series": chart_series[-2600:],
+        "backtest_trade_points": build_backtest_trade_points(all_trades),
+        "backtest_chart_meta": {
+            "rows": len(chart_series),
+            "trades": len(all_trades),
+            "start": chart_series[0].get("date") if chart_series else "",
+            "end": chart_series[-1].get("date") if chart_series else "",
+            "symbol": "PORTFOLIO",
+            "market": "组合",
+            "chart_type": "portfolio",
+            "line_labels": {"close": "组合策略权益指数", "ma20": "组合定投权益指数", "ma50": "组合持有权益指数"},
+            "chart_note": "组合图展示的是组合权益指数，初始计划资金=100；买卖点来自各基金独立策略交易，圆点贴在组合策略权益线。",
+        },
+        "exported": exported,
+        "fetch_errors": fetch_errors,
+        "portfolio_items": items,
+        "portfolio_results": [
+            {
+                "symbol": r.get("_portfolio_item", {}).get("symbol"),
+                "symbol_name": r.get("_portfolio_item", {}).get("symbol_name"),
+                "target_pct": r.get("_portfolio_item", {}).get("target_pct"),
+                "summary": r.get("summary", {}),
+                "metrics": r.get("metrics", []),
+            }
+            for r in single_results
+        ],
+    }
+
+
+def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
+    portfolio_enabled = bool(data.get("portfolio_enabled")) or str(data.get("portfolio_enabled") or "").strip().lower() in {"1", "true", "yes", "on"}
+    items = _parse_backtest_portfolio_items(data, cfg) if portfolio_enabled else []
+    if portfolio_enabled:
+        if not items:
+            raise RuntimeError("已启用固定计划占比组合，但组合标的列表为空")
+        return run_backtest_portfolio_web(data, cfg, items)
+    return run_backtest_single_asset(data, cfg)
 
 @app.route("/", methods=["GET"])
 def index():
@@ -7747,7 +8066,7 @@ def api_backtest():
     try:
         cfg = ensure_config()
         cache_payload = {
-            "version": 20,
+            "version": 21,
             "data": data,
             "cfg": {key: cfg.get(key) for key in [
                 "plan_amount", "strategy_family", "strategy", "strategy_mix", "strategy_family_params", "deviation", "position_mode", "backtest_risk_free_rate_pct",

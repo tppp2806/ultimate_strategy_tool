@@ -2416,9 +2416,148 @@
     return data;
   }
 
+
+
+  function readPortfolioItemsFromHidden() {
+    const hidden = $("#portfolio-items-json");
+    if (!hidden || !hidden.value) return [];
+    try {
+      const arr = JSON.parse(hidden.value);
+      return Array.isArray(arr) ? arr.filter(item => item && item.symbol) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function portfolioTotalPct(items = readPortfolioItemsFromHidden()) {
+    return items.reduce((sum, item) => sum + Math.max(0, numberOr(item.target_pct, 0)), 0);
+  }
+
+  function syncPortfolioItemsHidden() {
+    const host = $("#portfolio-items");
+    const hidden = $("#portfolio-items-json");
+    if (!host || !hidden) return [];
+    const rows = $$(".portfolio-item-row", host);
+    const items = rows.map(row => ({
+      symbol: row.querySelector('[data-field="symbol"]')?.value?.trim() || "",
+      symbol_name: row.querySelector('[data-field="symbol_name"]')?.value?.trim() || "",
+      market: row.querySelector('[data-field="market"]')?.value?.trim() || "auto",
+      asset_kind: row.querySelector('[data-field="asset_kind"]')?.value?.trim() || "auto",
+      source: row.querySelector('[data-field="source"]')?.value?.trim() || "auto",
+      target_pct: numberOr(row.querySelector('[data-field="target_pct"]')?.value, 0),
+    })).filter(item => item.symbol);
+    hidden.value = JSON.stringify(items);
+    updatePortfolioTotal(items);
+    return items;
+  }
+
+  function updatePortfolioTotal(items = readPortfolioItemsFromHidden()) {
+    const total = portfolioTotalPct(items);
+    const pill = $("#portfolio-total-pct");
+    if (!pill) return;
+    const cash = Math.max(0, 100 - total);
+    pill.textContent = total > 100.0001 ? `合计 ${total.toFixed(2)}%（超过100%）` : `合计 ${total.toFixed(2)}% · 现金 ${cash.toFixed(2)}%`;
+    pill.className = total > 100.0001 ? "pill danger" : (total >= 99.999 ? "pill buy" : "pill neutral");
+  }
+
+  function renderPortfolioItems(items = readPortfolioItemsFromHidden()) {
+    const host = $("#portfolio-items");
+    if (!host) return;
+    if (!items.length) {
+      host.innerHTML = `<div class="portfolio-empty">未添加组合标的。可以先在左侧搜索/选择基金，再点“添加左侧当前标的”。</div>`;
+      updatePortfolioTotal([]);
+      const hidden = $("#portfolio-items-json");
+      if (hidden) hidden.value = "[]";
+      return;
+    }
+    host.innerHTML = items.map((item, idx) => `
+      <div class="portfolio-item-row" data-index="${idx}">
+        <label><span>代码</span><input data-field="symbol" value="${escapeHTML(item.symbol || "")}" placeholder="如 017641"></label>
+        <label class="portfolio-name"><span>名称</span><input data-field="symbol_name" value="${escapeHTML(item.symbol_name || item.name || "")}" placeholder="可空"></label>
+        <label><span>市场</span><select data-field="market">
+          ${["auto", "CN", "US"].map(v => `<option value="${v}" ${(String(item.market || "auto").toUpperCase() === v.toUpperCase()) ? "selected" : ""}>${v}</option>`).join("")}
+        </select></label>
+        <label><span>类型</span><select data-field="asset_kind">
+          ${["auto", "fund", "etf", "index", "stock"].map(v => `<option value="${v}" ${(String(item.asset_kind || "auto").toLowerCase() === v) ? "selected" : ""}>${v}</option>`).join("")}
+        </select></label>
+        <label><span>数据源</span><select data-field="source">
+          ${["auto", "danjuan_only", "akshare", "yfinance", "stooq"].map(v => `<option value="${v}" ${(String(item.source || item.data_source || "auto") === v) ? "selected" : ""}>${v}</option>`).join("")}
+        </select></label>
+        <label><span>计划占比%</span><input data-field="target_pct" type="number" step="0.1" min="0" max="100" value="${numberOr(item.target_pct, 0)}"></label>
+        <button class="ghost-btn portfolio-remove" type="button" data-remove-portfolio-item="${idx}">删除</button>
+      </div>
+    `).join("");
+    syncPortfolioItemsHidden();
+  }
+
+  function addCurrentAssetToPortfolio() {
+    const cfg = toConfigPayload();
+    if (!cfg.symbol) {
+      showToast("请先在左侧搜索并选择一个标的", true);
+      return;
+    }
+    const items = readPortfolioItemsFromHidden();
+    const key = String(cfg.symbol).toUpperCase();
+    if (items.some(item => String(item.symbol || "").toUpperCase() === key)) {
+      showToast("这个标的已经在组合里", true);
+      return;
+    }
+    const remaining = Math.max(0, 100 - portfolioTotalPct(items));
+    items.push({
+      symbol: cfg.symbol,
+      symbol_name: cfg.symbol_name || cfg.symbol,
+      market: cfg.market || "auto",
+      asset_kind: cfg.asset_kind || "auto",
+      source: cfg.data_source || "auto",
+      target_pct: items.length ? Math.min(remaining || 10, 30) : 100,
+    });
+    renderPortfolioItems(items);
+    saveBacktestState();
+  }
+
+  function normalizePortfolioTo100() {
+    const items = syncPortfolioItemsHidden();
+    const total = portfolioTotalPct(items);
+    if (!items.length || total <= 0) {
+      showToast("组合为空或占比合计为0", true);
+      return;
+    }
+    const normalized = items.map(item => ({...item, target_pct: Math.round((numberOr(item.target_pct, 0) / total * 100) * 100) / 100}));
+    renderPortfolioItems(normalized);
+    saveBacktestState();
+  }
+
+  function clearPortfolioItems() {
+    renderPortfolioItems([]);
+    saveBacktestState();
+  }
+
+  function initPortfolioEditor() {
+    renderPortfolioItems(readPortfolioItemsFromHidden());
+    const host = $("#portfolio-items");
+    if (host) {
+      host.addEventListener("input", () => { syncPortfolioItemsHidden(); saveBacktestState(); });
+      host.addEventListener("change", () => { syncPortfolioItemsHidden(); saveBacktestState(); });
+      host.addEventListener("click", event => {
+        const btn = event.target.closest("[data-remove-portfolio-item]");
+        if (!btn) return;
+        event.preventDefault();
+        const idx = Number(btn.dataset.removePortfolioItem);
+        const items = syncPortfolioItemsHidden();
+        if (Number.isFinite(idx)) items.splice(idx, 1);
+        renderPortfolioItems(items);
+        saveBacktestState();
+      });
+    }
+    $("#portfolio-add-current-btn")?.addEventListener("click", event => { event.preventDefault(); addCurrentAssetToPortfolio(); });
+    $("#portfolio-normalize-btn")?.addEventListener("click", event => { event.preventDefault(); normalizePortfolioTo100(); });
+    $("#portfolio-clear-btn")?.addEventListener("click", event => { event.preventDefault(); clearPortfolioItems(); });
+  }
+
   function saveBacktestState() {
     const form = $("#backtest-form");
     if (!form) return;
+    syncPortfolioItemsHidden();
     try {
       localStorage.setItem(BACKTEST_KEY, JSON.stringify(formToStorageObject(form)));
     } catch {}
@@ -2431,6 +2570,7 @@
       const raw = localStorage.getItem(BACKTEST_KEY);
       if (!raw) return;
       restoreForm(form, JSON.parse(raw));
+      renderPortfolioItems(readPortfolioItemsFromHidden());
     } catch {}
   }
 
@@ -2584,9 +2724,11 @@
     const s = result.summary || {};
     if (summary) {
       const dcaLine = s.定投基准 ? `定投基准：${escapeHTML(s.定投基准)}<br>` : "";
+      const portfolioLine = s.组合计划 ? `组合计划：${escapeHTML(s.组合计划)}<br>` : "";
       summary.innerHTML = `
         <b>${escapeHTML(s.标的 || "--")}</b> · ${escapeHTML(s.市场 || "--")} · ${escapeHTML(s.数据源 || "--")}<br>
         回测周期：${escapeHTML(s.回测周期 || "--")}；操作周期：${escapeHTML(s.操作周期 || "--")}；交易次数：${escapeHTML(s.交易次数 ?? "--")}<br>
+        ${portfolioLine}
         ${dcaLine}
         <span class="small">${escapeHTML(s.提示 || "")}</span>
       `;
@@ -2637,11 +2779,21 @@
     try {
       await saveConfigNow({quiet: true, recalc: false});
       const currentCfg = toConfigPayload();
-      if (!currentCfg.symbol) {
+      const rawForm = formToPlainObject(form);
+      const portfolioItems = syncPortfolioItemsHidden();
+      if (!currentCfg.symbol && !rawForm.portfolio_enabled) {
         throw new Error("请先在左侧搜索并选择一个当前标的");
       }
+      if (rawForm.portfolio_enabled && !portfolioItems.length) {
+        throw new Error("已启用固定计划占比组合，请至少添加一个组合标的");
+      }
+      const portfolioTotal = portfolioTotalPct(portfolioItems);
+      if (rawForm.portfolio_enabled && portfolioTotal > 100.0001) {
+        throw new Error(`组合计划占比合计不能超过100%，当前为 ${portfolioTotal.toFixed(2)}%`);
+      }
       const payload = {
-        ...formToPlainObject(form),
+        ...rawForm,
+        portfolio_items: portfolioItems,
         symbol: currentCfg.symbol,
         symbol_name: currentCfg.symbol_name,
         market: currentCfg.market || "auto",
@@ -2713,6 +2865,7 @@
     });
     const form = $("#backtest-form");
     loadBacktestState();
+    initPortfolioEditor();
     const valuationMode = $("#backtest-valuation-mode");
     if (valuationMode) {
       valuationMode.addEventListener("change", () => {

@@ -272,6 +272,20 @@
       </div>
 
       <form id="backtest-form" class="backtest-form">
+        <section class="backtest-portfolio-box">
+          <div class="portfolio-head">
+            <label class="inline-check strong"><input type="checkbox" name="portfolio_enabled" id="portfolio-enabled"> 启用固定计划占比组合</label>
+            <span id="portfolio-total-pct" class="pill neutral">合计 0%</span>
+          </div>
+          <p class="small">适合股票/债券/黄金/现金这类稳定配置：总计划资金仍来自左侧【计划资金】，每只基金按固定占比分到自己的计划资金，再分别套用当前总体策略。</p>
+          <input type="hidden" name="portfolio_items_json" id="portfolio-items-json" value="[]">
+          <div id="portfolio-items" class="portfolio-items"></div>
+          <div class="portfolio-actions">
+            <button class="btn mini light" type="button" id="portfolio-add-current-btn">添加左侧当前标的</button>
+            <button class="btn mini light" type="button" id="portfolio-normalize-btn">按合计归一到100%</button>
+            <button class="btn mini warn" type="button" id="portfolio-clear-btn">清空组合</button>
+          </div>
+        </section>
         <label class="field">
           <span>开始日期</span>
           <input type="date" name="start_date" value="2022-10-01">
@@ -450,7 +464,7 @@
     </header>
     <div class="trend-chart-tools">
       <span id="trend-chart-meta" class="small">拉取数据后可查看最近约一年趋势。</span>
-      <div class="trend-chart-legend" aria-label="图例">
+      <div id="trend-chart-legend" class="trend-chart-legend" aria-label="图例">
         <span><i data-line="close"></i>净值/收盘</span>
         <span><i data-line="ma20"></i>MA20</span>
         <span><i data-line="ma50"></i>MA50</span>
@@ -1123,6 +1137,24 @@ input[type="range"]::-moz-range-thumb {
     {key: "ma50", label: "MA50", color: "#2d63b8", width: 1.8},
     {key: "ma200", label: "MA200", color: "#b65d2a", width: 1.8}
   ];
+  function isPortfolioBacktestChart() {
+    return lastChartMode === "backtest" && String(lastChartMeta?.chart_type || "").toLowerCase() === "portfolio";
+  }
+  function chartLinesForCurrentMode() {
+    const labels = (lastChartMeta && typeof lastChartMeta.line_labels === "object") ? lastChartMeta.line_labels : {};
+    const base = CHART_LINES.map(line => ({...line, label: labels[line.key] || line.label}));
+    if (isPortfolioBacktestChart()) return base.filter(line => line.key !== "ma200");
+    return base;
+  }
+  function renderTrendChartLegend(lines = chartLinesForCurrentMode()) {
+    const host = $("#trend-chart-legend");
+    if (!host) return;
+    const lineHtml = lines.map(line => `<span><i data-line="${escapeHtml(line.key)}"></i>${escapeHtml(line.label)}</span>`).join("");
+    const tradeHtml = lastChartMode === "backtest"
+      ? `<span><i data-line="buy"></i>买入点</span><span><i data-line="sell"></i>卖出点</span>`
+      : "";
+    host.innerHTML = `${lineHtml}${tradeHtml}`;
+  }
 
   function finiteNumber(value) {
     if (value === null || value === undefined || value === "") return null;
@@ -1155,6 +1187,10 @@ input[type="range"]::-moz-range-thumb {
       asset_pct: String(row?.asset_pct || row?.["当前总资产"] || ""),
       action: String(row?.action || row?.操作建议 || ""),
       rule: String(row?.rule || row?.命中规则 || ""),
+      symbol: String(row?.symbol || row?.标的 || ""),
+      symbol_name: String(row?.symbol_name || row?.名称 || ""),
+      plan_weight_pct: String(row?.plan_weight_pct || row?.["计划占比%"] || ""),
+      amount: String(row?.amount || row?.成交金额 || ""),
     })).filter(row => row.date && row.direction);
   }
   function updateTrendChartButton() {
@@ -1210,7 +1246,15 @@ input[type="range"]::-moz-range-thumb {
     const last = lastChartSeries[lastChartSeries.length - 1] || {};
     const prev = lastChartSeries.length >= 2 ? lastChartSeries[lastChartSeries.length - 2] : null;
     const dayRet = prev && prev.close ? (last.close / prev.close - 1) * 100 : null;
-    const rows = [
+    const portfolioMode = isPortfolioBacktestChart();
+    const rows = portfolioMode ? [
+      ["组合策略权益指数", fmtChartValue(last.close, "close")],
+      ["策略日收益", fmtChartValue(dayRet, "return")],
+      ["组合定投权益指数", fmtChartValue(last.ma20, "ma20")],
+      ["组合持有权益指数", fmtChartValue(last.ma50, "ma50")],
+      ["交易点", `${lastChartTrades.length}个`],
+      ["样本", `${lastChartSeries.length}条`],
+    ] : [
       ["最新", fmtChartValue(last.close, "close")],
       ["日涨跌", fmtChartValue(dayRet, "return")],
       ["MA20", fmtChartValue(last.ma20, "ma20")],
@@ -1238,8 +1282,12 @@ input[type="range"]::-moz-range-thumb {
     const card = $("#trend-chart-hover-card");
     if (!card || !marker) return;
     const reason = String(marker.trade?.rule || marker.trade?.action || "暂无操作原因").trim() || "暂无操作原因";
+    const asset = [marker.trade?.symbol_name, marker.trade?.symbol].filter(Boolean).join(" · ");
+    const plan = marker.trade?.plan_weight_pct ? `计划占比 ${marker.trade.plan_weight_pct}%` : "";
+    const action = `${marker.trade?.direction || ""}${marker.trade?.trade_pct !== null && marker.trade?.trade_pct !== undefined ? ` ${marker.trade.trade_pct}%` : ""}`.trim();
     card.innerHTML = `
-      <strong>操作原因</strong>
+      <strong>${escapeHtml(asset || "操作原因")}</strong>
+      <div class="muted">${escapeHtml([action, plan, marker.trade?.amount ? `成交金额 ${marker.trade.amount}` : ""].filter(Boolean).join(" · "))}</div>
       <div class="reason-text">${escapeHtml(reason)}</div>
     `;
     card.hidden = false;
@@ -1357,11 +1405,22 @@ input[type="range"]::-moz-range-thumb {
     const meta = $("#trend-chart-meta");
     renderTrendChartKpis();
     const title = $("#trend-chart-title");
-    if (title) title.textContent = lastChartMode === "backtest" ? "回测趋势 / 买卖点" : "净值 / 均线趋势";
+    const portfolioMode = isPortfolioBacktestChart();
+    const chartLines = chartLinesForCurrentMode();
+    renderTrendChartLegend(chartLines);
+    if (title) {
+      title.textContent = portfolioMode
+        ? "组合回测趋势 / 各基金买卖点"
+        : (lastChartMode === "backtest" ? "单标的回测趋势 / 买卖点" : "净值 / 均线趋势");
+    }
     if (meta) {
       const start = lastChartSeries[0]?.date || lastChartMeta.start || "--";
       const end = lastChartSeries[lastChartSeries.length - 1]?.date || lastChartMeta.end || "--";
-      if (lastChartMode === "backtest") {
+      if (portfolioMode) {
+        meta.textContent = lastChartSeries.length
+          ? `${start} 至 ${end} · ${lastChartSeries.length}条 · 组合权益指数初始=100 · 买卖点${lastChartTrades.length}个（各基金交易）`
+          : "暂无组合回测趋势图数据，请先运行历史回测。";
+      } else if (lastChartMode === "backtest") {
         meta.textContent = lastChartSeries.length ? `${start} 至 ${end} · ${lastChartSeries.length}条 · 买卖点${lastChartTrades.length}个` : "暂无回测趋势图数据，请先运行历史回测。";
       } else {
         meta.textContent = lastChartSeries.length ? `${start} 至 ${end} · ${lastChartSeries.length}条 · 拉取后本地绘制` : "暂无数据，请先拉取标的数据。";
@@ -1393,7 +1452,7 @@ input[type="range"]::-moz-range-thumb {
     const plotH = Math.max(10, h - pad.top - pad.bottom);
     const allValues = [];
     for (const row of lastChartSeries) {
-      for (const line of CHART_LINES) {
+      for (const line of chartLines) {
         const v = finiteNumber(row[line.key]);
         if (v !== null) allValues.push(v);
       }
@@ -1446,7 +1505,7 @@ input[type="range"]::-moz-range-thumb {
     ctx.strokeStyle = "rgba(47, 36, 29, .28)";
     ctx.strokeRect(pad.left, pad.top, plotW, plotH);
 
-    for (const line of CHART_LINES) {
+    for (const line of chartLines) {
       ctx.beginPath();
       let started = false;
       let points = 0;

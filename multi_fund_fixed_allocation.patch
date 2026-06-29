@@ -1,0 +1,671 @@
+diff --git a/app.py b/app.py
+index bc17c2a..a7a9ed0 100644
+--- a/app.py
++++ b/app.py
+@@ -6910,7 +6910,7 @@ def build_backtest_trade_points(trades: List[Dict[str, Any]]) -> List[Dict[str,
+         out.append(point)
+     return out
+ 
+-def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
++def run_backtest_single_asset(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
+     symbol = str(data.get("symbol") or cfg.get("symbol") or "").strip()
+     if not symbol:
+         raise RuntimeError("请先填写回测标的代码")
+@@ -6955,7 +6955,7 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
+         raise RuntimeError("可回测区间太短，或开始日期前没有足够预热数据")
+ 
+     # 回测优先使用左侧【标的与资金】里的核心配置，避免回测页重复字段与主配置不一致。
+-    initial_cash = max(as_float(cfg.get("plan_amount"), as_float(data.get("initial_cash"), 100000.0)), 1.0)
++    initial_cash = max(as_float(data.get("initial_cash"), as_float(cfg.get("plan_amount"), 100000.0)), 1.0)
+     strategy_family = str(cfg.get("strategy_family") or data.get("strategy_family") or DEFAULT_STRATEGY_FAMILY)
+     if strategy_family not in STRATEGY_FAMILIES:
+         strategy_family = DEFAULT_STRATEGY_FAMILY
+@@ -7281,6 +7281,8 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
+             "定投基准": f"每 {rebalance_days} 个交易日定额买入；默认投入100%计划资金；排除最后一个可观测日；买入 {dca_buy_count} 次",
+             "K线数量": len(records),
+             "交易次数": len(trades),
++            "计划资金": backtest_money(initial_cash),
++            "组合计划占比": backtest_pct(as_float(data.get("plan_weight_pct"), 100.0)) if data.get("plan_weight_pct") not in (None, "") else "100%",
+             "估值模式": {"none": "不使用估值修正", "fixed": "固定估值假设", "historical": "历史估值序列"}.get(valuation_mode, valuation_mode),
+             "估值序列条数": len(valuation_series) if valuation_series else 0,
+             "提示": "历史估值序列只使用当日及以前数据自算百分位；若不可用则不使用估值修正。" if valuation_mode == "historical" else ("PE/PB/ROE作为固定假设参与整段回测。" if valuation_mode == "fixed" else "本次回测不使用估值修正。"),
+@@ -7300,8 +7302,309 @@ def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
+             "market": market,
+         },
+         "exported": exported,
++
+         "fetch_errors": fetch_errors + valuation_trace + valuation_compare_notes,
++        "_equity_curve_full": equity_curve if data.get("_include_full_curve") else [],
++        "_trades_full": trades if data.get("_include_full_curve") else [],
++        "_allocated_cash": initial_cash,
++    }
++
++
++def _parse_backtest_portfolio_items(data: Dict[str, Any], cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
++    """读取历史回测页的固定计划占比组合。"""
++    raw_items = data.get("portfolio_items")
++    if raw_items is None:
++        raw_items = data.get("portfolio_items_json")
++    if isinstance(raw_items, str):
++        text = raw_items.strip()
++        if not text:
++            raw_items = []
++        else:
++            try:
++                raw_items = json.loads(text)
++            except Exception:
++                raise RuntimeError("组合配置 JSON 解析失败，请检查固定计划占比列表")
++    if not isinstance(raw_items, list):
++        raw_items = []
++
++    items: List[Dict[str, Any]] = []
++    seen = set()
++    for raw in raw_items:
++        if not isinstance(raw, dict):
++            continue
++        symbol = str(raw.get("symbol") or "").strip()
++        if not symbol:
++            continue
++        market = str(raw.get("market") or "auto").strip().upper() or "AUTO"
++        symbol_name = str(raw.get("symbol_name") or raw.get("name") or symbol).strip()
++        asset_kind = resolve_asset_kind(symbol, market, str(raw.get("asset_kind") or "auto"), symbol_name)
++        source = str(raw.get("source") or raw.get("data_source") or cfg.get("data_source") or "auto").strip() or "auto"
++        target_pct = clamp(as_float(raw.get("target_pct", raw.get("plan_pct", raw.get("weight_pct", 0.0))), 0.0), 0.0, 100.0)
++        key = (symbol.upper(), market, asset_kind)
++        if target_pct <= 0 or key in seen:
++            continue
++        seen.add(key)
++        items.append({
++            "symbol": symbol,
++            "symbol_name": symbol_name,
++            "market": "CN" if market == "AUTO" and re.fullmatch(r"\d{6}", symbol) else (market if market != "AUTO" else "US"),
++            "asset_kind": asset_kind,
++            "source": source,
++            "target_pct": target_pct,
++        })
++    return items
++
++
++def _portfolio_curve_from_single_results(results: List[Dict[str, Any]], total_cash: float, unallocated_cash: float) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
++    dates = sorted({str(row.get("日期") or "")[:10] for item in results for row in item.get("_equity_curve_full", []) if row.get("日期")})
++    if not dates:
++        return [], []
++
++    state: List[Dict[str, Any]] = []
++    for item in results:
++        rows = item.get("_equity_curve_full", []) or []
++        by_date = {str(row.get("日期") or "")[:10]: row for row in rows if row.get("日期")}
++        allocated = float(item.get("_allocated_cash") or 0.0)
++        state.append({
++            "by_date": by_date,
++            "last_strategy": allocated,
++            "last_hold": allocated,
++            "last_dca": allocated,
++            "last_exposure_pct": 0.0,
++        })
++
++    equity_curve: List[Dict[str, Any]] = []
++    chart_series: List[Dict[str, Any]] = []
++    for d in dates:
++        strategy_total = float(unallocated_cash)
++        hold_total = float(unallocated_cash)
++        dca_total = float(unallocated_cash)
++        exposure_value = 0.0
++        for st in state:
++            row = st["by_date"].get(d)
++            if row:
++                st["last_strategy"] = as_float(row.get("策略权益"), st["last_strategy"])
++                st["last_hold"] = as_float(row.get("买入持有权益"), st["last_hold"])
++                st["last_dca"] = as_float(row.get("定投策略权益"), st["last_dca"])
++                st["last_exposure_pct"] = as_float(row.get("仓位比例%"), st["last_exposure_pct"])
++            strategy_total += st["last_strategy"]
++            hold_total += st["last_hold"]
++            dca_total += st["last_dca"]
++            exposure_value += st["last_strategy"] * st["last_exposure_pct"] / 100.0
++        exposure_pct = exposure_value / max(strategy_total, 1e-9) * 100.0
++        equity_curve.append({
++            "日期": d,
++            "策略权益": round(strategy_total, 2),
++            "买入持有权益": round(hold_total, 2),
++            "定投策略权益": round(dca_total, 2),
++            "组合仓位%": round(exposure_pct, 2),
++            "现金/未分配": round(unallocated_cash, 2),
++        })
++        chart_series.append({
++            "date": d,
++            "close": round(strategy_total / max(total_cash, 1e-9) * 100.0, 6),
++            "ma20": round(dca_total / max(total_cash, 1e-9) * 100.0, 6),
++            "ma50": round(hold_total / max(total_cash, 1e-9) * 100.0, 6),
++            "ma200": None,
++        })
++    return equity_curve, chart_series
++
++
++def run_backtest_portfolio_web(data: Dict[str, Any], cfg: Dict[str, Any], items: List[Dict[str, Any]]) -> Dict[str, Any]:
++    total_cash = max(as_float(data.get("initial_cash"), as_float(cfg.get("plan_amount"), 100000.0)), 1.0)
++    total_pct = sum(float(x.get("target_pct") or 0.0) for x in items)
++    if total_pct <= 0:
++        raise RuntimeError("请至少为一个组合标的设置大于 0% 的计划占比")
++    if total_pct > 100.0001:
++        raise RuntimeError(f"组合计划占比合计不能超过 100%，当前为 {total_pct:.2f}%")
++
++    risk_free_rate = backtest_risk_free_rate(data, cfg)
++    rebalance_days = int(clamp(as_float(data.get("rebalance_days"), 5), 1, 60))
++    export_files = bool(data.get("export_files"))
++    single_results: List[Dict[str, Any]] = []
++    all_trades: List[Dict[str, Any]] = []
++    fetch_errors: List[str] = []
++
++    for idx, item in enumerate(items, 1):
++        allocated_cash = total_cash * float(item["target_pct"]) / 100.0
++        item_data = dict(data)
++        item_data.update({
++            "portfolio_enabled": False,
++            "portfolio_items": [],
++            "portfolio_items_json": "",
++            "symbol": item["symbol"],
++            "symbol_name": item.get("symbol_name") or item["symbol"],
++            "market": item.get("market") or "auto",
++            "asset_kind": item.get("asset_kind") or "auto",
++            "source": item.get("source") or cfg.get("data_source") or "auto",
++            "data_source": item.get("source") or cfg.get("data_source") or "auto",
++            "initial_cash": allocated_cash,
++            "plan_weight_pct": item["target_pct"],
++            "_include_full_curve": True,
++        })
++        try:
++            result = run_backtest_single_asset(item_data, cfg)
++        except Exception as exc:
++            raise RuntimeError(f"组合第 {idx} 个标的 {item['symbol']} 回测失败：{exc}")
++        result["_portfolio_item"] = item
++        single_results.append(result)
++        fetch_errors.extend([f"{item['symbol']}：{x}" for x in (result.get("fetch_errors") or [])])
++        for tr in result.get("_trades_full", []) or []:
++            row = dict(tr)
++            row = {"标的": item["symbol"], "名称": item.get("symbol_name") or item["symbol"], "计划占比%": round(float(item["target_pct"]), 2), **row}
++            all_trades.append(row)
++
++    unallocated_pct = max(0.0, 100.0 - total_pct)
++    unallocated_cash = total_cash * unallocated_pct / 100.0
++    equity_curve, chart_series = _portfolio_curve_from_single_results(single_results, total_cash, unallocated_cash)
++    if not equity_curve:
++        raise RuntimeError("组合回测没有生成权益曲线")
++
++    eq = [float(x["策略权益"]) for x in equity_curve]
++    hold = [float(x["买入持有权益"]) for x in equity_curve]
++    dca = [float(x["定投策略权益"]) for x in equity_curve]
++    days = (parse_date_safe(equity_curve[-1]["日期"]) - parse_date_safe(equity_curve[0]["日期"])).days
++    total_ret = eq[-1] / total_cash - 1.0
++    hold_ret = hold[-1] / total_cash - 1.0
++    dca_ret = dca[-1] / total_cash - 1.0
++    c = backtest_cagr(total_cash, eq[-1], days)
++    hc = backtest_cagr(total_cash, hold[-1], days)
++    dc = backtest_cagr(total_cash, dca[-1], days)
++    mdd = backtest_max_drawdown(eq)
++    hold_mdd = backtest_max_drawdown(hold)
++    dca_mdd = backtest_max_drawdown(dca)
++    vol = backtest_annual_vol(backtest_series_returns(eq))
++    sharpe = backtest_sharpe_ratio(eq, risk_free_rate)
++    hold_sharpe = backtest_sharpe_ratio(hold, risk_free_rate)
++    dca_sharpe = backtest_sharpe_ratio(dca, risk_free_rate)
++    calmar = backtest_calmar_ratio(c, mdd, risk_free_rate)
++    hold_calmar = backtest_calmar_ratio(hc, hold_mdd, risk_free_rate)
++    dca_calmar = backtest_calmar_ratio(dc, dca_mdd, risk_free_rate)
++    trade_turnover = sum(as_float(row.get("成交金额"), 0.0) for row in all_trades)
++    avg_exp = sum(as_float(row.get("组合仓位%"), 0.0) for row in equity_curve) / len(equity_curve)
++    strategy_score = backtest_strategy_score(c, mdd, calmar, sharpe, risk_free_rate, _system_execution_quality_score(avg_exp, len(all_trades)))
++    dca_buy_proxy = max(0, int(len(equity_curve) / max(rebalance_days, 1)))
++    dca_score = backtest_strategy_score(dc, dca_mdd, dca_calmar, dca_sharpe, risk_free_rate, _dca_execution_quality_score(dca_buy_proxy))
++    hold_score = backtest_strategy_score(hc, hold_mdd, hold_calmar, hold_sharpe, risk_free_rate, 95.0)
++
++    metrics = {
++        "组合策略得分": backtest_score_100(strategy_score),
++        "组合定投得分": backtest_score_100(dca_score),
++        "组合持有得分": backtest_score_100(hold_score),
++        "策略总收益": backtest_pct(total_ret * 100),
++        "定投策略总收益": backtest_pct(dca_ret * 100),
++        "买入持有总收益": backtest_pct(hold_ret * 100),
++        "策略年化收益": backtest_pct(c * 100),
++        "定投策略年化收益": backtest_pct(dc * 100),
++        "买入持有年化收益": backtest_pct(hc * 100),
++        "策略最大回撤": backtest_pct(mdd * 100),
++        "定投策略最大回撤": backtest_pct(dca_mdd * 100),
++        "买入持有最大回撤": backtest_pct(hold_mdd * 100),
++        "卡玛比率": round(calmar, 3),
++        "定投策略卡玛比率": round(dca_calmar, 3),
++        "持有策略卡玛比率": round(hold_calmar, 3),
++        "无风险收益率": backtest_pct(risk_free_rate * 100),
++        "年化波动": backtest_pct(vol * 100),
++        "夏普比率": round(sharpe, 3),
++        "定投策略夏普比率": round(dca_sharpe, 3),
++        "持有策略夏普比率": round(hold_sharpe, 3),
++        "交易次数": len(all_trades),
++        "平均仓位": backtest_pct(avg_exp),
++        "换手率": backtest_pct(trade_turnover / total_cash * 100),
++        "期末权益": backtest_money(eq[-1]),
++        "组合计划资金": backtest_money(total_cash),
++        "已分配计划占比": backtest_pct(total_pct),
++        "未分配现金占比": backtest_pct(unallocated_pct),
++        "组合标的数量": len(items),
+     }
++    build_backtest_diagnosis_metrics(
++        metrics,
++        total_ret=total_ret,
++        dca_ret=dca_ret,
++        bench_ret=hold_ret,
++        strategy_mdd=mdd,
++        dca_mdd=dca_mdd,
++        bench_mdd=hold_mdd,
++        avg_exp_pct=avg_exp,
++        turnover_value=trade_turnover,
++        initial_cash=total_cash,
++        fee=clamp(as_float(data.get("fee_bps"), 2.0), 0.0, 1000.0) / 10000.0,
++        effective_slip=clamp(as_float(data.get("slippage_bps"), 3.0), 0.0, 1000.0) / 10000.0,
++        trade_count=len(all_trades),
++    )
++    metric_rows = backtest_metrics_rows(metrics)
++    all_trades.sort(key=lambda r: (str(r.get("执行日") or ""), str(r.get("信号日") or ""), str(r.get("标的") or "")))
++
++    exported: Dict[str, str] = {}
++    if export_files:
++        outdir = os.path.join(APP_DIR, "backtest_reports")
++        os.makedirs(outdir, exist_ok=True)
++        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
++        prefix = f"portfolio_{len(items)}assets_{stamp}"
++        metric_path = os.path.join(outdir, f"组合核心指标_{prefix}.csv")
++        trade_path = os.path.join(outdir, f"组合交易记录_{prefix}.csv")
++        curve_path = os.path.join(outdir, f"组合权益曲线_{prefix}.csv")
++        write_backtest_csv(metric_path, metric_rows)
++        write_backtest_csv(trade_path, all_trades)
++        write_backtest_csv(curve_path, equity_curve)
++        exported = {"组合核心指标": metric_path, "组合交易记录": trade_path, "组合权益曲线": curve_path}
++
++    plan_text = "；".join([f"{x.get('symbol_name') or x['symbol']}({x['symbol']}) {x['target_pct']:.2f}%" for x in items])
++    if unallocated_pct > 1e-6:
++        plan_text += f"；未分配现金 {unallocated_pct:.2f}%"
++
++    return {
++        "summary": {
++            "标的": f"固定计划占比组合（{len(items)}只）",
++            "市场": "组合",
++            "数据源": "多标的独立拉取",
++            "回测周期": f"{equity_curve[0]['日期']} ~ {equity_curve[-1]['日期']}",
++            "操作周期": f"每 {rebalance_days} 个交易日检查一次",
++            "定投基准": "每个标的按自己的固定计划资金独立定投；组合层按固定占比汇总。",
++            "K线数量": sum(int(as_float(r.get('summary', {}).get('K线数量'), 0.0)) for r in single_results),
++            "交易次数": len(all_trades),
++            "估值模式": str(single_results[0].get("summary", {}).get("估值模式") or ""),
++            "组合计划": plan_text,
++            "提示": "组合层只按固定计划占比分配资金，不做动态偏移；每只基金内部仍使用当前选择的总体策略/参数风格。",
++        },
++        "metrics": metric_rows,
++        "trades": all_trades[-500:],
++        "trade_count": len(all_trades),
++        "curve_tail": equity_curve[-180:],
++        "backtest_chart_series": chart_series[-2600:],
++        "backtest_trade_points": build_backtest_trade_points(all_trades),
++        "backtest_chart_meta": {
++            "rows": len(chart_series),
++            "trades": len(all_trades),
++            "start": chart_series[0].get("date") if chart_series else "",
++            "end": chart_series[-1].get("date") if chart_series else "",
++            "symbol": "PORTFOLIO",
++            "market": "组合",
++        },
++        "exported": exported,
++        "fetch_errors": fetch_errors,
++        "portfolio_items": items,
++        "portfolio_results": [
++            {
++                "symbol": r.get("_portfolio_item", {}).get("symbol"),
++                "symbol_name": r.get("_portfolio_item", {}).get("symbol_name"),
++                "target_pct": r.get("_portfolio_item", {}).get("target_pct"),
++                "summary": r.get("summary", {}),
++                "metrics": r.get("metrics", []),
++            }
++            for r in single_results
++        ],
++    }
++
++
++def run_backtest_web(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
++    portfolio_enabled = bool(data.get("portfolio_enabled")) or str(data.get("portfolio_enabled") or "").strip().lower() in {"1", "true", "yes", "on"}
++    items = _parse_backtest_portfolio_items(data, cfg) if portfolio_enabled else []
++    if portfolio_enabled:
++        if not items:
++            raise RuntimeError("已启用固定计划占比组合，但组合标的列表为空")
++        return run_backtest_portfolio_web(data, cfg, items)
++    return run_backtest_single_asset(data, cfg)
+ 
+ @app.route("/", methods=["GET"])
+ def index():
+@@ -7747,7 +8050,7 @@ def api_backtest():
+     try:
+         cfg = ensure_config()
+         cache_payload = {
+-            "version": 20,
++            "version": 21,
+             "data": data,
+             "cfg": {key: cfg.get(key) for key in [
+                 "plan_amount", "strategy_family", "strategy", "strategy_mix", "strategy_family_params", "deviation", "position_mode", "backtest_risk_free_rate_pct",
+diff --git a/static/app.js b/static/app.js
+index ca89a6e..046c592 100644
+--- a/static/app.js
++++ b/static/app.js
+@@ -2416,9 +2416,148 @@
+     return data;
+   }
+ 
++
++
++  function readPortfolioItemsFromHidden() {
++    const hidden = $("#portfolio-items-json");
++    if (!hidden || !hidden.value) return [];
++    try {
++      const arr = JSON.parse(hidden.value);
++      return Array.isArray(arr) ? arr.filter(item => item && item.symbol) : [];
++    } catch {
++      return [];
++    }
++  }
++
++  function portfolioTotalPct(items = readPortfolioItemsFromHidden()) {
++    return items.reduce((sum, item) => sum + Math.max(0, numberOr(item.target_pct, 0)), 0);
++  }
++
++  function syncPortfolioItemsHidden() {
++    const host = $("#portfolio-items");
++    const hidden = $("#portfolio-items-json");
++    if (!host || !hidden) return [];
++    const rows = $$(".portfolio-item-row", host);
++    const items = rows.map(row => ({
++      symbol: row.querySelector('[data-field="symbol"]')?.value?.trim() || "",
++      symbol_name: row.querySelector('[data-field="symbol_name"]')?.value?.trim() || "",
++      market: row.querySelector('[data-field="market"]')?.value?.trim() || "auto",
++      asset_kind: row.querySelector('[data-field="asset_kind"]')?.value?.trim() || "auto",
++      source: row.querySelector('[data-field="source"]')?.value?.trim() || "auto",
++      target_pct: numberOr(row.querySelector('[data-field="target_pct"]')?.value, 0),
++    })).filter(item => item.symbol);
++    hidden.value = JSON.stringify(items);
++    updatePortfolioTotal(items);
++    return items;
++  }
++
++  function updatePortfolioTotal(items = readPortfolioItemsFromHidden()) {
++    const total = portfolioTotalPct(items);
++    const pill = $("#portfolio-total-pct");
++    if (!pill) return;
++    const cash = Math.max(0, 100 - total);
++    pill.textContent = total > 100.0001 ? `合计 ${total.toFixed(2)}%（超过100%）` : `合计 ${total.toFixed(2)}% · 现金 ${cash.toFixed(2)}%`;
++    pill.className = total > 100.0001 ? "pill danger" : (total >= 99.999 ? "pill buy" : "pill neutral");
++  }
++
++  function renderPortfolioItems(items = readPortfolioItemsFromHidden()) {
++    const host = $("#portfolio-items");
++    if (!host) return;
++    if (!items.length) {
++      host.innerHTML = `<div class="portfolio-empty">未添加组合标的。可以先在左侧搜索/选择基金，再点“添加左侧当前标的”。</div>`;
++      updatePortfolioTotal([]);
++      const hidden = $("#portfolio-items-json");
++      if (hidden) hidden.value = "[]";
++      return;
++    }
++    host.innerHTML = items.map((item, idx) => `
++      <div class="portfolio-item-row" data-index="${idx}">
++        <label><span>代码</span><input data-field="symbol" value="${escapeHTML(item.symbol || "")}" placeholder="如 017641"></label>
++        <label class="portfolio-name"><span>名称</span><input data-field="symbol_name" value="${escapeHTML(item.symbol_name || item.name || "")}" placeholder="可空"></label>
++        <label><span>市场</span><select data-field="market">
++          ${["auto", "CN", "US"].map(v => `<option value="${v}" ${(String(item.market || "auto").toUpperCase() === v.toUpperCase()) ? "selected" : ""}>${v}</option>`).join("")}
++        </select></label>
++        <label><span>类型</span><select data-field="asset_kind">
++          ${["auto", "fund", "etf", "index", "stock"].map(v => `<option value="${v}" ${(String(item.asset_kind || "auto").toLowerCase() === v) ? "selected" : ""}>${v}</option>`).join("")}
++        </select></label>
++        <label><span>数据源</span><select data-field="source">
++          ${["auto", "danjuan_only", "akshare", "yfinance", "stooq"].map(v => `<option value="${v}" ${(String(item.source || item.data_source || "auto") === v) ? "selected" : ""}>${v}</option>`).join("")}
++        </select></label>
++        <label><span>计划占比%</span><input data-field="target_pct" type="number" step="0.1" min="0" max="100" value="${numberOr(item.target_pct, 0)}"></label>
++        <button class="ghost-btn portfolio-remove" type="button" data-remove-portfolio-item="${idx}">删除</button>
++      </div>
++    `).join("");
++    syncPortfolioItemsHidden();
++  }
++
++  function addCurrentAssetToPortfolio() {
++    const cfg = toConfigPayload();
++    if (!cfg.symbol) {
++      showToast("请先在左侧搜索并选择一个标的", true);
++      return;
++    }
++    const items = readPortfolioItemsFromHidden();
++    const key = String(cfg.symbol).toUpperCase();
++    if (items.some(item => String(item.symbol || "").toUpperCase() === key)) {
++      showToast("这个标的已经在组合里", true);
++      return;
++    }
++    const remaining = Math.max(0, 100 - portfolioTotalPct(items));
++    items.push({
++      symbol: cfg.symbol,
++      symbol_name: cfg.symbol_name || cfg.symbol,
++      market: cfg.market || "auto",
++      asset_kind: cfg.asset_kind || "auto",
++      source: cfg.data_source || "auto",
++      target_pct: items.length ? Math.min(remaining || 10, 30) : 100,
++    });
++    renderPortfolioItems(items);
++    saveBacktestState();
++  }
++
++  function normalizePortfolioTo100() {
++    const items = syncPortfolioItemsHidden();
++    const total = portfolioTotalPct(items);
++    if (!items.length || total <= 0) {
++      showToast("组合为空或占比合计为0", true);
++      return;
++    }
++    const normalized = items.map(item => ({...item, target_pct: Math.round((numberOr(item.target_pct, 0) / total * 100) * 100) / 100}));
++    renderPortfolioItems(normalized);
++    saveBacktestState();
++  }
++
++  function clearPortfolioItems() {
++    renderPortfolioItems([]);
++    saveBacktestState();
++  }
++
++  function initPortfolioEditor() {
++    renderPortfolioItems(readPortfolioItemsFromHidden());
++    const host = $("#portfolio-items");
++    if (host) {
++      host.addEventListener("input", () => { syncPortfolioItemsHidden(); saveBacktestState(); });
++      host.addEventListener("change", () => { syncPortfolioItemsHidden(); saveBacktestState(); });
++      host.addEventListener("click", event => {
++        const btn = event.target.closest("[data-remove-portfolio-item]");
++        if (!btn) return;
++        event.preventDefault();
++        const idx = Number(btn.dataset.removePortfolioItem);
++        const items = syncPortfolioItemsHidden();
++        if (Number.isFinite(idx)) items.splice(idx, 1);
++        renderPortfolioItems(items);
++        saveBacktestState();
++      });
++    }
++    $("#portfolio-add-current-btn")?.addEventListener("click", event => { event.preventDefault(); addCurrentAssetToPortfolio(); });
++    $("#portfolio-normalize-btn")?.addEventListener("click", event => { event.preventDefault(); normalizePortfolioTo100(); });
++    $("#portfolio-clear-btn")?.addEventListener("click", event => { event.preventDefault(); clearPortfolioItems(); });
++  }
++
+   function saveBacktestState() {
+     const form = $("#backtest-form");
+     if (!form) return;
++    syncPortfolioItemsHidden();
+     try {
+       localStorage.setItem(BACKTEST_KEY, JSON.stringify(formToStorageObject(form)));
+     } catch {}
+@@ -2431,6 +2570,7 @@
+       const raw = localStorage.getItem(BACKTEST_KEY);
+       if (!raw) return;
+       restoreForm(form, JSON.parse(raw));
++      renderPortfolioItems(readPortfolioItemsFromHidden());
+     } catch {}
+   }
+ 
+@@ -2584,9 +2724,11 @@
+     const s = result.summary || {};
+     if (summary) {
+       const dcaLine = s.定投基准 ? `定投基准：${escapeHTML(s.定投基准)}<br>` : "";
++      const portfolioLine = s.组合计划 ? `组合计划：${escapeHTML(s.组合计划)}<br>` : "";
+       summary.innerHTML = `
+         <b>${escapeHTML(s.标的 || "--")}</b> · ${escapeHTML(s.市场 || "--")} · ${escapeHTML(s.数据源 || "--")}<br>
+         回测周期：${escapeHTML(s.回测周期 || "--")}；操作周期：${escapeHTML(s.操作周期 || "--")}；交易次数：${escapeHTML(s.交易次数 ?? "--")}<br>
++        ${portfolioLine}
+         ${dcaLine}
+         <span class="small">${escapeHTML(s.提示 || "")}</span>
+       `;
+@@ -2637,11 +2779,21 @@
+     try {
+       await saveConfigNow({quiet: true, recalc: false});
+       const currentCfg = toConfigPayload();
+-      if (!currentCfg.symbol) {
++      const rawForm = formToPlainObject(form);
++      const portfolioItems = syncPortfolioItemsHidden();
++      if (!currentCfg.symbol && !rawForm.portfolio_enabled) {
+         throw new Error("请先在左侧搜索并选择一个当前标的");
+       }
++      if (rawForm.portfolio_enabled && !portfolioItems.length) {
++        throw new Error("已启用固定计划占比组合，请至少添加一个组合标的");
++      }
++      const portfolioTotal = portfolioTotalPct(portfolioItems);
++      if (rawForm.portfolio_enabled && portfolioTotal > 100.0001) {
++        throw new Error(`组合计划占比合计不能超过100%，当前为 ${portfolioTotal.toFixed(2)}%`);
++      }
+       const payload = {
+-        ...formToPlainObject(form),
++        ...rawForm,
++        portfolio_items: portfolioItems,
+         symbol: currentCfg.symbol,
+         symbol_name: currentCfg.symbol_name,
+         market: currentCfg.market || "auto",
+@@ -2713,6 +2865,7 @@
+     });
+     const form = $("#backtest-form");
+     loadBacktestState();
++    initPortfolioEditor();
+     const valuationMode = $("#backtest-valuation-mode");
+     if (valuationMode) {
+       valuationMode.addEventListener("change", () => {
+diff --git a/static/style.css b/static/style.css
+index 1fb909e..a9f9641 100644
+--- a/static/style.css
++++ b/static/style.css
+@@ -2571,3 +2571,86 @@ input[type="range"]::-moz-range-thumb {
+   background: var(--accent);
+   box-shadow: 0 2px 8px rgba(82, 62, 38, .18);
+ }
++
++/* 固定计划占比组合回测 */
++.backtest-portfolio-box {
++  grid-column: 1 / -1;
++  display: grid;
++  gap: 10px;
++  padding: 12px 13px;
++  border: 1px solid var(--line);
++  border-radius: 17px;
++  background: rgba(255,255,255,.54);
++}
++.portfolio-head,
++.portfolio-actions {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: 8px;
++  flex-wrap: wrap;
++}
++.inline-check.strong {
++  display: inline-flex;
++  align-items: center;
++  gap: 6px;
++  margin: 0;
++  font-weight: 950;
++  color: var(--ink);
++}
++.portfolio-items {
++  display: grid;
++  gap: 8px;
++}
++.portfolio-empty {
++  padding: 12px;
++  border: 1px dashed var(--line);
++  border-radius: 14px;
++  color: var(--muted);
++  background: rgba(255,250,242,.7);
++  font-size: 13px;
++}
++.portfolio-item-row {
++  display: grid;
++  grid-template-columns: minmax(96px, .85fr) minmax(150px, 1.2fr) minmax(76px, .58fr) minmax(82px, .62fr) minmax(108px, .8fr) minmax(98px, .65fr) auto;
++  gap: 7px;
++  align-items: end;
++  padding: 9px;
++  border: 1px solid rgba(143, 95, 54, .18);
++  border-radius: 14px;
++  background: #fffaf2;
++}
++.portfolio-item-row label {
++  display: grid;
++  gap: 4px;
++  min-width: 0;
++  margin: 0;
++}
++.portfolio-item-row label span {
++  font-size: 11px;
++  font-weight: 900;
++  color: var(--muted);
++}
++.portfolio-item-row input,
++.portfolio-item-row select {
++  width: 100%;
++  min-width: 0;
++  height: 34px;
++  padding: 0 8px;
++  border: 1px solid var(--line);
++  border-radius: 10px;
++  background: #fffdfa;
++}
++.portfolio-remove {
++  min-height: 34px;
++  padding: 0 10px;
++  color: var(--red);
++}
++@media (max-width: 860px) {
++  .portfolio-item-row {
++    grid-template-columns: repeat(2, minmax(0, 1fr));
++  }
++  .portfolio-remove {
++    grid-column: 1 / -1;
++  }
++}
+diff --git a/templates/index.html b/templates/index.html
+index 8ed26cc..4ca7de2 100644
+--- a/templates/index.html
++++ b/templates/index.html
+@@ -272,6 +272,20 @@
+       </div>
+ 
+       <form id="backtest-form" class="backtest-form">
++        <section class="backtest-portfolio-box">
++          <div class="portfolio-head">
++            <label class="inline-check strong"><input type="checkbox" name="portfolio_enabled" id="portfolio-enabled"> 启用固定计划占比组合</label>
++            <span id="portfolio-total-pct" class="pill neutral">合计 0%</span>
++          </div>
++          <p class="small">适合股票/债券/黄金/现金这类稳定配置：总计划资金仍来自左侧【计划资金】，每只基金按固定占比分到自己的计划资金，再分别套用当前总体策略。</p>
++          <input type="hidden" name="portfolio_items_json" id="portfolio-items-json" value="[]">
++          <div id="portfolio-items" class="portfolio-items"></div>
++          <div class="portfolio-actions">
++            <button class="btn mini light" type="button" id="portfolio-add-current-btn">添加左侧当前标的</button>
++            <button class="btn mini light" type="button" id="portfolio-normalize-btn">按合计归一到100%</button>
++            <button class="btn mini warn" type="button" id="portfolio-clear-btn">清空组合</button>
++          </div>
++        </section>
+         <label class="field">
+           <span>开始日期</span>
+           <input type="date" name="start_date" value="2022-10-01">
