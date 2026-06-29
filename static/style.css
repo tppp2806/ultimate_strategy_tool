@@ -1357,6 +1357,7 @@ textarea { resize: vertical; min-height: 74px; }
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 9px;
+  min-height: 515px;
 }
 .backtest-form .field,
 .backtest-form .backtest-fieldset,
@@ -2612,7 +2613,7 @@ input[type="range"]::-moz-range-thumb {
 }
 .portfolio-item-row {
   display: grid;
-  grid-template-columns: minmax(96px, .85fr) minmax(150px, 1.2fr) minmax(76px, .58fr) minmax(82px, .62fr) minmax(108px, .8fr) minmax(98px, .65fr) auto;
+  grid-template-columns: minmax(96px, .85fr) minmax(150px, 1.2fr) minmax(82px, .62fr) minmax(98px, .65fr) auto;
   gap: 7px;
   align-items: end;
   padding: 9px;

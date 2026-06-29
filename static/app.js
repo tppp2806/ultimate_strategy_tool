@@ -1747,18 +1747,29 @@
     }
   }
 
+  async function updateLocalSymbols() {
+    const btn = $("#local-symbols-update-btn");
+    const restore = setBusy(btn, "更新中…");
+    try {
+      const data = await postJSON("/api/local-symbols/update", {});
+      showToast(data.message || "本地代码映射表已更新");
+      loadIndexMap();
+    } catch (err) {
+      showToast(err.message || "本地代码映射表更新失败", true);
+    } finally {
+      restore();
+    }
+  }
+
 
   async function searchAsset() {
     const q = $("#asset-search-input")?.value?.trim();
     const host = $("#asset-candidates");
     if (!q) {
-      // 只有搜索框为空时，点击【搜索】才作为“收起下拉栏”。
       clearSearchResults(false);
       return;
     }
 
-    // 参数相同且已有候选时，不重复搜索；如果下拉栏被收起，则重新展开。
-    // 注意：非空输入再次点击【搜索】不再关闭下拉栏，避免误操作。
     if (lastCandidateQuery === q && host?.children.length) {
       setSearchOpen(true);
       return;
@@ -1767,60 +1778,21 @@
     const currentDataSource = configForm?.querySelector('[name="data_source"]')?.value || "auto";
     const btn = $("#asset-search-btn");
     const restore = setBusy(btn, "搜索中…");
-    const queryToken = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    searchAsset._token = queryToken;
-
-    function stillCurrent() {
-      return searchAsset._token === queryToken && ($("#asset-search-input")?.value?.trim() || "") === q;
-    }
-
-    if (host) {
-      host.innerHTML = `<div class="candidate-empty">正在读取本地缓存“${escapeHTML(q)}”…</div>`;
-    }
+    if (host) host.innerHTML = `<div class="candidate-empty">正在查找本地代码表“${escapeHTML(q)}”…</div>`;
     setSearchOpen(true);
 
-    let renderedLocal = false;
     try {
-      // 第一阶段：只读本地持久化缓存 + 内置映射，立即展示，不联网。
-      const localUrl = `/api/search?q=${encodeURIComponent(q)}&data_source=${encodeURIComponent(currentDataSource)}&local_cache=1`;
-      const localRes = await fetch(localUrl);
-      const localData = await localRes.json();
-      if (localRes.ok && localData.ok !== false && stillCurrent()) {
-        const localResults = localData.results || [];
-        if (localResults.length) {
-          renderCandidates(localResults, q);
-          renderedLocal = true;
-          showToast("已先展示本地缓存结果，正在增量刷新");
-        } else if (host) {
-          host.innerHTML = `<div class="candidate-empty">本地暂无“${escapeHTML(q)}”，正在联网搜索…</div>`;
-        }
-      }
-    } catch (_) {
-      // 本地缓存读取失败不影响联网搜索。
-    }
-
-    try {
-      // 第二阶段：联网增量搜索，后端会把新结果合并写入本地 search_cache.json。
-      const url = `/api/search?q=${encodeURIComponent(q)}&data_source=${encodeURIComponent(currentDataSource)}&refresh=1`;
+      const url = `/api/search?q=${encodeURIComponent(q)}&data_source=${encodeURIComponent(currentDataSource)}`;
       const res = await fetch(url);
       const data = await res.json();
       if (!res.ok || data.ok === false) throw new Error(data.message || "搜索失败");
-      if (!stillCurrent()) return;
       renderCandidates(data.results || [], q);
-      if (data.cache?.hit) {
-        showToast("搜索结果来自缓存");
-      } else if (renderedLocal) {
-        showToast("搜索结果已增量刷新并写入本地缓存");
-      }
+      showToast((data.results || []).length ? "已从本地代码表找到结果" : "本地代码表暂无结果");
     } catch (err) {
-      if (!renderedLocal) {
-        showToast(err.message || "搜索失败", true);
-        if (host) host.innerHTML = `<div class="candidate-empty">搜索失败：${escapeHTML(err.message || "未知错误")}</div>`;
-      } else {
-        showToast("联网增量刷新失败，已保留本地缓存结果", true);
-      }
+      showToast(err.message || "搜索失败", true);
+      if (host) host.innerHTML = `<div class="candidate-empty">搜索失败：${escapeHTML(err.message || "未知错误")}</div>`;
     } finally {
-      if (stillCurrent()) restore();
+      restore();
     }
   }
 
@@ -2121,6 +2093,7 @@
     const saveBtn = $('#settings-save-btn');
     const testBtn = $('#connection-test-btn');
     const cacheClearBtn = $('#cache-clear-btn');
+    const localSymbolsUpdateBtn = $('#local-symbols-update-btn');
     const mapLoadBtn = $('#index-map-load-btn');
     const mapSaveBtn = $('#index-map-save-btn');
     if (saveBtn) saveBtn.addEventListener('click', async () => {
@@ -2129,6 +2102,7 @@
     });
     if (testBtn) testBtn.addEventListener('click', runConnectionTest);
     if (cacheClearBtn) cacheClearBtn.addEventListener('click', clearRuntimeCache);
+    if (localSymbolsUpdateBtn) localSymbolsUpdateBtn.addEventListener('click', updateLocalSymbols);
     if (mapLoadBtn) mapLoadBtn.addEventListener('click', loadIndexMap);
     if (mapSaveBtn) mapSaveBtn.addEventListener('click', saveIndexMap);
     document.addEventListener('keydown', (event) => {
@@ -2472,17 +2446,11 @@
     }
     host.innerHTML = items.map((item, idx) => `
       <div class="portfolio-item-row" data-index="${idx}">
-        <label><span>代码</span><input data-field="symbol" value="${escapeHTML(item.symbol || "")}" placeholder="如 017641"></label>
-        <label class="portfolio-name"><span>名称</span><input data-field="symbol_name" value="${escapeHTML(item.symbol_name || item.name || "")}" placeholder="可空"></label>
-        <label><span>市场</span><select data-field="market">
-          ${["auto", "CN", "US"].map(v => `<option value="${v}" ${(String(item.market || "auto").toUpperCase() === v.toUpperCase()) ? "selected" : ""}>${v}</option>`).join("")}
-        </select></label>
-        <label><span>类型</span><select data-field="asset_kind">
-          ${["auto", "fund", "etf", "index", "stock"].map(v => `<option value="${v}" ${(String(item.asset_kind || "auto").toLowerCase() === v) ? "selected" : ""}>${v}</option>`).join("")}
-        </select></label>
-        <label><span>数据源</span><select data-field="source">
-          ${["auto", "danjuan_only", "akshare", "yfinance", "stooq"].map(v => `<option value="${v}" ${(String(item.source || item.data_source || "auto") === v) ? "selected" : ""}>${v}</option>`).join("")}
-        </select></label>
+        <input type="hidden" data-field="market" value="${escapeHTML(item.market || "auto")}">
+        <input type="hidden" data-field="source" value="${escapeHTML(item.source || item.data_source || "auto")}">
+        <label><span>代码</span><input data-field="symbol" value="${escapeHTML(item.symbol || "")}" readonly></label>
+        <label class="portfolio-name"><span>名称</span><input data-field="symbol_name" value="${escapeHTML(item.symbol_name || item.name || "")}" readonly></label>
+        <label><span>类型</span><input data-field="asset_kind" value="${escapeHTML(item.asset_kind || "auto")}" readonly></label>
         <label><span>计划占比%</span><input data-field="target_pct" type="number" step="0.1" min="0" max="100" value="${numberOr(item.target_pct, 0)}"></label>
         <button class="ghost-btn portfolio-remove" type="button" data-remove-portfolio-item="${idx}">删除</button>
       </div>
@@ -2726,7 +2694,7 @@
       const dcaLine = s.定投基准 ? `定投基准：${escapeHTML(s.定投基准)}<br>` : "";
       const portfolioLine = s.组合计划 ? `组合计划：${escapeHTML(s.组合计划)}<br>` : "";
       summary.innerHTML = `
-        <b>${escapeHTML(s.标的 || "--")}</b> · ${escapeHTML(s.市场 || "--")} · ${escapeHTML(s.数据源 || "--")}<br>
+        <b>${escapeHTML(s.标的 || "--")}</b><br>
         回测周期：${escapeHTML(s.回测周期 || "--")}；操作周期：${escapeHTML(s.操作周期 || "--")}；交易次数：${escapeHTML(s.交易次数 ?? "--")}<br>
         ${portfolioLine}
         ${dcaLine}

@@ -2514,26 +2514,15 @@ def local_symbol_search(query: str) -> List[Dict[str, str]]:
     results: List[Dict[str, str]] = []
 
     for item in LOCAL_SYMBOLS:
-        text = _normalize_query(item["symbol"] + item["name"])
-        if item["symbol"] in alias_symbols or q in text:
-            results.append(item.copy())
+        symbol = str(item.get("symbol") or "").strip().upper()
+        name = str(item.get("name") or symbol).strip()
+        text = _normalize_query(f"{symbol}{name}")
+        if symbol in alias_symbols or q in text:
+            out = item.copy()
+            out["symbol"] = symbol
+            out["name"] = name
+            results.append(out)
 
-    # 如果用户直接输入美股代码或6位国内代码，也直接给候选。
-    raw = str(query or "").strip().upper()
-    if re.fullmatch(r"[A-Z]{1,6}(\.[A-Z]{1,4})?", raw):
-        results.insert(0, {"symbol": raw, "name": raw, "market": "US", "asset_kind": "stock", "source": "yfinance"})
-    if re.fullmatch(r"\d{6}", raw):
-        known = next((item.copy() for item in LOCAL_SYMBOLS if str(item.get("symbol") or "").upper() == raw), None)
-        if known:
-            known["asset_kind"] = resolve_asset_kind(raw, known.get("market", "CN"), known.get("asset_kind", "auto"), known.get("name", ""))
-            results.insert(0, known)
-        else:
-            market = "CN"
-            source = "akshare"
-            kind = guess_cn_asset_kind(raw)
-            results.insert(0, {"symbol": raw, "name": raw, "market": market, "asset_kind": kind, "source": source})
-
-    # 去重
     seen = set()
     unique: List[Dict[str, str]] = []
     for item in results:
@@ -2541,7 +2530,7 @@ def local_symbol_search(query: str) -> List[Dict[str, str]]:
         if key not in seen:
             seen.add(key)
             unique.append(item)
-    return unique[:10]
+    return unique[:12]
 
 
 def search_yfinance(query: str) -> List[Dict[str, str]]:
@@ -2571,6 +2560,63 @@ def search_yfinance(query: str) -> List[Dict[str, str]]:
     except Exception:
         pass
     return results
+
+
+def _symbol_item(symbol: Any, name: Any, market: str, asset_kind: str, source: str) -> Optional[Dict[str, str]]:
+    s = str(symbol or "").strip().upper()
+    if not s:
+        return None
+    n = str(name or s).strip()
+    return {"symbol": s, "name": n, "market": market, "asset_kind": asset_kind, "source": source}
+
+
+def update_local_symbol_mapping() -> Dict[str, Any]:
+    try:
+        import akshare as ak  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(f"AKShare 不可用：{exc}")
+
+    mapping = load_index_mapping()
+    current = [dict(x) for x in mapping.get("local_symbols") or [] if isinstance(x, dict)]
+    by_key: Dict[Tuple[str, str, str], Dict[str, str]] = {}
+
+    def add(item: Optional[Dict[str, str]]) -> None:
+        if not item:
+            return
+        key = (item["symbol"], item.get("market", ""), item.get("asset_kind", ""))
+        by_key[key] = item
+
+    for item in current:
+        add(_symbol_item(item.get("symbol"), item.get("name"), str(item.get("market") or "auto"), str(item.get("asset_kind") or "auto"), str(item.get("source") or "auto")))
+
+    counts = {"stock": 0, "fund": 0, "etf": 0}
+    try:
+        df = ak.stock_info_a_code_name()
+        for _, row in df.iterrows():
+            add(_symbol_item(row.get("code") or row.get("证券代码"), row.get("name") or row.get("证券简称"), "CN", "stock", "akshare"))
+        counts["stock"] = int(len(df))
+    except Exception as exc:
+        raise RuntimeError(f"A 股代码表拉取失败：{exc}")
+
+    try:
+        df = ak.fund_name_em()
+        code_col = "基金代码" if "基金代码" in df.columns else df.columns[0]
+        name_col = "基金简称" if "基金简称" in df.columns else df.columns[1]
+        type_col = "基金类型" if "基金类型" in df.columns else ""
+        for _, row in df.iterrows():
+            name = row.get(name_col)
+            kind_text = str(row.get(type_col) if type_col else name or "").lower()
+            kind = "etf" if "etf" in kind_text or "lof" in kind_text else "fund"
+            add(_symbol_item(row.get(code_col), name, "CN", kind, "akshare"))
+            counts[kind] = counts.get(kind, 0) + 1
+    except Exception as exc:
+        raise RuntimeError(f"基金代码表拉取失败：{exc}")
+
+    mapping["local_symbols"] = sorted(by_key.values(), key=lambda x: (x.get("market", ""), x.get("asset_kind", ""), x.get("symbol", "")))
+    mapping["symbols_updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    saved = save_index_mapping(mapping, apply=True)
+    runtime_cache_clear("search")
+    return {"mapping": saved, "counts": counts, "total": len(saved.get("local_symbols") or [])}
 
 
 def search_akshare(query: str) -> List[Dict[str, str]]:
@@ -7703,6 +7749,23 @@ def api_index_map_save():
     })
 
 
+@app.post("/api/local-symbols/update")
+def api_local_symbols_update():
+    try:
+        result = update_local_symbol_mapping()
+    except Exception as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 500
+    counts = result.get("counts") or {}
+    return jsonify({
+        "ok": True,
+        "message": f"本地代码映射表已更新：共 {result.get('total', 0)} 条，股票 {counts.get('stock', 0)} 条，基金 {counts.get('fund', 0)} 条，ETF/LOF {counts.get('etf', 0)} 条",
+        "path": INDEX_MAP_PATH,
+        "counts": counts,
+        "total": result.get("total", 0),
+        "updated_at": result.get("mapping", {}).get("symbols_updated_at", ""),
+    })
+
+
 @app.post("/api/config")
 def api_config():
     cfg = ensure_config()
@@ -7831,84 +7894,14 @@ def api_search():
     cfg = ensure_config()
     source = str(request.args.get("data_source") or request.args.get("source") or cfg.get("data_source") or "auto").strip().lower()
     danjuan_only = is_danjuan_only_source(source)
-    local_cache_only = str(request.args.get("local_cache") or "").strip().lower() in {"1", "true", "yes"}
-    refresh = str(request.args.get("refresh") or "").strip().lower() in {"1", "true", "yes"}
-
-    if local_cache_only:
-        # 前端增量搜索第一阶段：立即返回本地持久化缓存 + 内置映射，不联网。
-        items = []
-        if danjuan_only:
-            items.extend(local_danjuan_search(query))
-        else:
-            items.extend(local_symbol_search(query))
-        items.extend(_search_from_persistent_cache(query, "danjuan_only" if danjuan_only else source))
-        results = dedupe_symbols(items, query)
-        return jsonify({
-            "ok": True,
-            "results": results[:12],
-            "source_mode": "danjuan_only" if danjuan_only else source,
-            "cache": {"hit": bool(results), "persistent": True, "local_only": True},
-            "partial": True,
-        })
-
-    cache_payload = {
-        "q": query,
-        "data_source": "danjuan_only" if danjuan_only else source,
-        "local_symbols": len(LOCAL_SYMBOLS),
-        "aliases": len(ALIASES),
-        "index_map_mtime": os.path.getmtime(INDEX_MAP_PATH) if os.path.exists(INDEX_MAP_PATH) else 0,
-    }
-    cached = None
-    age = 0
-    # refresh=1 用于增量搜索第二阶段：绕过进程缓存，强制合并最新网络结果到本地。
-    if not refresh:
-        cached, age = runtime_cache_get("search", cache_payload)
-    if cached is not None:
-        # 即使命中进程缓存，也额外合并本地持久化结果，避免重启前后的候选不一致。
-        cached_results = dedupe_symbols(list(cached.get("results") or []) + _search_from_persistent_cache(query, "danjuan_only" if danjuan_only else source), query)
-        cached["results"] = cached_results[:12]
-        return jsonify(add_cache_meta(cached, True, age))
-
-    if danjuan_only:
-        # 严格蛋卷模式：搜索阶段不调用 yfinance / AKShare，
-        # 但允许调用蛋卷自己的搜索接口，所以中文名称/简称也能搜到。
-        items = []
-        items.extend(local_danjuan_search(query))
-        items.extend(_search_from_persistent_cache(query, "danjuan_only"))
-        try:
-            items.extend(search_danjuan_funds(query, fetch_options_from_cfg(cfg)))
-        except Exception:
-            pass
-        results = dedupe_symbols(items, query)
-        payload = {"ok": True, "results": results[:12], "source_mode": "danjuan_only"}
-        _merge_search_cache_results(query, results, "danjuan_only")
-        runtime_cache_set("search", cache_payload, payload)
-        return jsonify(add_cache_meta(payload, False))
-
-    items = []
-    items.extend(local_symbol_search(query))
-    items.extend(_search_from_persistent_cache(query, source))
-    # 本地候选优先；在线搜索失败不影响功能。
-    try:
-        items.extend(search_yfinance(query))
-    except Exception:
-        pass
-    try:
-        items.extend(search_akshare(query))
-    except Exception:
-        pass
+    items = local_danjuan_search(query) if danjuan_only else local_symbol_search(query)
     results = dedupe_symbols(items, query)
-
-    # 只有在本地/在线都找不到结果时，才给一个可手动尝试的兜底候选；
-    # 不再让 001422 这种"基金代码 + A股前缀重叠"的代码先显示成股票占位项。
-    if re.fullmatch(r"\d{6}", query) and not any(str(x.get("symbol") or "").upper() == query.upper() for x in results):
-        fallback_kind = guess_cn_asset_kind(query)
-        results.append({"symbol": query.upper(), "name": query.upper(), "market": "CN", "asset_kind": fallback_kind, "source": "akshare"})
-
-    payload = {"ok": True, "results": results[:12]}
-    _merge_search_cache_results(query, results, source)
-    runtime_cache_set("search", cache_payload, payload)
-    return jsonify(add_cache_meta(payload, False))
+    return jsonify({
+        "ok": True,
+        "results": results[:12],
+        "source_mode": "danjuan_only" if danjuan_only else source,
+        "cache": {"hit": bool(results), "local_only": True},
+    })
 
 
 

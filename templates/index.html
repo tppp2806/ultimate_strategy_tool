@@ -153,6 +153,7 @@
               <p class="small">用于把 ETF、联接基金、关键词映射到跟踪指数估值代码。修改后可热更新，不需要重启。</p>
               <textarea id="index-map-editor" spellcheck="false" rows="12" placeholder="点击载入映射表"></textarea>
               <div class="settings-actions slim">
+                <button id="local-symbols-update-btn" class="btn mini" type="button">一键拉取更新本地代码表</button>
                 <button id="index-map-load-btn" class="btn mini light" type="button">载入映射表</button>
                 <button id="index-map-save-btn" class="btn mini" type="button">保存并热更新</button>
                 <span id="index-map-status" class="small">--</span>
@@ -268,7 +269,7 @@
       </div>
 
       <div class="strategy-summary backtest-current-source">
-        回测会直接使用左侧【标的与资金】、当前总体策略参数和顶部【设置】里的配置：当前标的、计划资金、仓位模式、策略档位、数据源、代理、超时和重试都不再重复填写。
+        回测会直接使用左侧【标的与资金】、当前总体策略参数和顶部【设置】里的配置：当前标的、计划资金、仓位模式、策略档位、代理、超时和重试都不再重复填写。
       </div>
 
       <form id="backtest-form" class="backtest-form">
